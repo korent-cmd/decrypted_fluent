@@ -13,7 +13,10 @@
 --]]
 
 _G.SniffEnabled = true
-_G.SniffFilter = type(_G.SniffFilter) == "string" and _G.SniffFilter or ""
+_G.SniffFilter = type(_G.SniffFilter) == "string" and _G.SniffFilter or "Trade"
+if _G.SniffFilter == "" then
+	_G.SniffFilter = "Trade"
+end
 _G.SniffDepth = _G.SniffDepth or 4
 _G.SniffDisplayLines = _G.SniffDisplayLines or 400
 
@@ -549,6 +552,16 @@ local topCorner = Instance.new("UICorner")
 topCorner.CornerRadius = UDim.new(0, 6)
 topCorner.Parent = topBar
 
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.fromOffset(26, 22)
+minimizeBtn.Position = UDim2.new(1, -31, 0, 4)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(65, 70, 84)
+minimizeBtn.BorderSizePixel = 0
+minimizeBtn.Text = "-"
+minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 16
+
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(0, 200, 1, 0)
 title.Position = UDim2.new(0, 8, 0, 0)
@@ -561,7 +574,7 @@ title.TextSize = 14
 
 local sizeHint = Instance.new("TextLabel")
 sizeHint.Size = UDim2.new(0, 240, 1, 0)
-sizeHint.Position = UDim2.new(1, -246, 0, 0)
+sizeHint.Position = UDim2.new(1, -278, 0, 0)
 sizeHint.BackgroundTransparency = 1
 sizeHint.Text = "0 lines"
 sizeHint.TextXAlignment = Enum.TextXAlignment.Right
@@ -677,6 +690,60 @@ logBox.Font = Enum.Font.Code
 logBox.TextSize = 12
 logBox.Text = "loading..."
 
+local minimizedIcon = Instance.new("TextButton")
+minimizedIcon.Name = "SniffIcon"
+minimizedIcon.Size = UDim2.fromOffset(48, 48)
+minimizedIcon.Position = root.Position
+minimizedIcon.BackgroundColor3 = Color3.fromRGB(40, 44, 54)
+minimizedIcon.BorderSizePixel = 0
+minimizedIcon.Text = "TS"
+minimizedIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+minimizedIcon.Font = Enum.Font.GothamBold
+minimizedIcon.TextSize = 16
+minimizedIcon.Visible = false
+
+local iconCorner = Instance.new("UICorner")
+iconCorner.CornerRadius = UDim.new(0, 10)
+iconCorner.Parent = minimizedIcon
+
+local function minimize()
+	minimizedIcon.Position = root.Position
+	root.Visible = false
+	minimizedIcon.Visible = true
+end
+
+local function restore()
+	root.Position = minimizedIcon.Position
+	root.Visible = true
+	minimizedIcon.Visible = false
+end
+
+minimizeBtn.Activated:Connect(minimize)
+minimizedIcon.Activated:Connect(restore)
+
+minimizedIcon.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local startPos = input.Position
+		local origin = minimizedIcon.Position
+		local dragConn
+		dragConn = UserInputService.InputChanged:Connect(function(change)
+			if change.UserInputType == Enum.UserInputType.MouseMovement then
+				minimizedIcon.Position = UDim2.new(0,
+					origin.X.Offset + (change.Position.X - startPos.X),
+					0,
+					origin.Y.Offset + (change.Position.Y - startPos.Y))
+			end
+		end)
+		local releaseConn
+		releaseConn = UserInputService.InputEnded:Connect(function(change)
+			if change.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragConn:Disconnect()
+				releaseConn:Disconnect()
+			end
+		end)
+	end
+end)
+
 topBar.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
 		local startPos = input.Position
@@ -700,6 +767,7 @@ end)
 topBar.Parent = root
 title.Parent = topBar
 sizeHint.Parent = topBar
+minimizeBtn.Parent = topBar
 status.Parent = root
 filterBox.Parent = root
 logBox.Parent = root
@@ -716,6 +784,7 @@ if not parentGui then
 end
 gui.Parent = parentGui
 root.Parent = gui
+minimizedIcon.Parent = gui
 
 -- keys
 pcall(function()
@@ -762,7 +831,11 @@ _G.StartSniff = function()
 	_G.SniffEnabled = true
 end
 _G.SniffToggleGui = function()
-	root.Visible = not root.Visible
+	if root.Visible then
+		minimize()
+	else
+		restore()
+	end
 end
 
 local function setStatus(msg)
