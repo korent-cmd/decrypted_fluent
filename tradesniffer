@@ -13,6 +13,7 @@
 --]]
 
 _G.SniffEnabled = true
+_G.SniffCaptureOutgoing = _G.SniffCaptureOutgoing == true
 _G.SniffFilter = type(_G.SniffFilter) == "string" and _G.SniffFilter or "Trade"
 if _G.SniffFilter == "" then
 	_G.SniffFilter = "Trade"
@@ -144,6 +145,9 @@ local namecallHooked = false
 local oldNamecall
 
 local function tryHookNamecall()
+	if not _G.SniffCaptureOutgoing then
+		return false
+	end
 	if not hookmetamethod or not getnamecallmethod then
 		return false
 	end
@@ -410,13 +414,13 @@ local function scanRemotes()
 	for _, inst in ipairs(remotes:GetChildren()) do
 		if inst:IsA("RemoteEvent") then
 			hookIncoming(inst)
-			if not namecallHooked then
+			if _G.SniffCaptureOutgoing and not namecallHooked then
 				wrapInstance(inst)
 			end
 			seen[inst] = true
 			n = n + 1
 		elseif inst:IsA("RemoteFunction") then
-			if not namecallHooked then
+			if _G.SniffCaptureOutgoing and not namecallHooked then
 				wrapInstance(inst)
 			end
 			seen[inst] = true
@@ -431,10 +435,10 @@ local function scanRemotes()
 		if ok and inst and not seen[inst] then
 			if inst:IsA("RemoteEvent") then
 				hookIncoming(inst)
-				if not namecallHooked then
+				if _G.SniffCaptureOutgoing and not namecallHooked then
 					wrapInstance(inst)
 				end
-			elseif inst:IsA("RemoteFunction") and not namecallHooked then
+			elseif inst:IsA("RemoteFunction") and _G.SniffCaptureOutgoing and not namecallHooked then
 				wrapInstance(inst)
 			end
 			addLine("BOOT", "direct probe found " .. inst:GetFullName() .. " (" .. inst.ClassName .. ")")
@@ -859,8 +863,8 @@ local ok, err = pcall(function()
 	setStatus("step 1: hooking namecall...")
 	local okHook = pcall(tryHookNamecall)
 
-	setStatus(string.format("step 2: scanning remotes (hook=%s)...",
-		namecallHooked and "namecall" or "instance-wrap"))
+	setStatus(string.format("step 2: scanning remotes (outgoing=%s)...",
+		_G.SniffCaptureOutgoing and "enabled" or "passive"))
 	local nRemotes = 0
 	pcall(function()
 		nRemotes = scanRemotes()
@@ -874,7 +878,7 @@ local ok, err = pcall(function()
 
 	setStatus("step 3: hooking additions...")
 	pcall(function()
-		hookNew(not namecallHooked)
+		hookNew(_G.SniffCaptureOutgoing and not namecallHooked)
 	end)
 
 	setStatus("step 4: watching the trade table...")
@@ -894,11 +898,13 @@ local ok, err = pcall(function()
 	local tradeGuiObjects = 0
 	-- Do not scan PlayerGui or attach recursive listeners here; the GUI can be huge.
 
-	setStatus(string.format("READY. remotes=%d | seats=%d | gui=%d | hook=%s | filter=%q | sit at the table now.",
-		nRemotes, tradeSeats, tradeGuiObjects, namecallHooked and "namecall ACTIVE" or "instance-wrap", tostring(_G.SniffFilter)))
-	if not namecallHooked then
-		addLine("BOOT", "WARNING: outbound remote capture is unavailable without hookmetamethod/getnamecallmethod")
-		status.Text = "READY with warning: executor lacks namecall hook"
+	setStatus(string.format("READY. remotes=%d | seats=%d | gui=%d | mode=%s | filter=%q | sit at the table now.",
+		nRemotes, tradeSeats, tradeGuiObjects, _G.SniffCaptureOutgoing and (namecallHooked and "outgoing" or "fallback") or "passive", tostring(_G.SniffFilter)))
+	if not _G.SniffCaptureOutgoing then
+		addLine("BOOT", "PASSIVE MODE: incoming TradeEvent and seat tracking enabled; outgoing calls are untouched")
+	elseif not namecallHooked then
+		addLine("BOOT", "WARNING: outbound capture unavailable; incoming TradeEvent tracking remains active")
+		status.Text = "READY: incoming-only mode"
 	end
 end)
 if not ok then
