@@ -1,0 +1,833 @@
+--[[
+  Blox Fruits - Trade Process Sniffer (with GUI)
+  Run in executor. No console/output needed: a draggable GUI shows the live log,
+  with Copy (clipboard) and Save (writefile) buttons. Every boot step reports
+  into the GUI so you can see exactly where it is / if it fails.
+
+  BUTTONS: Pause/Resume, Clear, Copy, Save, Filter box (substring on instance path).
+  LOGS:    OUT:REQ / OUT:RES  (client -> server), IN:EVENT (server -> client),
+           SIT (seat name + CFrame), PROMPT, KEY, BOOT.
+  CTRL:    _G.StartSniff() / _G.StopSniff() / _G.SniffToFile=true (writes trade_sniff.log)
+
+  Remotes live under ReplicatedStorage.Remotes (CommF_, TradeFunction, TradeEvent).
+--]]
+
+_G.SniffEnabled = true
+_G.SniffFilter = type(_G.SniffFilter) == "string" and _G.SniffFilter or ""
+_G.SniffDepth = _G.SniffDepth or 4
+_G.SniffDisplayLines = _G.SniffDisplayLines or 400
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+-- ------------------------------------------------------------------
+-- log storage
+-- ------------------------------------------------------------------
+local logBuffer = {}
+local logCount = 0
+local dirty = false
+
+local function addLine(tag, msg)
+	pcall(function()
+		logCount = logCount + 1
+		local stamp = tostring(os.clock()):sub(1, 6)
+		logBuffer[logCount] = string.format("[SNIFF:%s] %ss  %s", tag, stamp, msg)
+	end)
+	dirty = true
+end
+
+local function getFullLog()
+	return table.concat(logBuffer, "\n")
+end
+
+local function getVisibleLog()
+	local top = math.max(1, logCount - (_G.SniffDisplayLines or 400) + 1)
+	local parts = {}
+	for i = top, logCount do
+		parts[#parts + 1] = logBuffer[i]
+	end
+	return table.concat(parts, "\n")
+end
+
+-- ------------------------------------------------------------------
+-- serialization
+-- ------------------------------------------------------------------
+local function serialize(v)
+	local seen = {}
+
+	local function ser(x, depth)
+		local t = typeof(x)
+		if t == "Instance" then
+			local ok, path = pcall(function()
+				return x:GetFullName()
+			end)
+			return x.ClassName .. ">" .. (ok and path or "?")
+		elseif t == "table" then
+			if depth > _G.SniffDepth then
+				return "{...}"
+			end
+			if seen[x] then
+				return "{loop}"
+			end
+			if not next(x) then
+				return "{}"
+			end
+			seen[x] = true
+			local parts = {}
+			for k, val in pairs(x) do
+				table.insert(parts, ser(k, depth + 1) .. "=" .. ser(val, depth + 1))
+			end
+			seen[x] = nil
+			return "{" .. table.concat(parts, ", ") .. "}"
+		elseif t == "function" then
+			return "function"
+		elseif t == "string" then
+			return ("%q"):format(x)
+		else
+			return tostring(x)
+		end
+	end
+
+	local ok, result = pcall(function()
+		return ser(v, 0)
+	end)
+	return ok and result or "(unserializable)"
+end
+
+local function joinArgs(...)
+	local parts = {}
+	for i = 1, select("#", ...) do
+		parts[i] = serialize((select(i, ...)))
+	end
+	return table.concat(parts, ", ")
+end
+
+-- ------------------------------------------------------------------
+-- filter / emit
+-- ------------------------------------------------------------------
+local function shouldLog(inst)
+	if not _G.SniffEnabled then
+		return false
+	end
+	local f = _G.SniffFilter
+	if not f or f == "" then
+		return true
+	end
+	local ok, path = pcall(function()
+		return inst:GetFullName()
+	end)
+	return ok and path:lower():find(f:lower(), 1, true) ~= nil
+end
+
+local function logReq(inst, method, ...)
+	if shouldLog(inst) then
+		addLine("OUT:REQ", string.format("%s :: %s(%s)", inst:GetFullName(), method, joinArgs(...)))
+	end
+end
+
+local function logRes(inst, method, ...)
+	if shouldLog(inst) then
+		addLine("OUT:RES", string.format("%s :: %s -> %s", inst:GetFullName(), method, joinArgs(...)))
+	end
+end
+
+-- ------------------------------------------------------------------
+-- 1) outgoing: namecall hook (call the original exactly once)
+-- ------------------------------------------------------------------
+local namecallHooked = false
+local oldNamecall
+
+local function tryHookNamecall()
+	if not hookmetamethod or not getnamecallmethod then
+		return false
+	end
+
+	local wrap = newcclosure or (function(f)
+		return f
+	end)
+
+	oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+		local method = getnamecallmethod()
+
+		if method == "FireServer" or method == "InvokeServer" then
+			local ok, isRemote = pcall(function()
+				return self and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+			end)
+			if ok and isRemote then
+				logReq(self, method, ...)
+				if method == "InvokeServer" then
+					local results = { oldNamecall(self, ...) }
+					logRes(self, method, table.unpack(results))
+					return table.unpack(results)
+				end
+			end
+		end
+
+		return oldNamecall(self, ...)
+	end))
+
+	namecallHooked = true
+	return true
+end
+
+-- ------------------------------------------------------------------
+-- 2) outgoing: per-instance wrap (fallback, only if namecall hook failed)
+-- ------------------------------------------------------------------
+local wrapDone = {}
+
+local function wrapInstance(inst)
+	if wrapDone[inst] then
+		return
+	end
+	wrapDone[inst] = true
+
+	if inst:IsA("RemoteFunction") then
+		local ok, old = pcall(function()
+			return inst.InvokeServer
+		end)
+		if not ok or type(old) ~= "function" then
+			return
+		end
+		inst.InvokeServer = function(self, ...)
+			logReq(self, "InvokeServer", ...)
+			local results = { old(self, ...) }
+			logRes(self, "InvokeServer", table.unpack(results))
+			return table.unpack(results)
+		end
+	elseif inst:IsA("RemoteEvent") then
+		local ok, old = pcall(function()
+			return inst.FireServer
+		end)
+		if not ok or type(old) ~= "function" then
+			return
+		end
+		inst.FireServer = function(self, ...)
+			logReq(self, "FireServer", ...)
+			return old(self, ...)
+		end
+	end
+end
+
+-- ------------------------------------------------------------------
+-- 3) incoming
+-- ------------------------------------------------------------------
+local hookedIncoming = {}
+
+local function hookIncoming(inst)
+	if hookedIncoming[inst] then
+		return
+	end
+	hookedIncoming[inst] = true
+	pcall(function()
+		inst.OnClientEvent:Connect(function(...)
+			if shouldLog(inst) then
+				addLine("IN:EVENT", string.format("%s | %s", inst:GetFullName(), joinArgs(...)))
+			end
+		end)
+	end)
+end
+
+-- ------------------------------------------------------------------
+-- 4) sits / prompts / keys
+-- ------------------------------------------------------------------
+local function hookHumanoid(hum)
+	if not hum then
+		return
+	end
+	if hum:GetAttribute("SniffSitHooked") then
+		return
+	end
+	hum:SetAttribute("SniffSitHooked", true)
+	hum.Seated:Connect(function(seated, seat)
+		if not _G.SniffEnabled then
+			return
+		end
+		if seated and seat then
+			local ok, cf = pcall(function()
+				return tostring(seat.CFrame)
+			end)
+			addLine("SIT", string.format("SAT on %s | CFrame=%s", seat:GetFullName(), ok and cf or "?"))
+		else
+			addLine("SIT", "stood up")
+		end
+	end)
+end
+
+local function describeOccupant(seat)
+	local occupant = seat.Occupant
+	if not occupant then
+		return "empty"
+	end
+	local character = occupant.Parent
+	local player = character and Players:GetPlayerFromCharacter(character)
+	if player then
+		return string.format("%s (%s, UserId=%d)", player.Name, player.DisplayName, player.UserId)
+	end
+	return string.format("unknown humanoid %s", character and character:GetFullName() or "?")
+end
+
+local function hookTradeSeat(seat)
+	if not seat:IsA("Seat") and not seat:IsA("VehicleSeat") then
+		return
+	end
+	if not seat:IsDescendantOf(Workspace:FindFirstChild("Map") or Workspace) then
+		return
+	end
+	if not seat:GetFullName():lower():find("tradetable", 1, true) then
+		return
+	end
+	if seat:GetAttribute("SniffTradeSeatHooked") then
+		return
+	end
+	seat:SetAttribute("SniffTradeSeatHooked", true)
+	local function report()
+		addLine("TRADE:SEAT", string.format("%s occupant=%s", seat:GetFullName(), describeOccupant(seat)))
+	end
+	pcall(function()
+		seat:GetPropertyChangedSignal("Occupant"):Connect(report)
+	end)
+	report()
+end
+
+local function scanTradeSeats()
+	local count = 0
+	pcall(function()
+		for _, inst in ipairs(Workspace:GetDescendants()) do
+			if inst:IsA("Seat") or inst:IsA("VehicleSeat") then
+				local path = inst:GetFullName():lower()
+				if path:find("tradetable", 1, true) then
+					hookTradeSeat(inst)
+					count = count + 1
+				end
+			end
+		end
+	end)
+	return count
+end
+
+local function hookTradeGuiObject(inst)
+	local name = inst:GetFullName():lower()
+	if not name:find("trade", 1, true) then
+		return
+	end
+	if inst:GetAttribute("SniffTradeGuiHooked") then
+		return
+	end
+	inst:SetAttribute("SniffTradeGuiHooked", true)
+	if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+		local function report()
+			local text = inst.Text
+			if text and text ~= "" then
+				addLine("TRADE:UI", string.format("%s text=%q", inst:GetFullName(), text))
+			end
+		end
+		pcall(function()
+			inst:GetPropertyChangedSignal("Text"):Connect(report)
+		end)
+		report()
+	end
+	pcall(function()
+		inst.ChildAdded:Connect(function(child)
+			addLine("TRADE:UI", "added " .. child:GetFullName())
+			hookTradeGuiObject(child)
+		end)
+	end)
+end
+
+local function scanTradeGui()
+	local lp = Players.LocalPlayer
+	local pg = lp and lp:FindFirstChild("PlayerGui")
+	if not pg then
+		return 0
+	end
+	local count = 0
+	pcall(function()
+		for _, inst in ipairs(pg:GetDescendants()) do
+			if inst:GetFullName():lower():find("trade", 1, true) then
+				hookTradeGuiObject(inst)
+				count = count + 1
+			end
+		end
+		pg.DescendantAdded:Connect(function(inst)
+			if inst:GetFullName():lower():find("trade", 1, true) then
+				hookTradeGuiObject(inst)
+			end
+		end)
+	end)
+	return count
+end
+
+local function hookPrompt(p)
+	if not p:IsA("ProximityPrompt") then
+		return
+	end
+	if p:GetAttribute("SniffPromptHooked") then
+		return
+	end
+	p:SetAttribute("SniffPromptHooked", true)
+	pcall(function()
+		p.PromptShown:Connect(function()
+			if _G.SniffEnabled then
+				addLine("PROMPT", string.format("shown %s | key=%s | action=%s | obj=%s",
+					p:GetFullName(), tostring(p.KeyboardKeyCode), tostring(p.ActionText), tostring(p.ObjectText)))
+			end
+		end)
+		p.Triggered:Connect(function()
+			if _G.SniffEnabled then
+				addLine("PROMPT", string.format("TRIGGERED %s | action=%s", p:GetFullName(), tostring(p.ActionText)))
+			end
+		end)
+	end)
+end
+
+local function initCharacter(char)
+	if not char then
+		return
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hookHumanoid(hum)
+	end
+end
+
+-- ------------------------------------------------------------------
+-- 5) scanning / watching (lazy, yields so it can't hang)
+-- ------------------------------------------------------------------
+local function scanRemotes()
+	local remotes = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Remotes")
+	local n = 0
+	local seen = {}
+	if not remotes then
+		addLine("BOOT", "ReplicatedStorage.Remotes is not visible yet")
+		return 0
+	end
+	for _, inst in ipairs(remotes:GetChildren()) do
+		if inst:IsA("RemoteEvent") then
+			hookIncoming(inst)
+			if not namecallHooked then
+				wrapInstance(inst)
+			end
+			seen[inst] = true
+			n = n + 1
+		elseif inst:IsA("RemoteFunction") then
+			if not namecallHooked then
+				wrapInstance(inst)
+			end
+			seen[inst] = true
+			n = n + 1
+		end
+	end
+	-- Probe the known trade remotes directly without recursively scanning the game.
+	for _, remoteName in ipairs({"TradeEvent", "TradeFunction", "CommF_"}) do
+		local ok, inst = pcall(function()
+			return remotes:FindFirstChild(remoteName)
+		end)
+		if ok and inst and not seen[inst] then
+			if inst:IsA("RemoteEvent") then
+				hookIncoming(inst)
+				if not namecallHooked then
+					wrapInstance(inst)
+				end
+			elseif inst:IsA("RemoteFunction") and not namecallHooked then
+				wrapInstance(inst)
+			end
+			addLine("BOOT", "direct probe found " .. inst:GetFullName() .. " (" .. inst.ClassName .. ")")
+			seen[inst] = true
+			n = n + 1
+		end
+	end
+	addLine("BOOT", string.format("remote scan root=%s | events/functions=%d",
+		remotes:GetFullName(), n))
+	return n
+end
+
+local function waitAndScanRemotes()
+	for attempt = 1, 20 do
+		local count = scanRemotes()
+		if count > 0 then
+			addLine("BOOT", string.format("delayed remote scan found %d remotes on attempt %d", count, attempt))
+			return count
+		end
+		task.wait(1)
+	end
+	addLine("BOOT", "WARNING: no RemoteEvent/RemoteFunction instances found after 20 seconds")
+	return 0
+end
+
+local function hookNew(shouldWrap)
+	pcall(function()
+		ReplicatedStorage.DescendantAdded:Connect(function(inst)
+			if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+				if inst:IsA("RemoteEvent") then
+					hookIncoming(inst)
+					if shouldWrap then
+						wrapInstance(inst)
+					end
+				elseif inst:IsA("RemoteFunction") then
+					if shouldWrap then
+						wrapInstance(inst)
+					end
+				end
+			end
+		end)
+	end)
+	pcall(function()
+		local map = Workspace:FindFirstChild("Map")
+		local tableModel = map and map:FindFirstChild("TradeTable", true)
+		if tableModel then
+			for _, inst in ipairs(tableModel:GetChildren()) do
+				if inst:IsA("ProximityPrompt") then
+					hookPrompt(inst)
+				elseif inst:IsA("Seat") or inst:IsA("VehicleSeat") then
+					hookTradeSeat(inst)
+				end
+			end
+			tableModel.ChildAdded:Connect(function(inst)
+				if inst:IsA("ProximityPrompt") then
+					hookPrompt(inst)
+				elseif inst:IsA("Seat") or inst:IsA("VehicleSeat") then
+					hookTradeSeat(inst)
+				end
+			end)
+		end
+	end)
+	local lp = Players.LocalPlayer
+	if lp then
+		pcall(function()
+			lp.CharacterAdded:Connect(initCharacter)
+		end)
+		pcall(function()
+			if lp.Character then
+				initCharacter(lp.Character)
+			end
+		end)
+	end
+end
+
+-- ------------------------------------------------------------------
+-- GUI
+-- ------------------------------------------------------------------
+local guiName = "SniffGui"
+local existingGui = nil
+pcall(function()
+	existingGui = (Players.LocalPlayer and Players.LocalPlayer.PlayerGui and Players.LocalPlayer.PlayerGui:FindFirstChild(guiName))
+		or ReplicatedStorage:FindFirstChild(guiName)
+end)
+if existingGui then
+	existingGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = guiName
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local root = Instance.new("Frame")
+root.Size = UDim2.fromOffset(540, 350)
+root.Position = UDim2.new(0, 10, 0, 10)
+root.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
+root.BorderSizePixel = 0
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 6)
+corner.Parent = root
+
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1
+stroke.Color = Color3.fromRGB(45, 49, 60)
+stroke.Parent = root
+
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 30)
+topBar.BackgroundColor3 = Color3.fromRGB(40, 44, 54)
+topBar.BorderSizePixel = 0
+
+local topCorner = Instance.new("UICorner")
+topCorner.CornerRadius = UDim.new(0, 6)
+topCorner.Parent = topBar
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(0, 200, 1, 0)
+title.Position = UDim2.new(0, 8, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "Trade Sniffer"
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+
+local sizeHint = Instance.new("TextLabel")
+sizeHint.Size = UDim2.new(0, 240, 1, 0)
+sizeHint.Position = UDim2.new(1, -246, 0, 0)
+sizeHint.BackgroundTransparency = 1
+sizeHint.Text = "0 lines"
+sizeHint.TextXAlignment = Enum.TextXAlignment.Right
+sizeHint.TextColor3 = Color3.fromRGB(150, 155, 170)
+sizeHint.Font = Enum.Font.Gotham
+sizeHint.TextSize = 12
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 20)
+status.Position = UDim2.new(0, 10, 0, 328)
+status.BackgroundTransparency = 1
+status.Text = "booting..."
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextColor3 = Color3.fromRGB(150, 210, 150)
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+
+local filterBox = Instance.new("TextBox")
+filterBox.Size = UDim2.new(0, 120, 0, 24)
+filterBox.Position = UDim2.new(0, 40, 0, 38)
+filterBox.PlaceholderText = "filter (empty=all)"
+filterBox.Text = _G.SniffFilter or ""
+filterBox.BackgroundColor3 = Color3.fromRGB(30, 33, 41)
+filterBox.TextColor3 = Color3.fromRGB(230, 230, 230)
+filterBox.TextXAlignment = Enum.TextXAlignment.Center
+filterBox.Font = Enum.Font.Gotham
+filterBox.TextSize = 12
+filterBox.ClearTextOnFocus = false
+filterBox.FocusLost:Connect(function()
+	_G.SniffFilter = filterBox.Text or ""
+end)
+
+local function makeButton(text, x, width, color, callback)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(width, 24)
+	b.Position = UDim2.fromOffset(x, 38)
+	b.Text = text
+	b.Font = Enum.Font.Gotham
+	b.TextSize = 12
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.BackgroundColor3 = color
+	b.BorderSizePixel = 0
+	b.Parent = root
+	b.Activated:Connect(callback)
+	return b
+end
+
+local pauseBtn = makeButton("Pause", 170, 70, Color3.fromRGB(210, 130, 50), function()
+	if _G.SniffEnabled then
+		_G.SniffEnabled = false
+		pauseBtn.Text = "Resume"
+		pauseBtn.BackgroundColor3 = Color3.fromRGB(90, 180, 90)
+	else
+		_G.SniffEnabled = true
+		pauseBtn.Text = "Pause"
+		pauseBtn.BackgroundColor3 = Color3.fromRGB(210, 130, 50)
+	end
+end)
+
+makeButton("Clear", 248, 70, Color3.fromRGB(120, 60, 60), function()
+	logBuffer = {}
+	logCount = 0
+	dirty = true
+end)
+
+makeButton("Copy", 326, 82, Color3.fromRGB(55, 90, 150), function()
+	local text = getFullLog()
+	if #text == 0 then
+		status.Text = "nothing to copy yet"
+		return
+	end
+	local done = false
+	if setclipboard then
+		done = pcall(setclipboard, text)
+	end
+	if not done and clipboard and clipboard.set then
+		done = pcall(function()
+			clipboard.set(text)
+		end)
+	end
+	status.Text = done and ("copied " .. logCount .. " lines") or "copy failed (no clipboard api)"
+end)
+
+makeButton("Save", 416, 92, Color3.fromRGB(60, 120, 60), function()
+	local text = getFullLog()
+	if #text == 0 then
+		status.Text = "nothing to save yet"
+		return
+	end
+	local ok, err = pcall(function()
+		local name = "trade_sniff_" .. tostring(os.time()) .. ".log"
+		writefile(name, "Trade Sniffer log\nfilter=" .. tostring(_G.SniffFilter)
+			.. " | lines=" .. logCount .. "\n" .. text)
+		status.Text = "saved -> " .. name .. " (executor workspace)"
+	end)
+	if not ok then
+		status.Text = "save failed (no writefile): " .. tostring(err)
+	end
+end)
+
+local logBox = Instance.new("TextBox")
+logBox.Size = UDim2.new(1, -20, 0, 260)
+logBox.Position = UDim2.new(0, 10, 0, 70)
+logBox.MultiLine = true
+logBox.TextEditable = false
+logBox.ClearTextOnFocus = false
+logBox.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+logBox.TextColor3 = Color3.fromRGB(215, 220, 230)
+logBox.TextXAlignment = Enum.TextXAlignment.Left
+logBox.TextYAlignment = Enum.TextYAlignment.Top
+logBox.Font = Enum.Font.Code
+logBox.TextSize = 12
+logBox.Text = "loading..."
+
+topBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local startPos = input.Position
+		local origin = root.Position
+		local dragConn
+		dragConn = UserInputService.InputChanged:Connect(function(c)
+			if c.UserInputType == Enum.UserInputType.MouseMovement then
+				root.Position = UDim2.new(0, origin.X.Offset + (c.Position.X - startPos.X), 0, origin.Y.Offset + (c.Position.Y - startPos.Y))
+			end
+		end)
+		local releaseConn
+		releaseConn = UserInputService.InputEnded:Connect(function(c)
+			if c.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragConn:Disconnect()
+				releaseConn:Disconnect()
+			end
+		end)
+	end
+end)
+
+topBar.Parent = root
+title.Parent = topBar
+sizeHint.Parent = topBar
+status.Parent = root
+filterBox.Parent = root
+logBox.Parent = root
+
+local parentGui = nil
+pcall(function()
+	local lp = Players.LocalPlayer
+	if lp then
+		parentGui = lp:FindFirstChild("PlayerGui") or parentGui
+	end
+end)
+if not parentGui then
+	parentGui = ReplicatedStorage
+end
+gui.Parent = parentGui
+root.Parent = gui
+
+-- keys
+pcall(function()
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if input.KeyCode == Enum.KeyCode.E or input.KeyCode == Enum.KeyCode.Return then
+			if _G.SniffEnabled then
+				addLine("KEY", "pressed " .. tostring(input.KeyCode))
+			end
+		end
+	end)
+end)
+
+-- render loop (throttled, guarded)
+local lastPaint = 0
+RunService.Heartbeat:Connect(function(dt)
+	if not gui or not gui.Parent then
+		return
+	end
+	lastPaint = lastPaint + dt
+	if lastPaint < 0.1 then
+		return
+	end
+	lastPaint = 0
+	sizeHint.Text = string.format("%d lines", logCount)
+	if dirty then
+		local ok, text = pcall(getVisibleLog)
+		if ok then
+			logBox.Text = text
+		end
+		dirty = false
+	end
+end)
+
+-- ------------------------------------------------------------------
+-- controls / helpers
+-- ------------------------------------------------------------------
+_G.StopSniff = function()
+	_G.SniffEnabled = false
+end
+_G.StartSniff = function()
+	_G.SniffEnabled = true
+end
+_G.SniffToggleGui = function()
+	root.Visible = not root.Visible
+end
+
+local function setStatus(msg)
+	status.Text = msg
+	addLine("BOOT", msg)
+	dirty = true
+	logBox.Text = getVisibleLog()
+end
+
+-- note in GUI so the user isn't stuck if an error occurs mid-boot
+local function handleBootError(err)
+	pcall(function()
+		status.Text = "BOOT ERROR: " .. tostring(err)
+	end)
+end
+
+-- ------------------------------------------------------------------
+-- boot (guarded step by step)
+-- ------------------------------------------------------------------
+local ok, err = pcall(function()
+	setStatus("step 1: hooking namecall...")
+	local okHook = pcall(tryHookNamecall)
+
+	setStatus(string.format("step 2: scanning remotes (hook=%s)...",
+		namecallHooked and "namecall" or "instance-wrap"))
+	local nRemotes = 0
+	pcall(function()
+		nRemotes = scanRemotes()
+	end)
+	if nRemotes == 0 then
+		setStatus("no remotes yet; retrying for 20 seconds...")
+		task.spawn(function()
+			waitAndScanRemotes()
+		end)
+	end
+
+	setStatus("step 3: hooking additions...")
+	pcall(function()
+		hookNew(not namecallHooked)
+	end)
+
+	setStatus("step 4: watching the trade table...")
+	local tradeSeats = 0
+	pcall(function()
+		local map = Workspace:FindFirstChild("Map")
+		local tableModel = map and map:FindFirstChild("TradeTable", true)
+		if tableModel then
+			for _, inst in ipairs(tableModel:GetChildren()) do
+				if inst:IsA("Seat") or inst:IsA("VehicleSeat") then
+					hookTradeSeat(inst)
+					tradeSeats = tradeSeats + 1
+				end
+			end
+		end
+	end)
+	local tradeGuiObjects = 0
+	-- Do not scan PlayerGui or attach recursive listeners here; the GUI can be huge.
+
+	setStatus(string.format("READY. remotes=%d | seats=%d | gui=%d | hook=%s | filter=%q | sit at the table now.",
+		nRemotes, tradeSeats, tradeGuiObjects, namecallHooked and "namecall ACTIVE" or "instance-wrap", tostring(_G.SniffFilter)))
+	if not namecallHooked then
+		addLine("BOOT", "WARNING: outbound remote capture is unavailable without hookmetamethod/getnamecallmethod")
+		status.Text = "READY with warning: executor lacks namecall hook"
+	end
+end)
+if not ok then
+	handleBootError(err)
+end
