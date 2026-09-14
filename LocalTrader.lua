@@ -24,6 +24,8 @@ local CONFIG = {
 	TradeStartTimeout = 30,
 	CompletionTimeout = 45,
 	InventoryRefreshInterval = 2,
+	MaxLogLines = 200,
+	RetweenInterval = 4,
 }
 
 local state = "IDLE"
@@ -32,7 +34,9 @@ local session = nil
 local latestTradeState = nil
 local lastAccept = 0
 local lastOfferSignature = nil
+local lastLoggedOfferSignature = nil
 local connections = {}
+local logLines = {}
 
 local function disconnectAll()
 	for _, connection in ipairs(connections) do
@@ -242,6 +246,15 @@ local function offerSignature(tradeState)
 	return table.concat(chunks, "|") .. "|ready=" .. tostring(tradeState.State and tradeState.State.Ready)
 end
 
+local function offerSummary(items)
+	local parts = {}
+	for _, item in pairs(items or {}) do
+		parts[#parts + 1] = string.format("%s x%s [%s]", tostring(item.ItemId), tostring(item.Amount), tostring(item.Type))
+	end
+	table.sort(parts)
+	return #parts > 0 and table.concat(parts, ", ") or "empty"
+end
+
 local function findTable()
 	local current = workspace
 	for _, name in ipairs(CONFIG.TablePath) do
@@ -326,7 +339,7 @@ local gui = Instance.new("ScreenGui")
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local root = Instance.new("Frame")
-root.Size = UDim2.fromOffset(430, 300)
+root.Size = UDim2.fromOffset(430, 370)
 root.Position = UDim2.new(0, 20, 0, 80)
 root.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 root.BorderSizePixel = 0
@@ -502,17 +515,32 @@ logBox.ClearTextOnFocus = false
 logBox.Text = ""
 logBox.Parent = root
 
-local logLines = {}
 local function writeLog(message)
 	logLines[#logLines + 1] = os.date("%H:%M:%S") .. " " .. message
-	while #logLines > 5 do
+	while #logLines > CONFIG.MaxLogLines do
 		table.remove(logLines, 1)
 	end
 	logBox.Text = table.concat(logLines, "\n")
 	status.Text = "Status: " .. state .. "\n" .. message
 end
 
-local function button(text, position, width, callback)
+local function copyLog()
+	local text = table.concat(logLines, "\n")
+	if text == "" then
+		writeLog("log is empty")
+		return
+	end
+	local copied = false
+	if type(setclipboard) == "function" then
+		copied = pcall(setclipboard, text)
+	end
+	if not copied and type(clipboard) == "table" and type(clipboard.set) == "function" then
+		copied = pcall(clipboard.set, text)
+	end
+	writeLog(copied and "copied full log" or "clipboard API unavailable")
+end
+
+local function button(text, position, width, callback, color)
 	local object = Instance.new("TextButton")
 	object.Size = UDim2.fromOffset(width, 25)
 	object.Position = position
@@ -520,7 +548,7 @@ local function button(text, position, width, callback)
 	object.TextColor3 = Color3.fromRGB(255, 255, 255)
 	object.Font = Enum.Font.Gotham
 	object.TextSize = 12
-	object.BackgroundColor3 = Color3.fromRGB(56, 95, 150)
+	object.BackgroundColor3 = color or Color3.fromRGB(56, 95, 150)
 	object.BorderSizePixel = 0
 	object.Activated:Connect(callback)
 	object.Parent = root
@@ -534,6 +562,7 @@ local function stopTrader(reason)
 	latestTradeState = nil
 	session = nil
 	lastOfferSignature = nil
+	lastLoggedOfferSignature = nil
 	disconnectAll()
 	if startButton then
 		startButton.Text = "Start"
@@ -589,6 +618,7 @@ local function startTrader()
 		inventoryBefore = inventoryAmount(inventory, requestedId),
 		startedAt = os.clock(),
 		addRequested = false,
+		lastRetween = 0,
 	}
 	startButton.Text = "Stop"
 	local seat = emptyTradeSeat()
@@ -601,7 +631,8 @@ local function startTrader()
 		end
 		state = "WAITING_FOR_CUSTOMER"
 	end
-	writeLog(string.format("ready: %s x%d (ItemId %s)", fruitBox.Text, quantity, tostring(requestedId)))
+	writeLog(string.format("ready: %s x%d (ItemId %s, catalog=%s, inventory=%s)",
+		fruitBox.Text, quantity, tostring(requestedId), tostring(itemRecord(requestedId) and itemRecord(requestedId)[1]), tostring(requestedType)))
 
 	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
 		if not running or not session then
@@ -625,7 +656,7 @@ local function startTrader()
 			state = "TRADE_STARTED"
 			session.localSide = localSide
 			session.startedAt = os.clock()
-			writeLog("trade started with " .. otherPlayer.Name)
+			writeLog(string.format("trade started with %s (UserId %s, localSide=%d)", otherPlayer.Name, tostring(otherId), localSide))
 		elseif eventName == "update_state" then
 			if not session.localSide then
 				session.localSide = getLocalSide(tradeState)
@@ -640,6 +671,13 @@ local function startTrader()
 			local customerItems = offerItems(tradeState.Offer[otherSide])
 			local localHasRequested = offerHasItem(localItems, session.requestedId, session.quantity)
 			local signature = offerSignature(tradeState)
+			if signature ~= lastLoggedOfferSignature then
+				lastLoggedOfferSignature = signature
+				writeLog(string.format("offers: worker={%s}; customer={%s}; ready=%s/%s; state=%s",
+					offerSummary(localItems), offerSummary(customerItems),
+					tostring(tradeState.State.Ready[localSide]), tostring(tradeState.State.Ready[otherSide]),
+					tostring(tradeState.State.Type)))
+			end
 
 			if not localHasRequested and not session.addRequested and tradeState.State.Type == "NotReady" then
 				state = "OFFERING_ORDER_ITEM"
@@ -661,7 +699,8 @@ local function startTrader()
 				end
 			elseif localHasRequested and tradeState.State.Type == "NotReady" then
 				state = "WAITING_FOR_CUSTOMER_OFFER"
-				if countItems(customerItems) > 0 and signature ~= lastOfferSignature
+				if countItems(customerItems) > 0
+					and tradeState.State.Ready[localSide] ~= true
 					and os.clock() - lastAccept >= CONFIG.AcceptInterval then
 					lastOfferSignature = signature
 					lastAccept = os.clock()
@@ -698,6 +737,10 @@ local function startTrader()
 				state = "WAITING_FOR_CUSTOMER"
 				latestTradeState = nil
 				session.startedAt = os.clock()
+				session.addRequested = false
+				session.localSide = nil
+				lastOfferSignature = nil
+				lastLoggedOfferSignature = nil
 				writeLog("customer left; waiting for the customer to sit again")
 			end
 		end
@@ -708,11 +751,42 @@ startButton = button("Start", UDim2.fromOffset(12, 270), 195, startTrader)
 button("Stop", UDim2.fromOffset(220, 270), 195, function()
 	stopTrader("stopped by user")
 end)
+button("Copy Log", UDim2.fromOffset(12, 300), 403, copyLog, Color3.fromRGB(65, 105, 145))
+
+local function retweenToTableIfNeeded()
+	if not running or not session or state ~= "WAITING_FOR_CUSTOMER" then
+		return
+	end
+	if os.clock() - session.lastRetween < CONFIG.RetweenInterval then
+		return
+	end
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Sit then
+		return
+	end
+	local p1, p2 = tableSeats()
+	local targetSeat = (p1 and not p1.Occupant and p1) or (p2 and not p2.Occupant and p2)
+	if not targetSeat then
+		return
+	end
+	session.lastRetween = os.clock()
+	state = "TRAVELING_TO_TABLE"
+	local moved, errorMessage = tweenToSeat(targetSeat)
+	if moved then
+		state = "WAITING_FOR_CUSTOMER"
+		writeLog("re-tweened to trade table")
+	else
+		state = "WAITING_FOR_CUSTOMER"
+		writeLog("re-tween failed: " .. tostring(errorMessage))
+	end
+end
 
 RunService.Heartbeat:Connect(function()
 	if not running or not session then
 		return
 	end
+	retweenToTableIfNeeded()
 	local elapsed = os.clock() - session.startedAt
 	if state == "WAITING_FOR_CUSTOMER" and elapsed > CONFIG.CustomerWaitTimeout then
 		stopTrader("customer wait timed out")
