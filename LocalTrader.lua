@@ -18,6 +18,7 @@ assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
 
 local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
+	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
 	AcceptInterval = 1.5,
 	CustomerWaitTimeout = 180,
 	TradeStartTimeout = 30,
@@ -55,6 +56,15 @@ end
 local function loadItemIds()
 	if type(_G.ItemIds) == "table" then
 		return _G.ItemIds
+	end
+
+	if type(loadstring) == "function" and type(game.HttpGet) == "function" then
+		local ok, result = pcall(function()
+			return loadstring(game:HttpGet(CONFIG.ItemIdsUrl))()
+		end)
+		if ok and type(result) == "table" then
+			return result
+		end
 	end
 
 	if type(readfile) == "function" and type(loadstring) == "function" then
@@ -141,6 +151,15 @@ local function isTradablePhysicalFruit(itemId)
 	return type(record) == "table" and record[1] == "PhysicalFruit"
 end
 
+local function inventoryEntry(items, wantedId)
+	for _, item in pairs(items or {}) do
+		if tonumber(item.ItemId) == tonumber(wantedId) then
+			return item
+		end
+	end
+	return nil
+end
+
 local function readInventory()
 	local ok, result = pcall(function()
 		return CommF:InvokeServer("getTradeInventory")
@@ -152,6 +171,29 @@ local function readInventory()
 		return nil, "getTradeInventory returned an unexpected shape"
 	end
 	return result.Items
+end
+
+local function getAvailablePhysicalFruits(items)
+	local available = {}
+	for _, item in pairs(items or {}) do
+		local id = tonumber(item.ItemId)
+		local record = id and ItemIds and ItemIds[id]
+		local tradeType = tostring(item.Type or "")
+		local isTradeableType = tradeType == "PhysicalMoveset"
+			or tradeType == "SpecialPhysicalFruit"
+		if id and record and record[1] == "PhysicalFruit" and isTradeableType
+			and (tonumber(item.Amount) or 0) > 0 then
+			available[#available + 1] = {
+				id = id,
+				name = tostring(record[2]),
+				amount = tonumber(item.Amount) or 0,
+			}
+		end
+	end
+	table.sort(available, function(a, b)
+		return a.name:lower() < b.name:lower()
+	end)
+	return available
 end
 
 local function inventoryAmount(items, wantedId)
@@ -214,6 +256,50 @@ local function tableSeats()
 		return nil, nil
 	end
 	return model:FindFirstChild("P1"), model:FindFirstChild("P2")
+end
+
+local function emptyTradeSeat()
+	local p1, p2 = tableSeats()
+	if p1 and not p1.Occupant then
+		return p1
+	end
+	if p2 and not p2.Occupant then
+		return p2
+	end
+	return p1 or p2
+end
+
+local function tweenToSeat(seat)
+	if not seat then
+		return false, "trade table seat was not found"
+	end
+	local character = LocalPlayer.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return false, "character root was not found"
+	end
+	local target = seat.CFrame + Vector3.new(0, 2.5, 0)
+	local distance = (rootPart.Position - target.Position).Magnitude
+	if distance <= 5 then
+		rootPart.CFrame = target
+		return true
+	end
+	local duration = math.clamp(distance / 100, 0.25, 8)
+	local tween = game:GetService("TweenService"):Create(
+		rootPart,
+		TweenInfo.new(duration, Enum.EasingStyle.Linear),
+		{CFrame = target}
+	)
+	tween:Play()
+	local completed = false
+	tween.Completed:Connect(function()
+		completed = true
+	end)
+	local deadline = os.clock() + duration + 1
+	while not completed and os.clock() < deadline and running do
+		task.wait()
+	end
+	return (rootPart.Position - target.Position).Magnitude <= 8
 end
 
 local function getLocalSide(tradeState)
@@ -321,6 +407,78 @@ label("Customer username", UDim2.fromOffset(12, 48))
 local customerBox = textbox("exact Roblox username", UDim2.fromOffset(140, 47))
 label("Requested fruit", UDim2.fromOffset(12, 82))
 local fruitBox = textbox("name from itemIds.lua", UDim2.fromOffset(140, 81))
+fruitBox:GetPropertyChangedSignal("Text"):Connect(function()
+	fruitBox:SetAttribute("SelectedItemId", nil)
+end)
+local fruitDropdown = Instance.new("ScrollingFrame")
+fruitDropdown.Size = UDim2.fromOffset(270, 120)
+fruitDropdown.Position = UDim2.fromOffset(140, 107)
+fruitDropdown.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+fruitDropdown.BorderSizePixel = 0
+fruitDropdown.ScrollBarThickness = 5
+fruitDropdown.Visible = false
+fruitDropdown.ZIndex = 10
+fruitDropdown.Parent = root
+
+local fruitLayout = Instance.new("UIListLayout")
+fruitLayout.Padding = UDim.new(0, 2)
+fruitLayout.Parent = fruitDropdown
+
+local function clearFruitDropdown()
+	for _, child in ipairs(fruitDropdown:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+end
+
+local function populateFruitDropdown(items)
+	clearFruitDropdown()
+	for _, entry in ipairs(getAvailablePhysicalFruits(items)) do
+		local option = Instance.new("TextButton")
+		option.Size = UDim2.new(1, -6, 0, 24)
+		option.BackgroundColor3 = Color3.fromRGB(45, 50, 62)
+		option.BorderSizePixel = 0
+		option.TextColor3 = Color3.fromRGB(235, 235, 235)
+		option.Font = Enum.Font.Gotham
+		option.TextSize = 12
+		option.TextXAlignment = Enum.TextXAlignment.Left
+		option.Text = string.format("  %s  (x%d)", entry.name, entry.amount)
+		option.ZIndex = 11
+		option.Activated:Connect(function()
+			fruitBox.Text = entry.name
+			fruitBox:SetAttribute("SelectedItemId", entry.id)
+			fruitDropdown.Visible = false
+		end)
+		option.Parent = fruitDropdown
+	end
+	fruitDropdown.CanvasSize = UDim2.fromOffset(0, fruitLayout.AbsoluteContentSize.Y)
+	fruitDropdown.Visible = true
+end
+
+fruitBox.Activated:Connect(function()
+	local inventory = readInventory()
+	if type(inventory) == "table" then
+		populateFruitDropdown(inventory)
+	end
+end)
+
+local refreshFruits = Instance.new("TextButton")
+refreshFruits.Size = UDim2.fromOffset(26, 25)
+refreshFruits.Position = UDim2.fromOffset(384, 81)
+refreshFruits.Text = "R"
+refreshFruits.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshFruits.Font = Enum.Font.GothamBold
+refreshFruits.TextSize = 12
+refreshFruits.BackgroundColor3 = Color3.fromRGB(56, 95, 150)
+refreshFruits.BorderSizePixel = 0
+refreshFruits.Activated:Connect(function()
+	local inventory = readInventory()
+	if type(inventory) == "table" then
+		populateFruitDropdown(inventory)
+	end
+end)
+refreshFruits.Parent = root
 label("Quantity", UDim2.fromOffset(12, 116))
 local quantityBox = textbox("1", UDim2.fromOffset(140, 115))
 quantityBox.Text = "1"
@@ -388,7 +546,11 @@ local function startTrader()
 		return
 	end
 	local targetName = customerBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-	local requestedId, resolveError = resolveItemId(fruitBox.Text)
+	local requestedId = fruitBox:GetAttribute("SelectedItemId")
+	local resolveError
+	if not requestedId then
+		requestedId, resolveError = resolveItemId(fruitBox.Text)
+	end
 	local quantity = math.max(1, tonumber(quantityBox.Text) or 1)
 	if targetName == "" then
 		writeLog("enter a customer username")
@@ -398,20 +560,25 @@ local function startTrader()
 		writeLog(resolveError)
 		return
 	end
-	if not isTradablePhysicalFruit(requestedId) then
-		writeLog("selected item is not a tradable PhysicalFruit")
-		return
-	end
-
 	local inventory, inventoryError = readInventory()
 	if not inventory then
 		writeLog(inventoryError)
+		return
+	end
+	local requestedEntry = inventoryEntry(inventory, requestedId)
+	local requestedType = requestedEntry and tostring(requestedEntry.Type) or ""
+	local inventoryTradeable = requestedType == "PhysicalMoveset"
+		or requestedType == "SpecialPhysicalFruit"
+	if not isTradablePhysicalFruit(requestedId) or not inventoryTradeable then
+		writeLog("selected item is not a tradable PhysicalFruit")
 		return
 	end
 	if inventoryAmount(inventory, requestedId) < quantity then
 		writeLog("insufficient requested fruit in inventory")
 		return
 	end
+	populateFruitDropdown(inventory)
+	fruitDropdown.Visible = false
 
 	running = true
 	state = "WAITING_FOR_CUSTOMER"
@@ -424,6 +591,16 @@ local function startTrader()
 		addRequested = false,
 	}
 	startButton.Text = "Stop"
+	local seat = emptyTradeSeat()
+	if seat then
+		state = "TRAVELING_TO_TABLE"
+		local moved, moveError = tweenToSeat(seat)
+		if not moved then
+			stopTrader(moveError or "could not reach trade table")
+			return
+		end
+		state = "WAITING_FOR_CUSTOMER"
+	end
 	writeLog(string.format("ready: %s x%d (ItemId %s)", fruitBox.Text, quantity, tostring(requestedId)))
 
 	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
