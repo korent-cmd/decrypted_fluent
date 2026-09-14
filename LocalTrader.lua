@@ -456,7 +456,7 @@ local function populateFruitDropdown(items)
 	fruitDropdown.Visible = true
 end
 
-fruitBox.Activated:Connect(function()
+fruitBox.Focused:Connect(function()
 	local inventory = readInventory()
 	if type(inventory) == "table" then
 		populateFruitDropdown(inventory)
