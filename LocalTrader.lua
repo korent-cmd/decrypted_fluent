@@ -37,6 +37,7 @@ local lastOfferSignature = nil
 local lastLoggedOfferSignature = nil
 local connections = {}
 local logLines = {}
+local sessionSequence = 0
 
 local function disconnectAll()
 	for _, connection in ipairs(connections) do
@@ -315,6 +316,19 @@ local function tweenToSeat(seat)
 	return (rootPart.Position - target.Position).Magnitude <= 8
 end
 
+local function jumpOutOfTrade()
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return false
+	end
+	pcall(function()
+		humanoid.Jump = true
+		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	end)
+	return true
+end
+
 local function getLocalSide(tradeState)
 	if not tradeState or not tradeState.Trader then
 		return nil
@@ -524,6 +538,17 @@ local function writeLog(message)
 	status.Text = "Status: " .. state .. "\n" .. message
 end
 
+local function setState(nextState, message)
+	local previous = state
+	state = nextState
+	if session then
+		session.stageStartedAt = os.clock()
+	end
+	if previous ~= nextState or message then
+		writeLog(string.format("state %s -> %s%s", previous, nextState, message and (": " .. message) or ""))
+	end
+end
+
 local function copyLog()
 	local text = table.concat(logLines, "\n")
 	if text == "" then
@@ -557,6 +582,7 @@ end
 
 local startButton
 local function stopTrader(reason)
+	local stoppedSessionId = session and session.id
 	running = false
 	state = "IDLE"
 	latestTradeState = nil
@@ -567,7 +593,7 @@ local function stopTrader(reason)
 	if startButton then
 		startButton.Text = "Start"
 	end
-	writeLog(reason or "stopped")
+	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
 end
 
 local function startTrader()
@@ -610,35 +636,53 @@ local function startTrader()
 	fruitDropdown.Visible = false
 
 	running = true
+	sessionSequence = sessionSequence + 1
 	state = "WAITING_FOR_CUSTOMER"
 	session = {
+		id = sessionSequence,
 		customerName = targetName,
 		requestedId = requestedId,
 		quantity = quantity,
 		inventoryBefore = inventoryAmount(inventory, requestedId),
 		startedAt = os.clock(),
+		stageStartedAt = os.clock(),
 		addRequested = false,
 		lastRetween = 0,
 	}
 	startButton.Text = "Stop"
 	local seat = emptyTradeSeat()
 	if seat then
-		state = "TRAVELING_TO_TABLE"
+		setState("TRAVELING_TO_TABLE")
 		local moved, moveError = tweenToSeat(seat)
 		if not moved then
 			stopTrader(moveError or "could not reach trade table")
 			return
 		end
-		state = "WAITING_FOR_CUSTOMER"
+		setState("WAITING_FOR_CUSTOMER")
 	end
 	writeLog(string.format("ready: %s x%d (ItemId %s, catalog=%s, inventory=%s)",
 		fruitBox.Text, quantity, tostring(requestedId), tostring(itemRecord(requestedId) and itemRecord(requestedId)[1]), tostring(requestedType)))
+	writeLog("session " .. tostring(session.id) .. " started")
 
 	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
 		if not running or not session then
 			return
 		end
 		if type(tradeState) ~= "table" then
+			return
+		end
+		if session.ignoreTrade then
+			if eventName == "leave" then
+				session.ignoreTrade = false
+				session.localSide = nil
+				session.addRequested = false
+				lastOfferSignature = nil
+				lastLoggedOfferSignature = nil
+				latestTradeState = nil
+				setState("WAITING_FOR_CUSTOMER", "unwanted trade ended")
+				session.startedAt = os.clock()
+				writeLog("unwanted trade ended; continuing to wait for the assigned customer")
+			end
 			return
 		end
 		latestTradeState = tradeState
@@ -649,11 +693,15 @@ local function startTrader()
 			local otherId = localSide and tradeState.Trader[otherSide]
 			local otherPlayer = otherId and Players:GetPlayerByUserId(otherId)
 			if not otherPlayer or otherPlayer.Name:lower() ~= session.customerName:lower() then
-				writeLog("wrong customer; canceling session")
-				pcall(function() TradeFunction:InvokeServer("cancel") end)
+				session.ignoreTrade = true
+				setState("WAITING_FOR_CUSTOMER", "wrong customer; jumping out")
+				latestTradeState = nil
+				session.startedAt = os.clock()
+				writeLog("wrong customer; jumping out and continuing to wait")
+				jumpOutOfTrade()
 				return
 			end
-			state = "TRADE_STARTED"
+			setState("TRADE_STARTED")
 			session.localSide = localSide
 			session.startedAt = os.clock()
 			writeLog(string.format("trade started with %s (UserId %s, localSide=%d)", otherPlayer.Name, tostring(otherId), localSide))
@@ -680,7 +728,7 @@ local function startTrader()
 			end
 
 			if not localHasRequested and not session.addRequested and tradeState.State.Type == "NotReady" then
-				state = "OFFERING_ORDER_ITEM"
+				setState("OFFERING_ORDER_ITEM")
 				session.addRequested = true
 				local ok, result = pcall(function()
 					for _ = 1, session.quantity do
@@ -698,31 +746,31 @@ local function startTrader()
 					writeLog("requested fruit add requested")
 				end
 			elseif localHasRequested and tradeState.State.Type == "NotReady" then
-				state = "WAITING_FOR_CUSTOMER_OFFER"
+				setState("WAITING_FOR_CUSTOMER_OFFER")
 				if countItems(customerItems) > 0
 					and tradeState.State.Ready[localSide] ~= true
 					and os.clock() - lastAccept >= CONFIG.AcceptInterval then
 					lastOfferSignature = signature
 					lastAccept = os.clock()
-					state = "ACCEPTING"
+					setState("ACCEPTING")
 					local ok, result = pcall(function()
 						return TradeFunction:InvokeServer("accept")
 					end)
 					writeLog(ok and "accept requested" or ("accept failed: " .. tostring(result)))
 				end
 			elseif tradeState.State.Type == "Countdown" then
-				state = "COUNTDOWN"
+				setState("COUNTDOWN")
 				writeLog("countdown started; leaving table is not allowed")
 			elseif tradeState.State.Type == "Processing" then
-				state = "PROCESSING"
+				setState("PROCESSING")
 				writeLog("trade processing")
 			end
 		elseif eventName == "countdown_cancel" then
-			state = "TRADE_STARTED"
+			setState("TRADE_STARTED")
 			writeLog("countdown canceled; waiting for a stable offer")
 		elseif eventName == "leave" then
 			if tradeState.State and tradeState.State.Type == "Processing" then
-				state = "VERIFYING_INVENTORY"
+				setState("VERIFYING_INVENTORY")
 				local inventoryAfter = readInventory()
 				local before = session.inventoryBefore or 0
 				local after = type(inventoryAfter) == "table" and inventoryAmount(inventoryAfter, session.requestedId) or nil
@@ -734,7 +782,7 @@ local function startTrader()
 					stopTrader("verification failed")
 				end
 			else
-				state = "WAITING_FOR_CUSTOMER"
+				setState("WAITING_FOR_CUSTOMER", "customer left")
 				latestTradeState = nil
 				session.startedAt = os.clock()
 				session.addRequested = false
@@ -747,14 +795,28 @@ local function startTrader()
 	end)
 end
 
+local function retryTrader()
+	if running then
+		stopTrader("retry requested")
+		task.wait(0.2)
+	end
+	startTrader()
+end
+
 startButton = button("Start", UDim2.fromOffset(12, 270), 195, startTrader)
 button("Stop", UDim2.fromOffset(220, 270), 195, function()
 	stopTrader("stopped by user")
 end)
-button("Copy Log", UDim2.fromOffset(12, 300), 403, copyLog, Color3.fromRGB(65, 105, 145))
+button("Retry", UDim2.fromOffset(12, 300), 128, retryTrader, Color3.fromRGB(120, 95, 50))
+button("Copy Log", UDim2.fromOffset(149, 300), 128, copyLog, Color3.fromRGB(65, 105, 145))
+button("Clear Log", UDim2.fromOffset(286, 300), 129, function()
+	logLines = {}
+	logBox.Text = ""
+	writeLog("log cleared")
+end, Color3.fromRGB(90, 65, 90))
 
 local function retweenToTableIfNeeded()
-	if not running or not session or state ~= "WAITING_FOR_CUSTOMER" then
+	if not running or not session or session.ignoreTrade or state ~= "WAITING_FOR_CUSTOMER" then
 		return
 	end
 	if os.clock() - session.lastRetween < CONFIG.RetweenInterval then
@@ -771,13 +833,13 @@ local function retweenToTableIfNeeded()
 		return
 	end
 	session.lastRetween = os.clock()
-	state = "TRAVELING_TO_TABLE"
+	setState("TRAVELING_TO_TABLE")
 	local moved, errorMessage = tweenToSeat(targetSeat)
 	if moved then
-		state = "WAITING_FOR_CUSTOMER"
+		setState("WAITING_FOR_CUSTOMER", "re-tween complete")
 		writeLog("re-tweened to trade table")
 	else
-		state = "WAITING_FOR_CUSTOMER"
+		setState("WAITING_FOR_CUSTOMER", "re-tween failed")
 		writeLog("re-tween failed: " .. tostring(errorMessage))
 	end
 end
@@ -787,13 +849,18 @@ RunService.Heartbeat:Connect(function()
 		return
 	end
 	retweenToTableIfNeeded()
-	local elapsed = os.clock() - session.startedAt
+	local elapsed = os.clock() - (session.stageStartedAt or session.startedAt)
 	if state == "WAITING_FOR_CUSTOMER" and elapsed > CONFIG.CustomerWaitTimeout then
-		stopTrader("customer wait timed out")
+		setState("TIMEOUT")
+		stopTrader("customer arrival timeout")
+	elseif state == "TRADE_STARTED" and elapsed > CONFIG.TradeStartTimeout then
+		setState("TIMEOUT")
+		stopTrader("trade offer timeout")
 	elseif state ~= "WAITING_FOR_CUSTOMER" and state ~= "IDLE"
 		and state ~= "PROCESSING" and state ~= "VERIFYING_INVENTORY"
-		and elapsed > CONFIG.CompletionTimeout then
-		stopTrader("trade timed out")
+		and state ~= "TIMEOUT" and elapsed > CONFIG.CompletionTimeout then
+		setState("TIMEOUT")
+		stopTrader("stage timeout: " .. state)
 	end
 end)
 
