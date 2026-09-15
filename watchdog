@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+Roblox Watchdog - Termux (rooted) edition, no ADB required
+-------------------------------------------------------------
+Runs directly on the cloud phone inside Termux. Uses `su` to force-stop
+and relaunch Roblox when it crashes, and to force a periodic rejoin.
+
+REQUIREMENTS (run once in Termux)
+    pkg update && pkg install python
+    Make sure `su` works when you type it in Termux and grant it root
+    when prompted (Magisk / whatever root manager the cloud phone uses).
+
+USAGE
+    Edit PLACE_ID and the interval settings below, then:
+        python3 roblox_watchdog_termux.py
+    Leave Termux running in the background (disable battery
+    optimization for Termux in Android settings, or it'll get killed).
+"""
+
+import subprocess
+import time
+import logging
+import datetime
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+
+PACKAGE_MATCH = "roblox"          # substring used to auto-detect installed Roblox packages/clones
+
+# Optional: map a specific package name -> place ID, for when different
+# clones should join different places. Anything not listed here falls
+# back to DEFAULT_PLACE_ID.
+PLACE_ID_MAP = {
+    # "com.roblox.client": "1234567890",
+    # "com.roblox.client.clone1": "9876543210",
+}
+DEFAULT_PLACE_ID = "1234567890"    # <-- set your default target place ID
+
+REJOIN_INTERVAL_MIN = 45          # force a rejoin this often even without a crash
+CHECK_INTERVAL_SEC = 20            # how often to poll for a crash
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("watchdog")
+
+
+# ----------------------------------------------------------------------
+# ROOT SHELL HELPERS
+# ----------------------------------------------------------------------
+
+def su(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
+    """Run a shell command as root via `su -c`."""
+    return subprocess.run(
+        ["su", "-c", cmd], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def discover_roblox_packages() -> list:
+    """Enumerate every installed package whose name contains PACKAGE_MATCH,
+    which catches the real Roblox app plus any cloned copies."""
+    result = su(f"pm list packages | grep -i {PACKAGE_MATCH}")
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    packages = []
+    for line in result.stdout.strip().splitlines():
+        # lines look like "package:com.roblox.client"
+        if line.startswith("package:"):
+            packages.append(line.split("package:", 1)[1].strip())
+    return sorted(packages)
+
+
+def is_running(package: str) -> bool:
+    result = su(f"pidof {package}")
+    return result.returncode == 0 and result.stdout.strip() != ""
+
+
+def force_stop(package: str):
+    su(f"am force-stop {package}")
+
+
+def wake_screen():
+    su("input keyevent KEYCODE_WAKEUP")
+
+
+def dismiss_keyguard():
+    # Best-effort swipe-up to clear a simple (non-PIN) lock screen.
+    su("input keyevent KEYCODE_MENU")
+
+
+def launch_place(package: str, place_id: str):
+    """
+    Deep-links into a specific place. If the games/ URL stops working
+    after an app update, try the app's own scheme instead:
+        su(f"am start -a android.intent.action.VIEW -d 'roblox://placeId={place_id}' {package}")
+    """
+    url = f"https://www.roblox.com/games/{place_id}/"
+    su(f"am start -a android.intent.action.VIEW -d '{url}' {package}")
+
+
+def place_for(package: str) -> str:
+    return PLACE_ID_MAP.get(package, DEFAULT_PLACE_ID)
+
+
+# ----------------------------------------------------------------------
+# MAIN LOOP
+# ----------------------------------------------------------------------
+
+def rejoin(package: str, reason: str):
+    log.info(f"[{package}] Rejoining ({reason})")
+    wake_screen()
+    dismiss_keyguard()
+    force_stop(package)
+    time.sleep(2)
+    launch_place(package, place_for(package))
+
+
+def main():
+    packages = discover_roblox_packages()
+    if not packages:
+        log.error(
+            f"No installed packages matched '{PACKAGE_MATCH}'. "
+            "Check that PACKAGE_MATCH is right and su/root works."
+        )
+        return
+
+    log.info(f"Watching {len(packages)} package(s): {', '.join(packages)}")
+    last_rejoin = {pkg: None for pkg in packages}
+
+    while True:
+        now = datetime.datetime.now()
+        for pkg in packages:
+            try:
+                running = is_running(pkg)
+                due = (
+                    last_rejoin[pkg] is None
+                    or (now - last_rejoin[pkg]) >= datetime.timedelta(minutes=REJOIN_INTERVAL_MIN)
+                )
+
+                if not running:
+                    rejoin(pkg, "crash detected")
+                    last_rejoin[pkg] = now
+                elif due:
+                    rejoin(pkg, "scheduled interval")
+                    last_rejoin[pkg] = now
+                else:
+                    log.info(f"[{pkg}] OK (running)")
+
+            except subprocess.TimeoutExpired:
+                log.error(f"[{pkg}] su command timed out, retrying next cycle")
+            except Exception as e:
+                log.error(f"[{pkg}] unexpected error: {e}")
+
+        time.sleep(CHECK_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Stopped.")
