@@ -283,6 +283,16 @@ local function emptyTradeSeat()
 	return p1 or p2
 end
 
+local function isSeatedAtTradeTable()
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or not humanoid.Sit then
+		return false
+	end
+	local p1, p2 = tableSeats()
+	return (p1 and p1.Occupant == humanoid) or (p2 and p2.Occupant == humanoid) or false
+end
+
 local function tweenToSeat(seat)
 	if not seat then
 		return false, "trade table seat was not found"
@@ -658,11 +668,16 @@ local function startTrader()
 			stopTrader(moveError or "could not reach trade table")
 			return
 		end
+		session.lastRetween = os.clock()
 		setState("WAITING_FOR_CUSTOMER")
 	end
 	writeLog(string.format("ready: %s x%d (ItemId %s, catalog=%s, inventory=%s)",
 		fruitBox.Text, quantity, tostring(requestedId), tostring(itemRecord(requestedId) and itemRecord(requestedId)[1]), tostring(requestedType)))
-	writeLog("session " .. tostring(session.id) .. " started")
+	if isSeatedAtTradeTable() then
+		writeLog("session " .. tostring(session.id) .. " started; worker seated")
+	else
+		writeLog("session " .. tostring(session.id) .. " started; worker reached table and is waiting to sit")
+	end
 
 	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
 		if not running or not session then
