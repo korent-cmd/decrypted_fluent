@@ -329,10 +329,29 @@ end
 local function jumpOutOfTrade()
 	local character = LocalPlayer.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if not humanoid then
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not rootPart then
 		return false
 	end
 	pcall(function()
+		-- A seat can immediately re-seat a character that only receives Jump.
+		-- Move clear of the table first, then leave the trade state.
+		local seat = humanoid.SeatPart
+		local escapeCFrame
+		if seat then
+			escapeCFrame = seat.CFrame * CFrame.new(0, 3, 10)
+		else
+			local p1, p2 = tableSeats()
+			local tablePart = p1 or p2
+			if tablePart then
+				escapeCFrame = tablePart.CFrame * CFrame.new(0, 3, 10)
+			end
+		end
+		humanoid.Sit = false
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		if escapeCFrame then
+			rootPart.CFrame = escapeCFrame
+		end
 		humanoid.Jump = true
 		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 	end)
