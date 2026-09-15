@@ -334,8 +334,7 @@ local function jumpOutOfTrade()
 		return false
 	end
 	pcall(function()
-		-- A seat can immediately re-seat a character that only receives Jump.
-		-- Move clear of the table first, then leave the trade state.
+		-- Jump first so Roblox releases the seat before we tween clear of the table.
 		local seat = humanoid.SeatPart
 		local escapeCFrame
 		if seat then
@@ -347,13 +346,28 @@ local function jumpOutOfTrade()
 				escapeCFrame = tablePart.CFrame * CFrame.new(0, 3, 10)
 			end
 		end
-		humanoid.Sit = false
-		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-		if escapeCFrame then
-			rootPart.CFrame = escapeCFrame
-		end
 		humanoid.Jump = true
 		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		local releaseDeadline = os.clock() + 1
+		while humanoid.SeatPart and os.clock() < releaseDeadline do
+			task.wait()
+		end
+		if humanoid.SeatPart then
+			-- Fallback if the seat did not release from the jump request.
+			humanoid.Sit = false
+			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+			task.wait()
+		end
+		if escapeCFrame then
+			local distance = (rootPart.Position - escapeCFrame.Position).Magnitude
+			local tween = game:GetService("TweenService"):Create(
+				rootPart,
+				TweenInfo.new(math.clamp(distance / 35, 0.25, 1), Enum.EasingStyle.Linear),
+				{CFrame = escapeCFrame}
+			)
+			tween:Play()
+			tween.Completed:Wait()
+		end
 	end)
 	return true
 end
