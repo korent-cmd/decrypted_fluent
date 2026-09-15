@@ -35,9 +35,9 @@ PLACE_ID_MAP = {
     # "com.roblox.client": "1234567890",
     # "com.roblox.client.clone1": "9876543210",
 }
-DEFAULT_PLACE_ID = "1234567890"    # <-- set your default target place ID
+DEFAULT_PLACE_ID = "2753915549"    # <-- set your default target place ID
 
-REJOIN_INTERVAL_MIN = 45          # force a rejoin this often even without a crash
+REJOIN_INTERVAL_MIN = 60          # force a rejoin this often even without a crash
 CHECK_INTERVAL_SEC = 20            # how often to poll for a crash
 
 logging.basicConfig(
