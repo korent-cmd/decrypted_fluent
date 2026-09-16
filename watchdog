@@ -1,164 +1,1015 @@
 #!/usr/bin/env python3
-"""
-Roblox Watchdog - Termux (rooted) edition, no ADB required
--------------------------------------------------------------
-Runs directly on the cloud phone inside Termux. Uses `su` to force-stop
-and relaunch Roblox when it crashes, and to force a periodic rejoin.
+# ==============================================================================
+#  ROBLOX WATCHDOG v3 - interactive edition for Termux (rooted Android)
+# ==============================================================================
+#  PASTE-TO-INSTALL (no download needed). In Termux:
+#
+#      1.  cat > rw.py
+#      2.  paste this entire file, press Enter
+#      3.  press Ctrl+D  (this ends the paste and writes the file)
+#
+#  Then just run it - no flags, no arguments, everything is menu-driven:
+#
+#      python3 rw.py
+#
+#  Menu option 1 ("Auto setup") does the whole thing: checks root, finds your
+#  Roblox packages (even renamed clones), asks for your place ID, saves the
+#  config, and offers to start farming immediately.
+# ==============================================================================
 
-REQUIREMENTS (run once in Termux)
-    pkg update && pkg install python
-    Make sure `su` works when you type it in Termux and grant it root
-    when prompted (Magisk / whatever root manager the cloud phone uses).
+from __future__ import annotations
 
-USAGE
-    Edit PLACE_ID and the interval settings below, then:
-        python3 roblox_watchdog_termux.py
-    Leave Termux running in the background (disable battery
-    optimization for Termux in Android settings, or it'll get killed).
-"""
-
+import json
+import os
+import random
+import re
+import shlex
+import signal
 import subprocess
+import sys
 import time
-import logging
-import datetime
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
+VERSION = "3.0"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "watchdog_config.json")
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "watchdog.log")
 
-PACKAGE_MATCH = "roblox"          # substring used to auto-detect installed Roblox packages/clones
-
-# Optional: map a specific package name -> place ID, for when different
-# clones should join different places. Anything not listed here falls
-# back to DEFAULT_PLACE_ID.
-PLACE_ID_MAP = {
-    # "com.roblox.client": "1234567890",
-    # "com.roblox.client.clone1": "9876543210",
-}
-DEFAULT_PLACE_ID = "2753915549"    # <-- set your default target place ID
-
-REJOIN_INTERVAL_MIN = 60          # force a rejoin this often even without a crash
-CHECK_INTERVAL_SEC = 20            # how often to poll for a crash
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("watchdog")
+PACKAGE_MARKERS = ["roblox", "rbx"]
+CLONER_BLOCKLIST = [
+    "com.applisto.appcloner", "com.lbe.parallel", "com.ludashi.dualspace",
+    "com.excelliance.dualaid", "com.oasisfeng.island", "com.parallel.space",
+    "do.multiple.space", "com.jumobile.multiapp",
+]
+ROBLOX_PROBE_URL = "https://www.roblox.com/games/1818/Classic-Crossroads"
+LAUNCH_URL_TEMPLATES = [
+    "https://www.roblox.com/games/{place_id}/",
+    "roblox://placeID={place_id}",
+    "roblox://placeId={place_id}",
+    "robloxmobile://placeID={place_id}",
+]
+MIN_CONFIDENCE = 2
 
 
-# ----------------------------------------------------------------------
-# ROOT SHELL HELPERS
-# ----------------------------------------------------------------------
+# ==============================================================================
+# TERMINAL HELPERS
+# ==============================================================================
 
-def su(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
-    """Run a shell command as root via `su -c`."""
-    return subprocess.run(
-        ["su", "-c", cmd], capture_output=True, text=True, timeout=timeout
-    )
-
-
-def discover_roblox_packages() -> list:
-    """Enumerate every installed package whose name contains PACKAGE_MATCH,
-    which catches the real Roblox app plus any cloned copies."""
-    result = su(f"pm list packages | grep -i {PACKAGE_MATCH}")
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-    packages = []
-    for line in result.stdout.strip().splitlines():
-        # lines look like "package:com.roblox.client"
-        if line.startswith("package:"):
-            packages.append(line.split("package:", 1)[1].strip())
-    return sorted(packages)
+class C:
+    """ANSI colors, auto-disabled when output isn't a terminal."""
+    _on = sys.stdout.isatty()
+    RESET = "\033[0m" if _on else ""
+    BOLD = "\033[1m" if _on else ""
+    DIM = "\033[2m" if _on else ""
+    RED = "\033[31m" if _on else ""
+    GREEN = "\033[32m" if _on else ""
+    YELLOW = "\033[33m" if _on else ""
+    BLUE = "\033[36m" if _on else ""
+    MAGENTA = "\033[35m" if _on else ""
 
 
-def is_running(package: str) -> bool:
-    result = su(f"pidof {package}")
-    return result.returncode == 0 and result.stdout.strip() != ""
+def clear() -> None:
+    print("\033[2J\033[H", end="")
 
 
-def force_stop(package: str):
-    su(f"am force-stop {package}")
+def banner() -> None:
+    print(f"{C.BLUE}{C.BOLD}")
+    print("  ____  _     _       __        __    _       _         _")
+    print(" |  _ \\| |   | |_  __ \\ \\      / /_ _| |_ ___| |__   __| | ___   __ _")
+    print(" | |_) | |   | \\ \\/ /  \\ \\ /\\ / / _` | __/ __| '_ \\ / _` |/ _ \\ / _` |")
+    print(" |  _ <| |___| |>  <    \\ V  V / (_| | || (__| | | | (_| | (_) | (_| |")
+    print(" |_| \\_\\_____|_/_/\\_\\    \\_/\\_/ \\__,_|\\__\\___|_| |_|\\__,_|\\___/ \\__, |")
+    print(f"                                                               |___/")
+    print(f"{C.RESET}{C.DIM}                   v{VERSION}  ·  termux edition  ·  no adb{C.RESET}\n")
 
 
-def wake_screen():
-    su("input keyevent KEYCODE_WAKEUP")
+def hr(char: str = "-") -> None:
+    print(C.DIM + char * 64 + C.RESET)
 
 
-def dismiss_keyguard():
-    # Best-effort swipe-up to clear a simple (non-PIN) lock screen.
-    su("input keyevent KEYCODE_MENU")
+def ok(msg: str) -> None:
+    print(f"  {C.GREEN}[+]{C.RESET} {msg}")
 
 
-def launch_place(package: str, place_id: str):
-    """
-    Deep-links into a specific place. If the games/ URL stops working
-    after an app update, try the app's own scheme instead:
-        su(f"am start -a android.intent.action.VIEW -d 'roblox://placeId={place_id}' {package}")
-    """
-    url = f"https://www.roblox.com/games/{place_id}/"
-    su(f"am start -a android.intent.action.VIEW -d '{url}' {package}")
+def warn(msg: str) -> None:
+    print(f"  {C.YELLOW}[!]{C.RESET} {msg}")
 
 
-def place_for(package: str) -> str:
-    return PLACE_ID_MAP.get(package, DEFAULT_PLACE_ID)
+def err(msg: str) -> None:
+    print(f"  {C.RED}[x]{C.RESET} {msg}")
 
 
-# ----------------------------------------------------------------------
-# MAIN LOOP
-# ----------------------------------------------------------------------
-
-def rejoin(package: str, reason: str):
-    log.info(f"[{package}] Rejoining ({reason})")
-    wake_screen()
-    dismiss_keyguard()
-    force_stop(package)
-    time.sleep(2)
-    launch_place(package, place_for(package))
+def info(msg: str) -> None:
+    print(f"  {C.BLUE}[*]{C.RESET} {msg}")
 
 
-def main():
-    packages = discover_roblox_packages()
-    if not packages:
-        log.error(
-            f"No installed packages matched '{PACKAGE_MATCH}'. "
-            "Check that PACKAGE_MATCH is right and su/root works."
-        )
-        return
+def ask(prompt: str, default: str = "") -> str:
+    suffix = f" {C.DIM}[{default}]{C.RESET}" if default else ""
+    try:
+        val = input(f"  {C.BOLD}>{C.RESET} {prompt}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return val or default
 
-    log.info(f"Watching {len(packages)} package(s): {', '.join(packages)}")
-    last_rejoin = {pkg: None for pkg in packages}
 
+def ask_yes(prompt: str, default: bool = True) -> bool:
+    d = "Y/n" if default else "y/N"
+    val = ask(f"{prompt} ({d})").lower()
+    if not val:
+        return default
+    return val.startswith("y")
+
+
+def ask_int(prompt: str, default: int, lo: int = 0, hi: int = 10 ** 9) -> int:
     while True:
-        now = datetime.datetime.now()
-        for pkg in packages:
-            try:
-                running = is_running(pkg)
-                due = (
-                    last_rejoin[pkg] is None
-                    or (now - last_rejoin[pkg]) >= datetime.timedelta(minutes=REJOIN_INTERVAL_MIN)
-                )
+        raw = ask(prompt, str(default))
+        try:
+            v = int(raw)
+            if lo <= v <= hi:
+                return v
+            warn(f"Enter a number between {lo} and {hi}.")
+        except ValueError:
+            warn("Numbers only.")
 
-                if not running:
-                    rejoin(pkg, "crash detected")
-                    last_rejoin[pkg] = now
-                elif due:
-                    rejoin(pkg, "scheduled interval")
-                    last_rejoin[pkg] = now
+
+def pause() -> None:
+    try:
+        input(f"\n  {C.DIM}press Enter to continue{C.RESET}")
+    except EOFError:
+        pass
+
+
+def spinner(msg: str) -> None:
+    print(f"  {C.DIM}... {msg}{C.RESET}")
+
+
+def logline(msg: str, level: str = "INFO") -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    color = {"INFO": C.RESET, "OK": C.GREEN, "WARN": C.YELLOW,
+             "ERR": C.RED}.get(level, C.RESET)
+    print(f"  {C.DIM}{stamp}{C.RESET} {color}{msg}{C.RESET}")
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {msg}\n")
+    except OSError:
+        pass
+
+
+# ==============================================================================
+# SHELL
+# ==============================================================================
+
+class Shell:
+    def __init__(self, prefer_root: bool = True):
+        self.has_root = self._probe_root() if prefer_root else False
+        self._cache: Dict[str, str] = {}
+
+    def _probe_root(self) -> bool:
+        try:
+            r = subprocess.run(["su", "-c", "id"], capture_output=True,
+                               text=True, timeout=25)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0 and "uid=0" in r.stdout
+
+    def run(self, cmd: str, timeout: int = 25, root: bool = True) -> Tuple[int, str]:
+        argv = ["su", "-c", cmd] if (root and self.has_root) else ["sh", "-c", cmd]
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        except FileNotFoundError:
+            return 127, ""
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+    def out(self, cmd: str, timeout: int = 25, root: bool = True) -> str:
+        return self.run(cmd, timeout, root)[1]
+
+    def cached(self, cmd: str, timeout: int = 45) -> str:
+        if cmd not in self._cache:
+            self._cache[cmd] = self.out(cmd, timeout)
+        return self._cache[cmd]
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+
+# ==============================================================================
+# DETECTION
+# ==============================================================================
+
+@dataclass
+class Candidate:
+    package: str
+    user_id: int = 0
+    strategies: Set[str] = field(default_factory=set)
+    label: Optional[str] = None
+
+    @property
+    def confidence(self) -> int:
+        return len(self.strategies)
+
+    @property
+    def display(self) -> str:
+        return self.label or self.package
+
+
+class Detector:
+    def __init__(self, sh: Shell, markers: Optional[Sequence[str]] = None):
+        self.sh = sh
+        self.markers = [m.lower() for m in (markers or PACKAGE_MARKERS)]
+        self.found: Dict[Tuple[str, int], Candidate] = {}
+
+    def _matches(self, text: str) -> bool:
+        t = text.lower()
+        return any(m in t for m in self.markers)
+
+    def _blocked(self, pkg: str) -> bool:
+        p = pkg.lower()
+        return any(b in p for b in CLONER_BLOCKLIST)
+
+    def _add(self, pkg: str, uid: int, strat: str, label: Optional[str] = None) -> None:
+        pkg = pkg.strip()
+        if not pkg or "." not in pkg or self._blocked(pkg):
+            return
+        key = (pkg, uid)
+        c = self.found.get(key) or Candidate(package=pkg, user_id=uid)
+        c.strategies.add(strat)
+        if label and not c.label:
+            c.label = label
+        self.found[key] = c
+
+    def list_users(self) -> List[int]:
+        out = self.sh.cached("pm list users")
+        ids = [int(m) for m in re.findall(r"UserInfo\{(\d+):", out)]
+        return sorted(set(ids)) or [0]
+
+    def _packages(self, uid: int) -> List[str]:
+        out = self.sh.cached(f"pm list packages --user {uid}")
+        if not out.strip() or "Error" in out or "Exception" in out:
+            out = self.sh.cached("pm list packages") if uid == 0 else ""
+        return [l.split("package:", 1)[1].strip()
+                for l in out.splitlines() if l.startswith("package:")]
+
+    # -- strategies ------------------------------------------------------------
+
+    def s_name(self, uid: int) -> None:
+        for pkg in self._packages(uid):
+            if self._matches(pkg):
+                self._add(pkg, uid, "name")
+
+    def s_url_handler(self, uid: int) -> None:
+        """Clones keep Roblox's intent filters even when renamed."""
+        for probe in (
+            f"cmd package query-activities --user {uid} -a android.intent.action.VIEW "
+            f"-d {shlex.quote(ROBLOX_PROBE_URL)}",
+            f"cmd package query-activities --user {uid} -a android.intent.action.VIEW "
+            f"-d {shlex.quote('roblox://placeID=1818')}",
+            f"pm query-activities --user {uid} -a android.intent.action.VIEW "
+            f"-d {shlex.quote(ROBLOX_PROBE_URL)}",
+        ):
+            out = self.sh.out(probe, timeout=30)
+            if not out.strip():
+                continue
+            for pkg in re.findall(r"packageName=([A-Za-z0-9_.]+)", out):
+                self._add(pkg, uid, "url_handler")
+            for pkg in re.findall(r"^\s*([A-Za-z0-9_.]+)/[A-Za-z0-9_.$]+", out, re.M):
+                self._add(pkg, uid, "url_handler")
+
+    def s_apk_path(self, uid: int) -> None:
+        out = self.sh.cached(f"pm list packages -f --user {uid}")
+        if not out.strip():
+            out = self.sh.cached("pm list packages -f")
+        for line in out.splitlines():
+            if not line.startswith("package:") or "=" not in line:
+                continue
+            path, pkg = line.split("package:", 1)[1].rsplit("=", 1)
+            if self._matches(path):
+                self._add(pkg, uid, "apk_path")
+
+    def s_data_dir(self, uid: int) -> None:
+        if not self.sh.has_root:
+            return
+        base = "/data/data" if uid == 0 else f"/data/user/{uid}"
+        for name in self.sh.out(f"ls {base} 2>/dev/null", timeout=30).split():
+            if self._matches(name):
+                self._add(name, uid, "data_dir")
+        hits = self.sh.out(
+            f"find {base} -maxdepth 3 -iname '*roblox*' 2>/dev/null | head -n 200",
+            timeout=60)
+        depth = len(base.strip("/").split("/"))
+        for path in hits.splitlines():
+            parts = path.strip().strip("/").split("/")
+            if len(parts) > depth:
+                self._add(parts[depth], uid, "data_dir")
+
+    def s_process(self, uid: int) -> None:
+        out = self.sh.out("ps -A -o NAME 2>/dev/null || ps -A 2>/dev/null", timeout=25)
+        for tok in out.split():
+            if self._matches(tok) and "." in tok:
+                self._add(tok.split(":")[0], uid, "process")
+
+    def s_dumpsys(self, uid: int) -> None:
+        pkgs = set(self._packages(uid))
+        if not pkgs:
+            return
+        pattern = "|".join(self.markers)
+        out = self.sh.out(
+            f"dumpsys package packages 2>/dev/null | grep -iE 'Package \\[|{pattern}'",
+            timeout=90)
+        current = None
+        for line in out.splitlines():
+            m = re.search(r"Package \[([A-Za-z0-9_.]+)\]", line)
+            if m:
+                current = m.group(1)
+                continue
+            if current and current in pkgs and self._matches(line):
+                self._add(current, uid, "dumpsys")
+
+    def resolve_labels(self) -> None:
+        for c in self.found.values():
+            out = self.sh.out(
+                f"dumpsys package {shlex.quote(c.package)} 2>/dev/null "
+                f"| grep -m1 -i applicationLabel", timeout=20)
+            m = re.search(r"applicationLabel=(.+)", out)
+            if m:
+                c.label = m.group(1).strip()
+
+    def foreground(self) -> Optional[str]:
+        for cmd in (
+            "dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp'",
+            "dumpsys activity activities 2>/dev/null | grep -m1 -E "
+            "'ResumedActivity|mResumedActivity'",
+        ):
+            m = re.search(r"([A-Za-z0-9_.]+)/[A-Za-z0-9_.$]+",
+                          self.sh.out(cmd, timeout=25))
+            if m and "." in m.group(1):
+                return m.group(1)
+        return None
+
+    def detect(self, deep: bool = True, verbose: bool = True) -> List[Candidate]:
+        self.sh.clear_cache()
+        users = self.list_users()
+        if verbose:
+            info(f"Android user profiles found: {users}")
+
+        steps = [
+            ("package names", self.s_name),
+            ("deep-link handlers", self.s_url_handler),
+            ("apk paths", self.s_apk_path),
+            ("app data folders", self.s_data_dir),
+            ("running processes", self.s_process),
+        ]
+        if deep:
+            steps.append(("package records (slow)", self.s_dumpsys))
+
+        for uid in users:
+            for name, fn in steps:
+                if verbose:
+                    spinner(f"scanning {name} (user {uid})")
+                try:
+                    fn(uid)
+                except Exception as e:
+                    if verbose:
+                        warn(f"{name} failed: {e}")
+
+        fg = self.foreground()
+        if fg and not self._blocked(fg):
+            if (fg, 0) in self.found:
+                self.found[(fg, 0)].strategies.add("foreground")
+            elif self._matches(fg):
+                self._add(fg, 0, "foreground")
+
+        self.resolve_labels()
+        return sorted(self.found.values(),
+                      key=lambda c: (-c.confidence, c.user_id, c.package))
+
+
+# ==============================================================================
+# TARGETS + CONTROL
+# ==============================================================================
+
+@dataclass
+class Target:
+    package: str
+    user_id: int = 0
+    place_id: str = ""
+    private_link: str = ""
+    rejoin_interval_min: int = 45
+    label: str = ""
+    enabled: bool = True
+
+    last_rejoin: Optional[datetime] = field(default=None, repr=False, compare=False)
+    last_cpu: Optional[int] = field(default=None, repr=False, compare=False)
+    stale_ticks: int = field(default=0, repr=False, compare=False)
+    fail_streak: int = field(default=0, repr=False, compare=False)
+    cooldown_until: Optional[datetime] = field(default=None, repr=False, compare=False)
+    restarts: int = field(default=0, repr=False, compare=False)
+    status: str = field(default="?", repr=False, compare=False)
+
+    @property
+    def name(self) -> str:
+        base = self.label or self.package
+        return f"{base}@u{self.user_id}" if self.user_id else base
+
+    def to_config(self) -> dict:
+        d = asdict(self)
+        for k in ("last_rejoin", "last_cpu", "stale_ticks", "fail_streak",
+                  "cooldown_until", "restarts", "status"):
+            d.pop(k, None)
+        return d
+
+
+class Controller:
+    HANG_TICKS = 3
+
+    def __init__(self, sh: Shell, hang_detection: bool = True):
+        self.sh = sh
+        self.hang_detection = hang_detection
+
+    def pids(self, t: Target) -> List[int]:
+        out = self.sh.out(f"pidof {shlex.quote(t.package)}", timeout=15)
+        return [int(x) for x in out.split() if x.isdigit()]
+
+    def cpu_ticks(self, pid: int) -> Optional[int]:
+        out = self.sh.out(f"cat /proc/{pid}/stat 2>/dev/null", timeout=15)
+        m = re.search(r"\)\s+\S+\s+(.*)", out)
+        if not m:
+            return None
+        f = m.group(1).split()
+        try:
+            return int(f[10]) + int(f[11])
+        except (IndexError, ValueError):
+            return None
+
+    def error_dialog(self) -> bool:
+        return bool(self.sh.out(
+            "dumpsys window 2>/dev/null | grep -m3 -iE "
+            "'Application Error|aerr|anr |isn.t responding|has stopped'",
+            timeout=25).strip())
+
+    def dismiss_dialog(self) -> None:
+        self.sh.run("input keyevent KEYCODE_ENTER", timeout=15)
+        time.sleep(0.5)
+        self.sh.run("input keyevent KEYCODE_BACK", timeout=15)
+
+    def wake(self) -> None:
+        out = self.sh.out(
+            "dumpsys power 2>/dev/null | grep -m1 -E 'mWakefulness|Display Power'",
+            timeout=20)
+        if any(s in out for s in ("Asleep", "Dozing", "state=OFF")):
+            self.sh.run("input keyevent KEYCODE_WAKEUP", timeout=15)
+            time.sleep(0.6)
+            self.sh.run("input keyevent KEYCODE_MENU", timeout=15)
+
+    def force_stop(self, t: Target) -> None:
+        uf = f"--user {t.user_id}" if t.user_id else ""
+        self.sh.run(f"am force-stop {uf} {shlex.quote(t.package)}", timeout=25)
+
+    def launch(self, t: Target) -> bool:
+        uf = f"--user {t.user_id}" if t.user_id else ""
+        urls: List[str] = []
+        if t.private_link and t.place_id:
+            urls.append(f"https://www.roblox.com/games/{t.place_id}"
+                        f"?privateServerLinkCode={t.private_link}")
+        if t.place_id:
+            urls += [u.format(place_id=t.place_id) for u in LAUNCH_URL_TEMPLATES]
+
+        for url in urls:
+            self.sh.run(f"am start {uf} -a android.intent.action.VIEW "
+                        f"-d {shlex.quote(url)} {shlex.quote(t.package)}", timeout=30)
+            if self._wait(t, 20):
+                return True
+        self.sh.run(f"monkey {uf} -p {shlex.quote(t.package)} "
+                    f"-c android.intent.category.LAUNCHER 1", timeout=30)
+        return self._wait(t, 25)
+
+    def _wait(self, t: Target, seconds: int) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.pids(t):
+                return True
+            time.sleep(2)
+        return False
+
+    def health(self, t: Target) -> str:
+        pids = self.pids(t)
+        if not pids:
+            return "dead"
+        if self.error_dialog():
+            return "dialog"
+        if self.hang_detection:
+            ticks = self.cpu_ticks(pids[0])
+            if ticks is not None:
+                if t.last_cpu is not None and ticks <= t.last_cpu:
+                    t.stale_ticks += 1
                 else:
-                    log.info(f"[{pkg}] OK (running)")
+                    t.stale_ticks = 0
+                t.last_cpu = ticks
+                if t.stale_ticks >= self.HANG_TICKS:
+                    return "hung"
+        return "ok"
 
-            except subprocess.TimeoutExpired:
-                log.error(f"[{pkg}] su command timed out, retrying next cycle")
-            except Exception as e:
-                log.error(f"[{pkg}] unexpected error: {e}")
+    def restart(self, t: Target, reason: str) -> bool:
+        logline(f"[{t.name}] restarting ({reason})", "WARN")
+        self.wake()
+        if reason == "dialog":
+            self.dismiss_dialog()
+            time.sleep(1)
+        self.force_stop(t)
+        time.sleep(2.5)
+        success = self.launch(t)
 
-        time.sleep(CHECK_INTERVAL_SEC)
+        t.last_rejoin = datetime.now()
+        t.last_cpu = None
+        t.stale_ticks = 0
+        t.restarts += 1
+
+        if success:
+            t.fail_streak = 0
+            t.status = "running"
+            logline(f"[{t.name}] rejoined (restart #{t.restarts})", "OK")
+        else:
+            t.fail_streak += 1
+            t.status = "failed"
+            back = min(300, 30 * (2 ** (t.fail_streak - 1))) + random.uniform(0, 10)
+            t.cooldown_until = datetime.now() + timedelta(seconds=back)
+            logline(f"[{t.name}] launch failed x{t.fail_streak}, "
+                    f"waiting {int(back)}s", "ERR")
+        return success
+
+
+# ==============================================================================
+# WATCHDOG LOOP
+# ==============================================================================
+
+class Watchdog:
+    def __init__(self, sh: Shell, targets: List[Target], interval: int,
+                 hang_detection: bool):
+        self.sh = sh
+        self.targets = [t for t in targets if t.enabled]
+        self.interval = interval
+        self.ctl = Controller(sh, hang_detection)
+        self.running = True
+        self.started = datetime.now()
+
+    def stop(self, *_a) -> None:
+        self.running = False
+
+    def tick(self, t: Target) -> None:
+        now = datetime.now()
+        if t.cooldown_until and now < t.cooldown_until:
+            t.status = "cooldown"
+            return
+
+        state = self.ctl.health(t)
+        if state in ("dead", "hung", "dialog"):
+            t.status = state
+            self.ctl.restart(t, state)
+            return
+
+        if t.last_rejoin is None:
+            # First pass: make sure it's actually in the right place, not just
+            # sitting on the Roblox home screen from whenever it was opened.
+            self.ctl.restart(t, "initial join")
+            return
+
+        if (t.rejoin_interval_min > 0 and
+                (now - t.last_rejoin) >= timedelta(minutes=t.rejoin_interval_min)):
+            self.ctl.restart(t, "scheduled")
+        else:
+            t.status = "running"
+
+    def header(self) -> None:
+        up = str(datetime.now() - self.started).split(".")[0]
+        total = sum(t.restarts for t in self.targets)
+        clear()
+        print(f"{C.BLUE}{C.BOLD}  ROBLOX WATCHDOG{C.RESET}   "
+              f"{C.DIM}uptime {up} · {total} restarts · "
+              f"root={self.sh.has_root}{C.RESET}")
+        hr("=")
+        for t in self.targets:
+            color = {"running": C.GREEN, "cooldown": C.YELLOW,
+                     "failed": C.RED, "dead": C.RED, "hung": C.YELLOW,
+                     "dialog": C.YELLOW}.get(t.status, C.DIM)
+            nxt = "-"
+            if t.last_rejoin and t.rejoin_interval_min > 0:
+                remain = (t.last_rejoin +
+                          timedelta(minutes=t.rejoin_interval_min) - datetime.now())
+                nxt = str(max(remain, timedelta(0))).split(".")[0]
+            print(f"  {color}●{C.RESET} {t.name[:26]:<26} "
+                  f"{color}{t.status:<9}{C.RESET} "
+                  f"{C.DIM}restarts={t.restarts:<3} next rejoin in {nxt}{C.RESET}")
+        hr("=")
+        print(f"  {C.DIM}Ctrl+C to stop and return to the menu{C.RESET}\n")
+
+    def run(self) -> None:
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+        try:
+            subprocess.run(["termux-wake-lock"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+        logline(f"watchdog started on {len(self.targets)} target(s)", "OK")
+        try:
+            while self.running:
+                for t in self.targets:
+                    if not self.running:
+                        break
+                    try:
+                        self.tick(t)
+                    except Exception as e:
+                        logline(f"[{t.name}] error: {e}", "ERR")
+                self.header()
+                slept = 0.0
+                step = 0.5
+                total = self.interval + random.uniform(0, 3)
+                while self.running and slept < total:
+                    time.sleep(step)
+                    slept += step
+        except KeyboardInterrupt:
+            self.running = False
+        finally:
+            try:
+                subprocess.run(["termux-wake-unlock"], capture_output=True, timeout=10)
+            except Exception:
+                pass
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+
+        up = str(datetime.now() - self.started).split(".")[0]
+        total = sum(t.restarts for t in self.targets)
+        print()
+        ok(f"Stopped after {up} · {total} restart(s) total")
+
+
+# ==============================================================================
+# CONFIG
+# ==============================================================================
+
+def save_config(targets: List[Target], interval: int, hang: bool) -> None:
+    data = {"check_interval_sec": interval, "hang_detection": hang,
+            "targets": [t.to_config() for t in targets]}
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_config() -> Tuple[List[Target], int, bool]:
+    if not os.path.exists(CONFIG_PATH):
+        return [], 20, True
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return [], 20, True
+    targets = []
+    for raw in data.get("targets", []):
+        try:
+            targets.append(Target(**raw))
+        except TypeError:
+            continue
+    return (targets, int(data.get("check_interval_sec", 20)),
+            bool(data.get("hang_detection", True)))
+
+
+def parse_place_id(raw: str) -> str:
+    """Accepts a bare id or a full roblox game URL and extracts the place id."""
+    raw = raw.strip()
+    m = re.search(r"/games/(\d+)", raw)
+    if m:
+        return m.group(1)
+    m = re.search(r"placeId=(\d+)", raw, re.I)
+    if m:
+        return m.group(1)
+    digits = re.sub(r"\D", "", raw)
+    return digits
+
+
+def parse_private_link(raw: str) -> str:
+    m = re.search(r"privateServerLinkCode=([A-Za-z0-9_-]+)", raw)
+    return m.group(1) if m else ""
+
+
+# ==============================================================================
+# APP / MENUS
+# ==============================================================================
+
+class App:
+    def __init__(self) -> None:
+        self.sh = Shell()
+        self.targets, self.interval, self.hang = load_config()
+
+    # -- setup wizard ----------------------------------------------------------
+
+    def wizard(self) -> None:
+        clear()
+        banner()
+        print(f"  {C.BOLD}AUTO SETUP{C.RESET}\n")
+        hr()
+
+        # step 1 - root
+        print(f"\n  {C.BOLD}Step 1/4 · Root access{C.RESET}")
+        if self.sh.has_root:
+            ok("Root confirmed (su works)")
+        else:
+            err("No root detected")
+            warn("Without root, force-stop and rejoin will very likely fail.")
+            warn("Open your root manager and grant Termux permission, then retry.")
+            if not ask_yes("Continue anyway?", False):
+                return
+
+        # step 2 - detect
+        print(f"\n  {C.BOLD}Step 2/4 · Finding Roblox{C.RESET}")
+        deep = ask_yes("Run deep scan? (slower, finds renamed clones)", True)
+        markers = None
+        extra = ask("Extra name hints, space separated (optional)")
+        if extra:
+            markers = PACKAGE_MARKERS + extra.split()
+
+        det = Detector(self.sh, markers)
+        cands = det.detect(deep=deep)
+
+        if not cands:
+            err("No Roblox packages found.")
+            print()
+            self.troubleshoot_text()
+            pause()
+            return
+
+        print()
+        ok(f"Found {len(cands)} candidate(s):\n")
+        for i, c in enumerate(cands, 1):
+            mark = f"{C.GREEN}OK{C.RESET}" if c.confidence >= MIN_CONFIDENCE \
+                else f"{C.YELLOW}? {C.RESET}"
+            print(f"   {i:>2}. [{mark}] {c.display}")
+            print(f"       {C.DIM}{c.package} · user {c.user_id} · "
+                  f"matched by: {','.join(sorted(c.strategies))}{C.RESET}")
+
+        print()
+        sel = ask("Which to watch? (numbers, 'a' for all confident ones)", "a")
+        if sel.lower().startswith("a"):
+            chosen = [c for c in cands if c.confidence >= MIN_CONFIDENCE] or cands
+        else:
+            idxs = [int(x) for x in re.findall(r"\d+", sel)]
+            chosen = [cands[i - 1] for i in idxs if 1 <= i <= len(cands)]
+        if not chosen:
+            err("Nothing selected.")
+            pause()
+            return
+        ok(f"Selected {len(chosen)} instance(s)")
+
+        # step 3 - place id
+        print(f"\n  {C.BOLD}Step 3/4 · Where to farm{C.RESET}")
+        info("Paste a game URL or just the place ID.")
+        place = ""
+        while not place:
+            place = parse_place_id(ask("Game URL or place ID"))
+            if not place:
+                warn("Couldn't read a place ID from that.")
+        priv = parse_private_link(ask("Private server link (optional, Enter to skip)"))
+        ok(f"Place ID: {place}" + (f" · private server: {priv}" if priv else ""))
+
+        same = True
+        if len(chosen) > 1:
+            same = ask_yes("Use this place for every instance?", True)
+
+        # step 4 - timing
+        print(f"\n  {C.BOLD}Step 4/4 · Timing{C.RESET}")
+        rejoin = ask_int("Force rejoin every N minutes (0 = only on crash)", 45, 0)
+        interval = ask_int("Check health every N seconds", 20, 5, 600)
+        hang = ask_yes("Also restart frozen (not-crashed) instances?", True)
+
+        targets: List[Target] = []
+        for c in chosen:
+            p, pv = place, priv
+            if not same:
+                print(f"\n  {C.DIM}for {c.display}{C.RESET}")
+                p = parse_place_id(ask("Place ID", place)) or place
+                pv = parse_private_link(ask("Private link (optional)")) or ""
+            targets.append(Target(package=c.package, user_id=c.user_id, place_id=p,
+                                  private_link=pv, rejoin_interval_min=rejoin,
+                                  label=c.label or ""))
+
+        self.targets, self.interval, self.hang = targets, interval, hang
+        save_config(targets, interval, hang)
+        print()
+        ok(f"Saved to {os.path.basename(CONFIG_PATH)}")
+        hr()
+        for t in targets:
+            print(f"   · {t.name} -> place {t.place_id}, rejoin {t.rejoin_interval_min}m")
+        hr()
+
+        if ask_yes("\n  Start the watchdog now?", True):
+            self.start()
+        else:
+            pause()
+
+    # -- run -------------------------------------------------------------------
+
+    def start(self) -> None:
+        if not self.targets:
+            err("Nothing configured yet. Run Auto setup (option 1) first.")
+            pause()
+            return
+        bad = [t for t in self.targets if not t.place_id]
+        if bad:
+            err(f"{len(bad)} target(s) have no place ID set.")
+            pause()
+            return
+        wd = Watchdog(self.sh, self.targets, self.interval, self.hang)
+        wd.run()
+        pause()
+
+    # -- detect only -----------------------------------------------------------
+
+    def detect_only(self) -> None:
+        clear()
+        print(f"  {C.BOLD}PACKAGE SCAN{C.RESET}\n")
+        hr()
+        deep = ask_yes("Deep scan?", True)
+        extra = ask("Extra name hints (optional)")
+        markers = PACKAGE_MARKERS + extra.split() if extra else None
+        print()
+        det = Detector(self.sh, markers)
+        cands = det.detect(deep=deep)
+        print()
+        hr("=")
+        print(f"  root: {self.sh.has_root}   foreground: {det.foreground() or '?'}")
+        hr("=")
+        if not cands:
+            err("Nothing found.")
+            print()
+            self.troubleshoot_text()
+        for i, c in enumerate(cands, 1):
+            mark = f"{C.GREEN}OK{C.RESET}" if c.confidence >= MIN_CONFIDENCE \
+                else f"{C.YELLOW}? {C.RESET}"
+            print(f"   {i:>2}. [{mark}] {c.package}")
+            print(f"       {C.DIM}{c.display} · user {c.user_id} · conf "
+                  f"{c.confidence} · {','.join(sorted(c.strategies))}{C.RESET}")
+        pause()
+
+    # -- config editor ---------------------------------------------------------
+
+    def edit_config(self) -> None:
+        while True:
+            clear()
+            print(f"  {C.BOLD}CONFIGURED INSTANCES{C.RESET}\n")
+            hr()
+            if not self.targets:
+                warn("No instances configured.")
+            for i, t in enumerate(self.targets, 1):
+                state = f"{C.GREEN}on {C.RESET}" if t.enabled else f"{C.DIM}off{C.RESET}"
+                print(f"   {i:>2}. [{state}] {t.name}")
+                print(f"       {C.DIM}place {t.place_id or '(unset)'} · "
+                      f"rejoin {t.rejoin_interval_min}m · user {t.user_id}{C.RESET}")
+            hr()
+            print(f"   {C.DIM}check interval {self.interval}s · "
+                  f"hang detection {'on' if self.hang else 'off'}{C.RESET}\n")
+            print("   [number] edit   [t N] toggle on/off   [d N] delete")
+            print("   [i] interval    [h] hang detection    [s] save   [b] back\n")
+            cmd = ask("choice").lower().strip()
+
+            if cmd in ("b", ""):
+                return
+            if cmd == "s":
+                save_config(self.targets, self.interval, self.hang)
+                ok("Saved.")
+                time.sleep(0.8)
+            elif cmd == "i":
+                self.interval = ask_int("Check every N seconds", self.interval, 5, 600)
+            elif cmd == "h":
+                self.hang = not self.hang
+            elif cmd.startswith("t"):
+                n = self._idx(cmd)
+                if n is not None:
+                    self.targets[n].enabled = not self.targets[n].enabled
+            elif cmd.startswith("d"):
+                n = self._idx(cmd)
+                if n is not None:
+                    removed = self.targets.pop(n)
+                    ok(f"Removed {removed.name}")
+                    time.sleep(0.8)
+            elif cmd.isdigit():
+                n = int(cmd) - 1
+                if 0 <= n < len(self.targets):
+                    self._edit_target(self.targets[n])
+
+    def _idx(self, cmd: str) -> Optional[int]:
+        m = re.search(r"\d+", cmd)
+        if not m:
+            return None
+        n = int(m.group()) - 1
+        return n if 0 <= n < len(self.targets) else None
+
+    def _edit_target(self, t: Target) -> None:
+        print()
+        info(f"Editing {t.name}")
+        new = ask("Place ID or game URL", t.place_id)
+        parsed = parse_place_id(new)
+        if parsed:
+            t.place_id = parsed
+        pl = ask("Private server link (blank = none)", t.private_link)
+        t.private_link = parse_private_link(pl) or (pl if pl.isalnum() else "")
+        t.rejoin_interval_min = ask_int("Rejoin every N minutes (0 = off)",
+                                        t.rejoin_interval_min, 0)
+        t.label = ask("Display name", t.label or t.package)
+        save_config(self.targets, self.interval, self.hang)
+        ok("Saved.")
+        time.sleep(0.8)
+
+    # -- diagnostics -----------------------------------------------------------
+
+    def diagnostics(self) -> None:
+        clear()
+        print(f"  {C.BOLD}DIAGNOSTICS{C.RESET}\n")
+        hr()
+        checks = [
+            ("su -c id", "Root access"),
+            ("pm list users", "User profiles"),
+            ("pm list packages | wc -l", "Packages visible"),
+            ("dumpsys window | grep -m1 mCurrentFocus", "Foreground app"),
+            ("getprop ro.build.version.release", "Android version"),
+        ]
+        for cmd, label in checks:
+            out = self.sh.out(cmd, timeout=30).strip()
+            first = out.splitlines()[0][:44] if out else ""
+            if out and "not found" not in out.lower() and "denied" not in out.lower():
+                ok(f"{label:<18} {C.DIM}{first}{C.RESET}")
+            else:
+                err(f"{label:<18} {C.DIM}{first or 'no output'}{C.RESET}")
+        hr()
+        print()
+        self.troubleshoot_text()
+        pause()
+
+    @staticmethod
+    def troubleshoot_text() -> None:
+        print(f"  {C.BOLD}If nothing is detected, try in order:{C.RESET}")
+        print(f"   1. {C.DIM}su -c id{C.RESET} — must print uid=0, else grant Termux root")
+        print(f"   2. {C.DIM}su -c 'pm list users'{C.RESET} — clones often live on user 10/11")
+        print("   3. Open Roblox first, then rescan — foreground detection catches it")
+        print("   4. Add your cloner's name as an extra hint in the scan prompt")
+
+    # -- main menu -------------------------------------------------------------
+
+    def menu(self) -> None:
+        while True:
+            clear()
+            banner()
+            n = len(self.targets)
+            root_s = f"{C.GREEN}root ok{C.RESET}" if self.sh.has_root \
+                else f"{C.RED}no root{C.RESET}"
+            cfg_s = (f"{C.GREEN}{n} instance(s) configured{C.RESET}" if n
+                     else f"{C.YELLOW}not configured{C.RESET}")
+            print(f"   status: {root_s}  ·  {cfg_s}\n")
+            hr("=")
+            print(f"   {C.BOLD}1{C.RESET}  Auto setup        "
+                  f"{C.DIM}find Roblox, pick a game, save{C.RESET}")
+            print(f"   {C.BOLD}2{C.RESET}  Start watchdog    "
+                  f"{C.DIM}begin auto-rejoin monitoring{C.RESET}")
+            print(f"   {C.BOLD}3{C.RESET}  Scan packages     "
+                  f"{C.DIM}detection report only{C.RESET}")
+            print(f"   {C.BOLD}4{C.RESET}  Edit instances    "
+                  f"{C.DIM}place IDs, timing, on/off{C.RESET}")
+            print(f"   {C.BOLD}5{C.RESET}  Diagnostics       "
+                  f"{C.DIM}why isn't it finding anything{C.RESET}")
+            print(f"   {C.BOLD}0{C.RESET}  Exit")
+            hr("=")
+            choice = ask("\n  select").strip()
+
+            if choice == "1":
+                self.wizard()
+            elif choice == "2":
+                self.start()
+            elif choice == "3":
+                self.detect_only()
+            elif choice == "4":
+                self.edit_config()
+            elif choice == "5":
+                self.diagnostics()
+            elif choice in ("0", "q", "exit"):
+                print(f"\n  {C.DIM}bye{C.RESET}\n")
+                return
+
+
+def main() -> int:
+    # Headless shortcut: `python3 rw.py start` skips the menu (for cron/boot).
+    if len(sys.argv) > 1 and sys.argv[1] in ("start", "run"):
+        app = App()
+        if not app.targets:
+            err("No config found. Run without arguments to set up.")
+            return 1
+        Watchdog(app.sh, app.targets, app.interval, app.hang).run()
+        return 0
+    try:
+        App().menu()
+    except KeyboardInterrupt:
+        print()
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Stopped.")
+    sys.exit(main())
