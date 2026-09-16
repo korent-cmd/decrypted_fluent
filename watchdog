@@ -72,7 +72,60 @@ class C:
 
 
 def clear() -> None:
-    print("\033[2J\033[H", end="")
+    """Full clear. Used only on screen transitions, never in a render loop."""
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+class Screen:
+    """
+    Flicker-free renderer.
+
+    Clearing the screen then redrawing leaves a visible blank gap every frame.
+    Instead we park the cursor at home and overwrite line by line, erasing each
+    line's tail as we go (\033[K), then erasing anything left below (\033[J).
+    The whole frame goes out in ONE write, so the terminal never shows a
+    half-drawn state. Identical frames are skipped entirely.
+    """
+    _last: Optional[str] = None
+    _hidden = False
+
+    @classmethod
+    def hide_cursor(cls) -> None:
+        if C._on and not cls._hidden:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+            cls._hidden = True
+
+    @classmethod
+    def show_cursor(cls) -> None:
+        if C._on and cls._hidden:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+            cls._hidden = False
+
+    @classmethod
+    def render(cls, lines: List[str]) -> None:
+        frame = "\n".join(lines)
+        if frame == cls._last:
+            return
+        cls._last = frame
+        if not C._on:
+            print(frame)
+            return
+        buf = "\033[H" + "\r\n".join(ln + "\033[K" for ln in lines) + "\033[J"
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._last = None
+
+
+# Rolling log shown inside the dashboard frame. Printing log lines directly
+# while a frame is on screen is what made the old dashboard tear.
+LOG_BUFFER: List[str] = []
+LIVE_MODE = False
 
 
 def banner() -> None:
@@ -106,12 +159,20 @@ def info(msg: str) -> None:
     print(f"  {C.BLUE}[*]{C.RESET} {msg}")
 
 
+class Quit(Exception):
+    """Raised when stdin dies, so we exit instead of spinning the menu."""
+
+
 def ask(prompt: str, default: str = "") -> str:
     suffix = f" {C.DIM}[{default}]{C.RESET}" if default else ""
     try:
         val = input(f"  {C.BOLD}>{C.RESET} {prompt}{suffix}: ").strip()
     except EOFError:
-        return default
+        # stdin closed (piped input ran out, session detached). Returning a
+        # default here would loop the menu forever at full speed.
+        raise Quit()
+    except KeyboardInterrupt:
+        raise Quit()
     return val or default
 
 
@@ -139,6 +200,8 @@ def pause() -> None:
     try:
         input(f"\n  {C.DIM}press Enter to continue{C.RESET}")
     except EOFError:
+        raise Quit()
+    except KeyboardInterrupt:
         pass
 
 
@@ -150,7 +213,13 @@ def logline(msg: str, level: str = "INFO") -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     color = {"INFO": C.RESET, "OK": C.GREEN, "WARN": C.YELLOW,
              "ERR": C.RED}.get(level, C.RESET)
-    print(f"  {C.DIM}{stamp}{C.RESET} {color}{msg}{C.RESET}")
+    entry = f"  {C.DIM}{stamp}{C.RESET} {color}{msg}{C.RESET}"
+    if LIVE_MODE:
+        # Buffer it; the dashboard frame draws it. Printing here would tear.
+        LOG_BUFFER.append(entry)
+        del LOG_BUFFER[:-200]
+    else:
+        print(entry)
     try:
         with open(LOG_PATH, "a") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {msg}\n")
@@ -583,14 +652,18 @@ class Watchdog:
         else:
             t.status = "running"
 
-    def header(self) -> None:
+    def frame(self) -> List[str]:
+        """Builds the whole dashboard as a list of lines. No printing here."""
         up = str(datetime.now() - self.started).split(".")[0]
         total = sum(t.restarts for t in self.targets)
-        clear()
-        print(f"{C.BLUE}{C.BOLD}  ROBLOX WATCHDOG{C.RESET}   "
-              f"{C.DIM}uptime {up} · {total} restarts · "
-              f"root={self.sh.has_root}{C.RESET}")
-        hr("=")
+        width = 64
+
+        lines: List[str] = []
+        lines.append(f"  {C.BLUE}{C.BOLD}ROBLOX WATCHDOG{C.RESET}   "
+                     f"{C.DIM}uptime {up} · {total} restarts · "
+                     f"root={self.sh.has_root}{C.RESET}")
+        lines.append(C.DIM + "=" * width + C.RESET)
+
         for t in self.targets:
             color = {"running": C.GREEN, "cooldown": C.YELLOW,
                      "failed": C.RED, "dead": C.RED, "hung": C.YELLOW,
@@ -599,14 +672,25 @@ class Watchdog:
             if t.last_rejoin and t.rejoin_interval_min > 0:
                 remain = (t.last_rejoin +
                           timedelta(minutes=t.rejoin_interval_min) - datetime.now())
-                nxt = str(max(remain, timedelta(0))).split(".")[0]
-            print(f"  {color}●{C.RESET} {t.name[:26]:<26} "
-                  f"{color}{t.status:<9}{C.RESET} "
-                  f"{C.DIM}restarts={t.restarts:<3} next rejoin in {nxt}{C.RESET}")
-        hr("=")
-        print(f"  {C.DIM}Ctrl+C to stop and return to the menu{C.RESET}\n")
+                # Round to whole minutes so the frame isn't redrawn every second.
+                secs = max(int(remain.total_seconds()), 0)
+                nxt = f"{secs // 60}m"
+            lines.append(f"  {color}●{C.RESET} {t.name[:24]:<24} "
+                         f"{color}{t.status:<9}{C.RESET} "
+                         f"{C.DIM}x{t.restarts:<3} next {nxt:>5}{C.RESET}")
+
+        lines.append(C.DIM + "=" * width + C.RESET)
+        lines.append("")
+        for entry in LOG_BUFFER[-8:]:
+            lines.append(entry)
+        lines.append("")
+        lines.append(f"  {C.DIM}Ctrl+C to stop and return to the menu{C.RESET}")
+        return lines
 
     def run(self) -> None:
+        global LIVE_MODE
+        prev_handlers = (signal.getsignal(signal.SIGINT),
+                         signal.getsignal(signal.SIGTERM))
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
         try:
@@ -614,7 +698,13 @@ class Watchdog:
         except Exception:
             pass
 
+        LIVE_MODE = True
+        LOG_BUFFER.clear()
+        Screen.reset()
+        clear()
+        Screen.hide_cursor()
         logline(f"watchdog started on {len(self.targets)} target(s)", "OK")
+
         try:
             while self.running:
                 for t in self.targets:
@@ -624,21 +714,25 @@ class Watchdog:
                         self.tick(t)
                     except Exception as e:
                         logline(f"[{t.name}] error: {e}", "ERR")
-                self.header()
-                slept = 0.0
-                step = 0.5
+                    Screen.render(self.frame())
+
                 total = self.interval + random.uniform(0, 3)
+                slept = 0.0
                 while self.running and slept < total:
-                    time.sleep(step)
-                    slept += step
+                    time.sleep(0.4)
+                    slept += 0.4
+                    Screen.render(self.frame())
         except KeyboardInterrupt:
             self.running = False
         finally:
+            LIVE_MODE = False
+            Screen.show_cursor()
             try:
                 subprocess.run(["termux-wake-unlock"], capture_output=True, timeout=10)
             except Exception:
                 pass
-            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGINT, prev_handlers[0])
+            signal.signal(signal.SIGTERM, prev_handlers[1])
 
         up = str(datetime.now() - self.started).split(".")[0]
         total = sum(t.restarts for t in self.targets)
@@ -958,6 +1052,7 @@ class App:
     def menu(self) -> None:
         while True:
             clear()
+            Screen.reset()
             banner()
             n = len(self.targets)
             root_s = f"{C.GREEN}root ok{C.RESET}" if self.sh.has_root \
@@ -976,9 +1071,11 @@ class App:
                   f"{C.DIM}place IDs, timing, on/off{C.RESET}")
             print(f"   {C.BOLD}5{C.RESET}  Diagnostics       "
                   f"{C.DIM}why isn't it finding anything{C.RESET}")
+            print(f"   {C.BOLD}6{C.RESET}  Plain mode        "
+                  f"{C.DIM}disable colors/redraw if display is glitchy{C.RESET}")
             print(f"   {C.BOLD}0{C.RESET}  Exit")
             hr("=")
-            choice = ask("\n  select").strip()
+            choice = ask("\n  select").strip().lower()
 
             if choice == "1":
                 self.wizard()
@@ -990,9 +1087,27 @@ class App:
                 self.edit_config()
             elif choice == "5":
                 self.diagnostics()
-            elif choice in ("0", "q", "exit"):
+            elif choice == "6":
+                self.toggle_plain()
+            elif choice in ("0", "q", "exit", "quit"):
                 print(f"\n  {C.DIM}bye{C.RESET}\n")
                 return
+            else:
+                warn("Pick a number from the menu.")
+                time.sleep(1.0)
+
+    @staticmethod
+    def toggle_plain() -> None:
+        """Escape hatch for terminals that mangle ANSI escapes."""
+        C._on = not C._on
+        for attr, code in (("RESET", "\033[0m"), ("BOLD", "\033[1m"),
+                           ("DIM", "\033[2m"), ("RED", "\033[31m"),
+                           ("GREEN", "\033[32m"), ("YELLOW", "\033[33m"),
+                           ("BLUE", "\033[36m"), ("MAGENTA", "\033[35m")):
+            setattr(C, attr, code if C._on else "")
+        Screen.reset()
+        ok("Colors " + ("enabled" if C._on else "disabled"))
+        time.sleep(1.0)
 
 
 def main() -> int:
@@ -1004,10 +1119,20 @@ def main() -> int:
             return 1
         Watchdog(app.sh, app.targets, app.interval, app.hang).run()
         return 0
+
+    if not sys.stdin.isatty():
+        err("No interactive terminal detected.")
+        info("Run this directly in Termux, or use: python3 rw.py start")
+        return 1
+
     try:
         App().menu()
+    except Quit:
+        print(f"\n  {C.DIM}input closed, exiting{C.RESET}\n")
     except KeyboardInterrupt:
         print()
+    finally:
+        Screen.show_cursor()
     return 0
 
 
