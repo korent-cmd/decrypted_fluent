@@ -232,53 +232,52 @@ def logline(msg: str, level: str = "INFO") -> None:
 
 class Shell:
     def __init__(self, prefer_root: bool = True):
-        # Safe startup: never launch `su` while constructing the app.
-        # Some rooted Android/Termux frontends can freeze when a root-manager
-        # interaction happens during startup.
+        # Never invoke su during startup. Some Termux/root-manager frontends
+        # can freeze while a root permission request is being handled.
         self.root_probe_detail = "startup probe skipped (safe Termux mode)"
         self.has_root = bool(prefer_root)
         self._cache: Dict[str, str] = {}
 
     def _probe_root(self) -> bool:
         """
-        Check root using the standard Termux-compatible invocation.
-
-        The old probe tried several different `su` syntaxes and could spend
-        a long time waiting on a root-manager interaction. Since the normal
-        `su -c id` invocation is sufficient here, keep startup fast and
-        predictable.
+        Tries several invocation styles because su implementations differ
+        (Magisk, KernelSU, APatch, vendor/cloud-phone brokers). Records what
+        actually happened so Diagnostics can show it instead of a bare
+        yes/no that hides *why* it failed.
         """
-        argv = ["su", "-c", "id"]
-        try:
-            r = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except FileNotFoundError:
-            self.root_probe_detail = "su -c id -> su binary not found on PATH"
-            return False
-        except subprocess.TimeoutExpired:
-            self.root_probe_detail = (
-                "su -c id -> timed out after 5s "
-                "(check the root manager permission for Termux)"
-            )
-            return False
-        except Exception as exc:
-            self.root_probe_detail = f"su -c id -> error: {exc}"
-            return False
+        attempts = [
+            ["su", "-c", "id"],
+            ["su", "-c", "id"],   # retry once: first call often just triggers
+                                   # the root-grant prompt/notification and
+                                   # returns before the user has tapped it
+            ["su", "0", "id"],
+            ["su", "-mm", "-c", "id"],
+        ]
+        details = []
+        for i, argv in enumerate(attempts):
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            except FileNotFoundError:
+                details.append(f"{' '.join(argv)} -> su binary not found on PATH")
+                break
+            except subprocess.TimeoutExpired:
+                details.append(f"{' '.join(argv)} -> timed out after 20s "
+                               f"(often means a root prompt is waiting for a tap)")
+                if i == 0:
+                    time.sleep(2)   # give a pending prompt a moment before retry
+                continue
 
-        out = (r.stdout or "").strip()
-        errtxt = (r.stderr or "").strip()
-        self.root_probe_detail = (
-            f"su -c id -> rc={r.returncode} "
-            f"stdout={out[:120]!r} stderr={errtxt[:120]!r}"
-        )
+            out = (r.stdout or "").strip()
+            errtxt = (r.stderr or "").strip()
+            details.append(f"{' '.join(argv)} -> rc={r.returncode} "
+                           f"stdout={out[:60]!r} stderr={errtxt[:60]!r}")
 
-        return r.returncode == 0 and (
-            "uid=0" in out or "uid=0" in errtxt
-        )
+            if r.returncode == 0 and ("uid=0" in out or "uid=0" in errtxt):
+                self.root_probe_detail = "\n".join(details)
+                return True
+
+        self.root_probe_detail = "\n".join(details)
+        return False
 
     def run(self, cmd: str, timeout: int = 25, root: bool = True) -> Tuple[int, str]:
         argv = ["su", "-c", cmd] if (root and self.has_root) else ["sh", "-c", cmd]
@@ -575,22 +574,50 @@ class Controller:
         self.sh.run(f"am force-stop {uf} {shlex.quote(t.package)}", timeout=25)
 
     def launch(self, t: Target) -> bool:
+        """Launch Roblox and explicitly pass the deep link to the target package.
+
+        A running Roblox PID is not enough: the old code treated "app opened" as
+        "game joined". We now try Roblox's documented direct deep-link first,
+        target the selected package with -p, and keep the command result in the
+        log so a failed Android intent is visible.
+        """
         uf = f"--user {t.user_id}" if t.user_id else ""
         urls: List[str] = []
-        if t.private_link and t.place_id:
-            urls.append(f"https://www.roblox.com/games/{t.place_id}"
-                        f"?privateServerLinkCode={t.private_link}")
+
+        # Roblox documents roblox://placeId=<id> as the direct-to-app format.
+        # Put it first so the app receives the place ID immediately.
         if t.place_id:
-            urls += [u.format(place_id=t.place_id) for u in LAUNCH_URL_TEMPLATES]
+            urls.append(f"roblox://placeId={t.place_id}")
+            if t.private_link:
+                urls.append(
+                    f"https://www.roblox.com/games/start?placeId={t.place_id}"
+                    f"&linkCode={t.private_link}"
+                )
+            urls.append(f"https://www.roblox.com/games/start?placeId={t.place_id}")
 
         for url in urls:
-            self.sh.run(f"am start {uf} -a android.intent.action.VIEW "
-                        f"-d {shlex.quote(url)} {shlex.quote(t.package)}", timeout=30)
-            if self._wait(t, 20):
+            cmd = (f"am start -W {uf} -a android.intent.action.VIEW "
+                   f"-d {shlex.quote(url)} -p {shlex.quote(t.package)}")
+            rc, out = self.sh.run(cmd, timeout=35)
+            logline(f"[{t.name}] launch intent rc={rc}: {url}",
+                     "INFO" if rc == 0 else "WARN")
+            if out.strip():
+                compact = " ".join(out.strip().split())[:220]
+                logline(f"[{t.name}] am start: {compact}",
+                         "INFO" if rc == 0 else "WARN")
+            if self._wait(t, 30):
+                # Give Roblox a moment to consume the deep link before declaring
+                # success. The PID alone only proves the app process exists.
+                time.sleep(3)
                 return True
-        self.sh.run(f"monkey {uf} -p {shlex.quote(t.package)} "
-                    f"-c android.intent.category.LAUNCHER 1", timeout=30)
-        return self._wait(t, 25)
+
+        # Last resort: open the selected Roblox instance normally.
+        rc, out = self.sh.run(
+            f"monkey {uf} -p {shlex.quote(t.package)} "
+            f"-c android.intent.category.LAUNCHER 1", timeout=30)
+        logline(f"[{t.name}] launcher fallback rc={rc}",
+                "INFO" if rc == 0 else "WARN")
+        return self._wait(t, 30)
 
     def _wait(self, t: Target, seconds: int) -> bool:
         end = time.time() + seconds
@@ -842,6 +869,7 @@ class App:
 
         # step 1 - root
         print(f"\n  {C.BOLD}Step 1/4 · Root access{C.RESET}")
+        self.sh.has_root = self.sh._probe_root()
         if self.sh.has_root:
             ok("Root confirmed (su works)")
         else:
@@ -1063,8 +1091,6 @@ class App:
 
     def diagnostics(self) -> None:
         clear()
-        # Root probing is deferred until Diagnostics.
-        self.sh.has_root = self.sh._probe_root()
         print(f"  {C.BOLD}DIAGNOSTICS{C.RESET}\n")
         hr()
 
@@ -1121,6 +1147,7 @@ class App:
     def menu(self) -> None:
         while True:
             clear()
+            Screen.reset()
             banner()
             n = len(self.targets)
             root_s = f"{C.GREEN}root ok{C.RESET}" if self.sh.has_root \
@@ -1188,7 +1215,6 @@ def main() -> int:
         Watchdog(app.sh, app.targets, app.interval, app.hang).run()
         return 0
 
-    # Safe Termux mode: no ANSI redraws and no root probe during startup.
     try:
         App().menu()
     except Quit:
