@@ -235,16 +235,50 @@ def logline(msg: str, level: str = "INFO") -> None:
 
 class Shell:
     def __init__(self, prefer_root: bool = True):
+        self.root_probe_detail = ""
         self.has_root = self._probe_root() if prefer_root else False
         self._cache: Dict[str, str] = {}
 
     def _probe_root(self) -> bool:
-        try:
-            r = subprocess.run(["su", "-c", "id"], capture_output=True,
-                               text=True, timeout=25)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-        return r.returncode == 0 and "uid=0" in r.stdout
+        """
+        Tries several invocation styles because su implementations differ
+        (Magisk, KernelSU, APatch, vendor/cloud-phone brokers). Records what
+        actually happened so Diagnostics can show it instead of a bare
+        yes/no that hides *why* it failed.
+        """
+        attempts = [
+            ["su", "-c", "id"],
+            ["su", "-c", "id"],   # retry once: first call often just triggers
+                                   # the root-grant prompt/notification and
+                                   # returns before the user has tapped it
+            ["su", "0", "id"],
+            ["su", "-mm", "-c", "id"],
+        ]
+        details = []
+        for i, argv in enumerate(attempts):
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            except FileNotFoundError:
+                details.append(f"{' '.join(argv)} -> su binary not found on PATH")
+                break
+            except subprocess.TimeoutExpired:
+                details.append(f"{' '.join(argv)} -> timed out after 20s "
+                               f"(often means a root prompt is waiting for a tap)")
+                if i == 0:
+                    time.sleep(2)   # give a pending prompt a moment before retry
+                continue
+
+            out = (r.stdout or "").strip()
+            errtxt = (r.stderr or "").strip()
+            details.append(f"{' '.join(argv)} -> rc={r.returncode} "
+                           f"stdout={out[:60]!r} stderr={errtxt[:60]!r}")
+
+            if r.returncode == 0 and ("uid=0" in out or "uid=0" in errtxt):
+                self.root_probe_detail = "\n".join(details)
+                return True
+
+        self.root_probe_detail = "\n".join(details)
+        return False
 
     def run(self, cmd: str, timeout: int = 25, root: bool = True) -> Tuple[int, str]:
         argv = ["su", "-c", cmd] if (root and self.has_root) else ["sh", "-c", cmd]
@@ -811,11 +845,20 @@ class App:
         if self.sh.has_root:
             ok("Root confirmed (su works)")
         else:
-            err("No root detected")
-            warn("Without root, force-stop and rejoin will very likely fail.")
-            warn("Open your root manager and grant Termux permission, then retry.")
-            if not ask_yes("Continue anyway?", False):
-                return
+            err("No root detected on the first probe")
+            for line in self.sh.root_probe_detail.splitlines():
+                print(f"   {C.DIM}{line}{C.RESET}")
+            warn("If your root manager just showed a grant prompt/notification,")
+            warn("tap Allow now, then retry below.")
+            if ask_yes("Retry root check?", True):
+                self.sh.has_root = self.sh._probe_root()
+            if self.sh.has_root:
+                ok("Root confirmed (su works)")
+            else:
+                err("Still no root.")
+                warn("Without root, force-stop and rejoin will very likely fail.")
+                if not ask_yes("Continue anyway?", False):
+                    return
 
         # step 2 - detect
         print(f"\n  {C.BOLD}Step 2/4 · Finding Roblox{C.RESET}")
@@ -1022,8 +1065,25 @@ class App:
         clear()
         print(f"  {C.BOLD}DIAGNOSTICS{C.RESET}\n")
         hr()
+
+        print(f"  {C.BOLD}Root probe detail{C.RESET} "
+              f"(what actually happened, not just yes/no):")
+        for line in (self.sh.root_probe_detail or "(not run yet)").splitlines():
+            print(f"   {C.DIM}{line}{C.RESET}")
+        print()
+        if self.sh.has_root:
+            ok("Root confirmed")
+        else:
+            err("Root not confirmed by any invocation style above")
+            warn("If `su -c id` works fine when you type it yourself in Termux,")
+            warn("the most common cause is a root-grant prompt/notification that")
+            warn("needs a manual tap the FIRST time a new process (this script)")
+            warn("asks for su - and it timed out waiting. Try 'r' below right")
+            warn("after tapping Allow/Grant in your root manager notification.")
+        print()
+        hr()
+
         checks = [
-            ("su -c id", "Root access"),
             ("pm list users", "User profiles"),
             ("pm list packages | wc -l", "Packages visible"),
             ("dumpsys window | grep -m1 mCurrentFocus", "Foreground app"),
@@ -1039,7 +1099,12 @@ class App:
         hr()
         print()
         self.troubleshoot_text()
-        pause()
+        print(f"\n   [{C.BOLD}r{C.RESET}] recheck root now   "
+              f"[{C.BOLD}Enter{C.RESET}] back")
+        choice = ask("").strip().lower()
+        if choice == "r":
+            self.sh.has_root = self.sh._probe_root()
+            self.diagnostics()
 
     @staticmethod
     def troubleshoot_text() -> None:
