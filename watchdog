@@ -73,6 +73,8 @@ class C:
 
 def clear() -> None:
     """Full clear. Used only on screen transitions, never in a render loop."""
+    if not C._on:
+        return
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
 
@@ -1120,10 +1122,15 @@ def main() -> int:
         Watchdog(app.sh, app.targets, app.interval, app.hang).run()
         return 0
 
-    if not sys.stdin.isatty():
-        err("No interactive terminal detected.")
-        info("Run this directly in Termux, or use: python3 rw.py start")
-        return 1
+    # Some Termux/cloud-phone terminal front-ends don't report isatty()
+    # correctly even though input works fine. Don't block on it - just drop
+    # ANSI color/cursor codes so a genuinely non-terminal session (piped,
+    # detached) still prints something sane instead of raw escape bytes.
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        if C._on:
+            App.toggle_plain()
+        warn("Terminal capabilities not detected - running in plain mode.")
+        warn("If input doesn't respond, use: python3 rw.py start (after Auto setup).")
 
     try:
         App().menu()
