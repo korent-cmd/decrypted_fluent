@@ -69,6 +69,19 @@ local function currentServerIsTrading()
 	return CONFIG.TradingJobId ~= "" and game.JobId == CONFIG.TradingJobId
 end
 
+local function reportStartupConfiguration()
+	if CONFIG.TradingJobId == "" then
+		warn("LocalTrader Version 3: CONFIG.TradingJobId is empty; edit LocalTrader.lua and set it to the private trading server JobId")
+		return false
+	end
+	if game.JobId == CONFIG.TradingJobId then
+		warn("LocalTrader Version 3: trading server detected; starting local trader")
+	else
+		warn("LocalTrader Version 3: non-trading server detected; checking for a FARMING handoff")
+	end
+	return true
+end
+
 local function loadQuantumOnyx()
 	local record = readHandoff()
 	if type(record) ~= "table" or record.phase ~= "FARMING" then
@@ -154,6 +167,10 @@ local function handoffToFarming(sessionData)
 		return false, "farming-server teleport failed: " .. tostring(teleportError)
 	end
 	return true
+end
+
+if not reportStartupConfiguration() then
+	return
 end
 
 if not currentServerIsTrading() then
