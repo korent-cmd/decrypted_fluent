@@ -860,7 +860,7 @@ class App:
 
         # step 1 - root
         print(f"\n  {C.BOLD}Step 1/4 · Root access{C.RESET}")
-        self.sh.has_root = self.sh._probe_root()
+        print("DEBUG: reached Step 1 without probing root")
         if self.sh.has_root:
             ok("Root confirmed (su works)")
         else:
