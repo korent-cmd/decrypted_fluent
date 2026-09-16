@@ -6,19 +6,19 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-assert(Remotes, "ReplicatedStorage.Remotes was not found")
-
-local TradeEvent = Remotes:WaitForChild("TradeEvent", 15)
-local TradeFunction = Remotes:WaitForChild("TradeFunction", 15)
-local CommF = Remotes:WaitForChild("CommF_", 15)
-assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
 
 local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
 	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
+	QuantumOnyxUrl = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua",
+	TradingJobId = tostring((getgenv and getgenv().LocalTraderTradingJobId) or _G.LocalTraderTradingJobId or ""),
+	HandoffFile = "LocalTrader_V3_Handoff.json",
+	FarmLoadMaxAttempts = 3,
+	FarmLoadRetryDelays = {0, 10, 30},
 	AcceptInterval = 1.5,
 	CustomerWaitTimeout = 180,
 	TradeStartTimeout = 30,
@@ -28,7 +28,148 @@ local CONFIG = {
 	RetweenInterval = 4,
 }
 
-local state = "IDLE"
+local function readHandoff()
+	if type(readfile) ~= "function" or type(HttpService.JSONDecode) ~= "function" then
+		return nil, "executor file persistence is unavailable"
+	end
+	if type(isfile) == "function" and not isfile(CONFIG.HandoffFile) then
+		return nil, "handoff file does not exist"
+	end
+	local ok, contents = pcall(readfile, CONFIG.HandoffFile)
+	if not ok or type(contents) ~= "string" or contents == "" then
+		return nil, "handoff file could not be read"
+	end
+	local decodedOk, record = pcall(function()
+		return HttpService:JSONDecode(contents)
+	end)
+	if not decodedOk or type(record) ~= "table" then
+		return nil, "handoff file contains invalid JSON"
+	end
+	return record
+end
+
+local function writeHandoff(record)
+	if type(writefile) ~= "function" then
+		return false, "executor writefile is unavailable"
+	end
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(record)
+	end)
+	if not ok then
+		return false, "handoff state could not be encoded"
+	end
+	local writeOk, writeError = pcall(writefile, CONFIG.HandoffFile, encoded)
+	if not writeOk then
+		return false, tostring(writeError)
+	end
+	return true
+end
+
+local function currentServerIsTrading()
+	return CONFIG.TradingJobId ~= "" and game.JobId == CONFIG.TradingJobId
+end
+
+local function loadQuantumOnyx()
+	local record = readHandoff()
+	if type(record) ~= "table" or record.phase ~= "FARMING" then
+		warn("LocalTrader Version 3: no FARMING handoff is pending")
+		return
+	end
+	if CONFIG.TradingJobId == "" then
+		warn("LocalTrader Version 3: set LocalTraderTradingJobId before using farming handoff")
+		return
+	end
+	if game.JobId == CONFIG.TradingJobId then
+		return
+	end
+	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
+		warn("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
+		return
+	end
+
+	local attempt = (record.loadJobId == game.JobId and tonumber(record.loadAttempt)) or 0
+	if attempt >= CONFIG.FarmLoadMaxAttempts then
+		warn("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
+		return
+	end
+	attempt = attempt + 1
+	local delaySeconds = CONFIG.FarmLoadRetryDelays[attempt] or 30
+	task.delay(delaySeconds, function()
+		local latest = readHandoff()
+		if type(latest) ~= "table" or latest.phase ~= "FARMING" then
+			return
+		end
+		latest.loadJobId = game.JobId
+		latest.loadAttempt = attempt
+		latest.lastLoadAttemptAt = os.time()
+		writeHandoff(latest)
+
+		local ok, result = pcall(function()
+			local source = game:HttpGet(CONFIG.QuantumOnyxUrl)
+			local chunk = loadstring(source)
+			assert(type(chunk) == "function", "QuantumOnyx did not compile")
+			return chunk()
+		end)
+		if ok then
+			latest.phase = "FARMING"
+			latest.farmStatus = "LOAD_EXECUTED"
+			latest.farmLoadedAt = os.time()
+			writeHandoff(latest)
+			warn("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
+		elseif attempt < CONFIG.FarmLoadMaxAttempts then
+			warn("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
+			task.spawn(loadQuantumOnyx)
+		else
+			latest.farmStatus = "LOAD_FAILED"
+			latest.lastError = tostring(result)
+			writeHandoff(latest)
+			warn("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+		end
+	end)
+end
+
+local function handoffToFarming(sessionData)
+	local record = {
+		version = 3,
+		phase = "FARMING",
+		farmStatus = "PENDING",
+		tradingJobId = CONFIG.TradingJobId,
+		previousJobId = game.JobId,
+		customerName = sessionData.customerName,
+		requestedId = sessionData.requestedId,
+		quantity = sessionData.quantity,
+		tradeSessionId = sessionData.id,
+		createdAt = os.time(),
+		loadJobId = nil,
+		loadAttempt = 0,
+	}
+	local saved, saveError = writeHandoff(record)
+	if not saved then
+		return false, "could not persist farming handoff: " .. tostring(saveError)
+	end
+	local ok, teleportError = pcall(function()
+		TeleportService:Teleport(game.PlaceId)
+	end)
+	if not ok then
+		return false, "farming-server teleport failed: " .. tostring(teleportError)
+	end
+	return true
+end
+
+if not currentServerIsTrading() then
+	loadQuantumOnyx()
+	return
+end
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+assert(Remotes, "ReplicatedStorage.Remotes was not found")
+
+local TradeEvent = Remotes:WaitForChild("TradeEvent", 15)
+local TradeFunction = Remotes:WaitForChild("TradeFunction", 15)
+local CommF = Remotes:WaitForChild("CommF_", 15)
+assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
+
+local state = "TRADING"
 local running = false
 local session = nil
 local latestTradeState = nil
@@ -824,7 +965,15 @@ local function startTrader()
 				local after = type(inventoryAfter) == "table" and inventoryAmount(inventoryAfter, session.requestedId) or nil
 				if after and after <= before - session.quantity then
 					writeLog("trade completed and requested item is no longer available")
-					stopTrader("completed")
+					setState("COOLDOWN", "trade verified; preparing farming handoff")
+					local handedOff, handoffError = handoffToFarming(session)
+					if handedOff then
+						writeLog("trade verified; joining a farming server")
+						stopTrader("completed; farming handoff started")
+					else
+						writeLog(handoffError)
+						stopTrader("completed, but farming handoff failed")
+					end
 				else
 					writeLog("processing ended, but inventory verification failed")
 					stopTrader("verification failed")
