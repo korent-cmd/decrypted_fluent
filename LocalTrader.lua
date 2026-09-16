@@ -2,6 +2,8 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 
+warn("LocalTrader: script execution started")
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
@@ -9,7 +11,36 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local function startupNotice(message, isError)
+	local playerGui = LocalPlayer and (LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		or LocalPlayer:WaitForChild("PlayerGui", 10))
+	if not playerGui then
+		warn("LocalTrader: " .. message)
+		return
+	end
+	local existing = playerGui:FindFirstChild("LocalTraderStartupNotice")
+	if existing then
+		existing:Destroy()
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "LocalTraderStartupNotice"
+	gui.ResetOnSpawn = false
+	gui.Parent = playerGui
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromOffset(520, 70)
+	label.Position = UDim2.fromOffset(20, 20)
+	label.BackgroundColor3 = isError and Color3.fromRGB(100, 35, 35) or Color3.fromRGB(35, 70, 105)
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextWrapped = true
+	label.TextSize = 14
+	label.Font = Enum.Font.Gotham
+	label.Text = message
+	label.Parent = gui
+	warn("LocalTrader: " .. message)
+	return gui
+end
 
 local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
@@ -71,13 +102,13 @@ end
 
 local function reportStartupConfiguration()
 	if CONFIG.TradingJobId == "" then
-		warn("LocalTrader Version 3: CONFIG.TradingJobId is empty; edit LocalTrader.lua and set it to the private trading server JobId")
+		startupNotice("TradingJobId is empty. Edit CONFIG.TradingJobId in LocalTrader.lua.\nCurrent JobId: " .. tostring(game.JobId), true)
 		return false
 	end
 	if game.JobId == CONFIG.TradingJobId then
-		warn("LocalTrader Version 3: trading server detected; starting local trader")
+		startupNotice("Trading server detected. Starting local trader.", false)
 	else
-		warn("LocalTrader Version 3: non-trading server detected; checking for a FARMING handoff")
+		startupNotice("Non-trading server detected. Checking for a farming handoff.\nCurrent JobId: " .. tostring(game.JobId), false)
 	end
 	return true
 end
@@ -176,6 +207,12 @@ end
 if not currentServerIsTrading() then
 	loadQuantumOnyx()
 	return
+end
+
+local startupNoticeGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	and LocalPlayer.PlayerGui:FindFirstChild("LocalTraderStartupNotice")
+if startupNoticeGui then
+	startupNoticeGui:Destroy()
 end
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
