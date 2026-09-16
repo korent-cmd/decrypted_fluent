@@ -241,44 +241,44 @@ class Shell:
 
     def _probe_root(self) -> bool:
         """
-        Tries several invocation styles because su implementations differ
-        (Magisk, KernelSU, APatch, vendor/cloud-phone brokers). Records what
-        actually happened so Diagnostics can show it instead of a bare
-        yes/no that hides *why* it failed.
+        Check root using the standard Termux-compatible invocation.
+
+        The old probe tried several different `su` syntaxes and could spend
+        a long time waiting on a root-manager interaction. Since the normal
+        `su -c id` invocation is sufficient here, keep startup fast and
+        predictable.
         """
-        attempts = [
-            ["su", "-c", "id"],
-            ["su", "-c", "id"],   # retry once: first call often just triggers
-                                   # the root-grant prompt/notification and
-                                   # returns before the user has tapped it
-            ["su", "0", "id"],
-            ["su", "-mm", "-c", "id"],
-        ]
-        details = []
-        for i, argv in enumerate(attempts):
-            try:
-                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-            except FileNotFoundError:
-                details.append(f"{' '.join(argv)} -> su binary not found on PATH")
-                break
-            except subprocess.TimeoutExpired:
-                details.append(f"{' '.join(argv)} -> timed out after 20s "
-                               f"(often means a root prompt is waiting for a tap)")
-                if i == 0:
-                    time.sleep(2)   # give a pending prompt a moment before retry
-                continue
+        argv = ["su", "-c", "id"]
+        try:
+            r = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            self.root_probe_detail = "su -c id -> su binary not found on PATH"
+            return False
+        except subprocess.TimeoutExpired:
+            self.root_probe_detail = (
+                "su -c id -> timed out after 5s "
+                "(check the root manager permission for Termux)"
+            )
+            return False
+        except Exception as exc:
+            self.root_probe_detail = f"su -c id -> error: {exc}"
+            return False
 
-            out = (r.stdout or "").strip()
-            errtxt = (r.stderr or "").strip()
-            details.append(f"{' '.join(argv)} -> rc={r.returncode} "
-                           f"stdout={out[:60]!r} stderr={errtxt[:60]!r}")
+        out = (r.stdout or "").strip()
+        errtxt = (r.stderr or "").strip()
+        self.root_probe_detail = (
+            f"su -c id -> rc={r.returncode} "
+            f"stdout={out[:120]!r} stderr={errtxt[:120]!r}"
+        )
 
-            if r.returncode == 0 and ("uid=0" in out or "uid=0" in errtxt):
-                self.root_probe_detail = "\n".join(details)
-                return True
-
-        self.root_probe_detail = "\n".join(details)
-        return False
+        return r.returncode == 0 and (
+            "uid=0" in out or "uid=0" in errtxt
+        )
 
     def run(self, cmd: str, timeout: int = 25, root: bool = True) -> Tuple[int, str]:
         argv = ["su", "-c", cmd] if (root and self.has_root) else ["sh", "-c", cmd]
