@@ -247,24 +247,17 @@ class Shell:
         """
         attempts = [
             ["su", "-c", "id"],
-            ["su", "-c", "id"],   # retry once: first call often just triggers
-                                   # the root-grant prompt/notification and
-                                   # returns before the user has tapped it
-            ["su", "0", "id"],
-            ["su", "-mm", "-c", "id"],
         ]
         details = []
         for i, argv in enumerate(attempts):
             try:
-                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
             except FileNotFoundError:
                 details.append(f"{' '.join(argv)} -> su binary not found on PATH")
                 break
             except subprocess.TimeoutExpired:
                 details.append(f"{' '.join(argv)} -> timed out after 20s "
                                f"(often means a root prompt is waiting for a tap)")
-                if i == 0:
-                    time.sleep(2)   # give a pending prompt a moment before retry
                 continue
 
             out = (r.stdout or "").strip()
@@ -597,7 +590,7 @@ class Controller:
 
         for url in urls:
             cmd = (f"am start -W {uf} -a android.intent.action.VIEW "
-                   f"-d {shlex.quote(url)} -p {shlex.quote(t.package)}")
+                   f"-d {shlex.quote(url)}")
             rc, out = self.sh.run(cmd, timeout=35)
             logline(f"[{t.name}] launch intent rc={rc}: {url}",
                      "INFO" if rc == 0 else "WARN")
@@ -606,9 +599,7 @@ class Controller:
                 logline(f"[{t.name}] am start: {compact}",
                          "INFO" if rc == 0 else "WARN")
             if self._wait(t, 30):
-                # Give Roblox a moment to consume the deep link before declaring
-                # success. The PID alone only proves the app process exists.
-                time.sleep(3)
+                time.sleep(5)
                 return True
 
         # Last resort: open the selected Roblox instance normally.
