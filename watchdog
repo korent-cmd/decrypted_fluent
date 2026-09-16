@@ -60,7 +60,7 @@ MIN_CONFIDENCE = 2
 
 class C:
     """ANSI colors, auto-disabled when output isn't a terminal."""
-    _on = sys.stdout.isatty()
+    _on = False
     RESET = "\033[0m" if _on else ""
     BOLD = "\033[1m" if _on else ""
     DIM = "\033[2m" if _on else ""
@@ -72,11 +72,8 @@ class C:
 
 
 def clear() -> None:
-    """Full clear. Used only on screen transitions, never in a render loop."""
-    if not C._on:
-        return
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
+    """Disabled in safe/plain mode; ANSI clear codes can break Termux frontends."""
+    return
 
 
 class Screen:
@@ -235,8 +232,11 @@ def logline(msg: str, level: str = "INFO") -> None:
 
 class Shell:
     def __init__(self, prefer_root: bool = True):
-        self.root_probe_detail = ""
-        self.has_root = self._probe_root() if prefer_root else False
+        # Safe startup: never launch `su` while constructing the app.
+        # Some rooted Android/Termux frontends can freeze when a root-manager
+        # interaction happens during startup.
+        self.root_probe_detail = "startup probe skipped (safe Termux mode)"
+        self.has_root = bool(prefer_root)
         self._cache: Dict[str, str] = {}
 
     def _probe_root(self) -> bool:
@@ -1063,6 +1063,8 @@ class App:
 
     def diagnostics(self) -> None:
         clear()
+        # Root probing is deferred until Diagnostics.
+        self.sh.has_root = self.sh._probe_root()
         print(f"  {C.BOLD}DIAGNOSTICS{C.RESET}\n")
         hr()
 
@@ -1119,7 +1121,6 @@ class App:
     def menu(self) -> None:
         while True:
             clear()
-            Screen.reset()
             banner()
             n = len(self.targets)
             root_s = f"{C.GREEN}root ok{C.RESET}" if self.sh.has_root \
@@ -1187,16 +1188,7 @@ def main() -> int:
         Watchdog(app.sh, app.targets, app.interval, app.hang).run()
         return 0
 
-    # Some Termux/cloud-phone terminal front-ends don't report isatty()
-    # correctly even though input works fine. Don't block on it - just drop
-    # ANSI color/cursor codes so a genuinely non-terminal session (piped,
-    # detached) still prints something sane instead of raw escape bytes.
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        if C._on:
-            App.toggle_plain()
-        warn("Terminal capabilities not detected - running in plain mode.")
-        warn("If input doesn't respond, use: python3 rw.py start (after Auto setup).")
-
+    # Safe Termux mode: no ANSI redraws and no root probe during startup.
     try:
         App().menu()
     except Quit:
