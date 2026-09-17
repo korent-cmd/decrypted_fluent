@@ -11,6 +11,7 @@
 # watchdog_config.json and can be edited from the menu.
 # ============================================================================
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -38,6 +39,8 @@ ORDER_PATH = os.environ.get(
     "LOCALTRADER_ORDER_PATH",
     os.path.join(BASE_DIR, "LocalTrader_Order.json"),
 )
+LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/ArceusX/Workspace"
+LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -309,6 +312,7 @@ class Target:
     label: str = ""
     enabled: bool = True
     hub_id: str = ""
+    clone_folder: str = ""
 
     last_rejoin: float = 0.0
     last_launch: float = 0.0
@@ -540,6 +544,56 @@ class Watchdog:
             t.hub_error = str(e)
             self.log.log(f"{t.label}: hub event failed: {e}")
 
+    def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
+        """Publish Hub connection/state into ArceusX clone Workspace.
+
+        Each clone has its own executor Workspace.  The config is deliberately
+        relative on the Lua side (readfile("LocalTrader_Hub.json")); rw.py
+        writes the corresponding absolute Android path here.
+        """
+        if not self.hub.enabled:
+            return
+
+        if target is not None:
+            clone_name = target.clone_folder
+            if not clone_name:
+                m = re.search(r"RobloxClone\d+", target.label or "")
+                clone_name = m.group(0) if m else ""
+            if not clone_name:
+                # Auto-setup / old configs have no explicit mapping.  Use the
+                # target's ordinal in the configured target list as the clone
+                # number, which matches the normal RobloxClone001... layout.
+                try:
+                    ordinal = self.targets.index(target) + 1
+                except ValueError:
+                    ordinal = 1
+                clone_name = f"RobloxClone{ordinal:03d}"
+            target.clone_folder = clone_name
+            dirs = f"/storage/emulated/0/{clone_name}/ArceusX/Workspace"
+        else:
+            dirs = LOCALTRADER_WORKSPACE_GLOB
+
+        payload = json.dumps({
+            "version": 2,
+            "hub_url": self.hub.base_url,
+            "hub_token": self.hub.token,
+            "hub_poll_sec": self.hub_poll_sec,
+            "mode": "TRADING" if target and target.hub_state == "TRADING" else "FARMING",
+            "account_id": target.hub_id if target else "",
+        }, ensure_ascii=False, separators=(",", ":"))
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        cmd = (
+            "for d in " + dirs + "; do "
+            "[ -d \"$d\" ] || continue; "
+            "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+            "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+            "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; "
+            "done"
+        )
+        result = self.shell.root(cmd, timeout=15)
+        if result.returncode != 0:
+            self.log.log(f"LocalTrader config sync failed: {result.stderr.strip()[:300]}")
+
     def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
         """Write the complete order for LocalTrader before opening Roblox."""
         order = {
@@ -649,6 +703,7 @@ class Watchdog:
     def enter_trading(self, t: Target) -> None:
         if not t.enabled:
             return
+        self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: ENTER TRADING")
         t.status = "switching_to_trading"
         self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
@@ -667,6 +722,7 @@ class Watchdog:
             self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
 
     def return_to_farming(self, t: Target) -> None:
+        self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: RETURN TO FARMING")
         t.status = "switching_to_farming"
         self.notify(t, t.status, "return_to_farming")
@@ -756,37 +812,10 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
-        # Establish a known starting point before the first watchdog tick.
-        # If Roblox is already running, don't immediately rejoin just because
-        # last_rejoin starts at 0. If it is not running, start it once so that
-        # "Start watchdog" actually starts the configured instance.
         for t in self.targets:
-            if not t.enabled:
-                continue
-            self.heartbeat(t)
-            try:
-                if self.controller.is_running(t.package):
-                    t.last_rejoin = time.time()
-                    t.status = "trading" if t.hub_state == "TRADING" else "running"
-                    self.log.log(
-                        f"{t.label}: already running; scheduled rejoin timer started"
-                    )
-                else:
-                    self.log.log(f"{t.label}: not running at startup; launching")
-                    if t.hub_state == "TRADING":
-                        ok = self.controller.launch_trading(t, self.trading_share_link)
-                        t.status = "trading_joining" if ok else "error"
-                    else:
-                        ok = self.controller.launch(t)
-                        t.status = "launching" if ok else "error"
-                        if ok:
-                            t.last_rejoin = time.time()
-                    if not ok:
-                        self.log.log(f"{t.label}: startup launch failed")
-            except Exception as e:
-                t.status = "error"
-                self.log.log(f"{t.label}: startup initialization failed: {e}")
-                self.log.log(traceback.format_exc()[-2000:])
+            if t.enabled:
+                self.sync_localtrader_config(t)
+                self.heartbeat(t)
 
         try:
             last_tick = 0.0
