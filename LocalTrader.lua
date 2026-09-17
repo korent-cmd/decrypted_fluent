@@ -46,8 +46,16 @@ local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
 	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
 	QuantumOnyxUrl = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua",
-	TradingJobId = "21efbc9a-9807-432f-bff8-2143a4302bad",
+	-- Server selection is controlled by the watchdog private-server share link.
+	TradingJobId = "",
 	HandoffFile = "LocalTrader_V3_Handoff.json",
+	-- Set this to the same shared Android path written by rw(2).py.
+	OrderFile = "/sdcard/LocalTrader_Order.json",
+	OrderCustomerName = "",
+	OrderFruitName = "",
+	OrderQuantity = 1,
+	TeleportMaxAttempts = 5,
+	TeleportRetryDelays = {0, 5, 15, 30, 60},
 	FarmLoadMaxAttempts = 3,
 	FarmLoadRetryDelays = {0, 10, 30},
 	AcceptInterval = 1.5,
@@ -96,19 +104,193 @@ local function writeHandoff(record)
 	return true
 end
 
+local function readExternalOrder()
+	if type(readfile) ~= "function" then
+		return nil
+	end
+	local ok, contents = pcall(readfile, CONFIG.OrderFile)
+	if not ok or type(contents) ~= "string" or contents == "" then
+		return nil
+	end
+	local decodedOk, order = pcall(function()
+		return HttpService:JSONDecode(contents)
+	end)
+	if not decodedOk or type(order) ~= "table" then
+		return nil
+	end
+	if order.status == "COMPLETED" or order.status == "CANCELED" then
+		return nil
+	end
+	if order.phase ~= "TRADING_ROUTE" and order.phase ~= "TRADING" then
+		return nil
+	end
+	if tostring(order.customer or "") == "" or tostring(order.item or "") == "" then
+		return nil
+	end
+	return order
+end
+
+local function writeExternalOrder(order, phase, status)
+	if type(writefile) ~= "function" or type(order) ~= "table" then
+		return false
+	end
+	local updated = {}
+	for key, value in pairs(order) do
+		updated[key] = value
+	end
+	updated.phase = phase
+	updated.status = status
+	updated.updated_at = os.time()
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(updated)
+	end)
+	if not ok then
+		return false
+	end
+	return pcall(writefile, CONFIG.OrderFile, encoded)
+end
+
 local function currentServerIsTrading()
 	return CONFIG.TradingJobId ~= "" and game.JobId == CONFIG.TradingJobId
 end
 
+local teleportInFlight = false
+local teleportMode = nil
+local teleportAttempt = 0
+
+local function teleportErrorText(result)
+	return tostring(result or "unknown teleport error")
+end
+
+local function teleportReachedDestination(mode, record)
+	if mode == "TRADING" then
+		return currentServerIsTrading()
+	end
+	return type(record) == "table"
+		and game.JobId ~= CONFIG.TradingJobId
+		and game.JobId ~= record.previousJobId
+end
+
+local function retryTeleport(mode, record)
+	if teleportInFlight then
+		return
+	end
+	if teleportAttempt >= CONFIG.TeleportMaxAttempts then
+		warn("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
+		return
+	end
+	teleportAttempt = teleportAttempt + 1
+	local attempt = teleportAttempt
+	local delaySeconds = CONFIG.TeleportRetryDelays[attempt] or 60
+	task.delay(delaySeconds, function()
+		if type(record) == "table" then
+			local latest = readHandoff()
+			if type(latest) ~= "table" or latest.phase ~= record.phase or latest.orderId ~= record.orderId then
+				return
+			end
+		end
+		local ok, result = pcall(function()
+			if mode == "TRADING" then
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, CONFIG.TradingJobId, LocalPlayer)
+			else
+				TeleportService:Teleport(game.PlaceId)
+			end
+		end)
+		if ok then
+			teleportInFlight = true
+			warn(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
+			task.delay(15, function()
+				if teleportInFlight and not teleportReachedDestination(mode, record) then
+					teleportInFlight = false
+					warn("LocalTrader Version 3: teleport did not complete; retrying")
+					task.spawn(retryTeleport, mode, record)
+				end
+			end)
+		else
+			teleportInFlight = false
+			warn("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
+			task.spawn(retryTeleport, mode, record)
+		end
+	end)
+end
+
+local function beginTeleport(mode, record)
+	if teleportInFlight then
+		return true
+	end
+	teleportMode = mode
+	teleportAttempt = 0
+	teleportInFlight = false
+	retryTeleport(mode, record)
+	return true
+end
+
+TeleportService.TeleportInitFailed:Connect(function(player, result)
+	if player ~= LocalPlayer or not teleportMode then
+		return
+	end
+	teleportInFlight = false
+	warn("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
+	local record = readHandoff()
+	if type(record) == "table" then
+		task.spawn(retryTeleport, teleportMode, record)
+	else
+		task.spawn(retryTeleport, teleportMode)
+	end
+end)
+
+local function createConfiguredOrder()
+	local customerName = tostring(CONFIG.OrderCustomerName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local fruitName = tostring(CONFIG.OrderFruitName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local quantity = math.max(1, tonumber(CONFIG.OrderQuantity) or 1)
+	if customerName == "" or fruitName == "" then
+		return nil
+	end
+	return {
+		version = 3,
+		phase = "ORDER_PENDING",
+		orderId = HttpService:GenerateGUID(false),
+		customerName = customerName,
+		requestedFruitName = fruitName,
+		quantity = quantity,
+		tradingJobId = CONFIG.TradingJobId,
+		createdAt = os.time(),
+	}
+end
+
+local function ensureConfiguredOrder()
+	local existing = readHandoff()
+	if type(existing) == "table"
+		and (existing.phase == "ORDER_PENDING" or existing.phase == "FARMING" or existing.phase == "TRADING") then
+		return existing
+	end
+	local configured = createConfiguredOrder()
+	if not configured then
+		return nil
+	end
+	local saved, saveError = writeHandoff(configured)
+	if not saved then
+		warn("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
+		return nil
+	end
+	return configured
+end
+
 local function reportStartupConfiguration()
 	if CONFIG.TradingJobId == "" then
-		startupNotice("TradingJobId is empty. Edit CONFIG.TradingJobId in LocalTrader.lua.\nCurrent JobId: " .. tostring(game.JobId), true)
+		local externalOrder = readExternalOrder()
+		local farmingHandoff = readHandoff()
+		if externalOrder or (type(farmingHandoff) == "table" and farmingHandoff.phase == "FARMING") then
+			startupNotice("Share-link routing is active. Checking the external order or farming handoff.", false)
+			return true
+		end
+		startupNotice("TradingJobId is empty and no external order is pending.\nCurrent JobId: " .. tostring(game.JobId), true)
 		return false
 	end
 	if game.JobId == CONFIG.TradingJobId then
 		startupNotice("Trading server detected. Starting local trader.", false)
 	else
-		startupNotice("Non-trading server detected. Checking for a farming handoff.\nCurrent JobId: " .. tostring(game.JobId), false)
+		startupNotice("Non-trading server detected. Routing an order or checking farming handoff.\nCurrent JobId: " .. tostring(game.JobId), false)
 	end
 	return true
 end
@@ -117,13 +299,6 @@ local function loadQuantumOnyx()
 	local record = readHandoff()
 	if type(record) ~= "table" or record.phase ~= "FARMING" then
 		warn("LocalTrader Version 3: no FARMING handoff is pending")
-		return
-	end
-	if CONFIG.TradingJobId == "" then
-		warn("LocalTrader Version 3: set LocalTraderTradingJobId before using farming handoff")
-		return
-	end
-	if game.JobId == CONFIG.TradingJobId then
 		return
 	end
 	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
@@ -177,6 +352,7 @@ local function handoffToFarming(sessionData)
 		version = 3,
 		phase = "FARMING",
 		farmStatus = "PENDING",
+		orderId = sessionData.orderId or sessionData.order_id or HttpService:GenerateGUID(false),
 		tradingJobId = CONFIG.TradingJobId,
 		previousJobId = game.JobId,
 		customerName = sessionData.customerName,
@@ -186,16 +362,16 @@ local function handoffToFarming(sessionData)
 		createdAt = os.time(),
 		loadJobId = nil,
 		loadAttempt = 0,
+		externalOrder = sessionData.externalOrder,
 	}
 	local saved, saveError = writeHandoff(record)
 	if not saved then
 		return false, "could not persist farming handoff: " .. tostring(saveError)
 	end
-	local ok, teleportError = pcall(function()
-		TeleportService:Teleport(game.PlaceId)
-	end)
-	if not ok then
-		return false, "farming-server teleport failed: " .. tostring(teleportError)
+	if not sessionData.externalOrder then
+		beginTeleport("FARMING", record)
+	else
+		warn("LocalTrader Version 3: external order completed; watchdog controls the farming relaunch")
 	end
 	return true
 end
@@ -204,7 +380,21 @@ if not reportStartupConfiguration() then
 	return
 end
 
-if not currentServerIsTrading() then
+local startupOrder = readExternalOrder()
+local function isTradingPrivateServer()
+	return tostring(game.PrivateServerId or "") ~= ""
+end
+
+if startupOrder and not isTradingPrivateServer() then
+	startupNotice("Order is pending, but this is not a private trading server. Waiting for the watchdog share-link launch.", true)
+	return
+end
+
+if not startupOrder and not currentServerIsTrading() then
+	local pendingOrder = ensureConfiguredOrder()
+	if type(pendingOrder) == "table" then
+		warn("LocalTrader Version 3: local JobId handoff is obsolete; use the watchdog share-link route")
+	end
 	loadQuantumOnyx()
 	return
 end
@@ -821,6 +1011,8 @@ end
 local startButton
 local function stopTrader(reason)
 	local stoppedSessionId = session and session.id
+	local stoppedOrderId = session and session.orderId
+	local completed = session and session.completed
 	running = false
 	state = "IDLE"
 	latestTradeState = nil
@@ -831,12 +1023,27 @@ local function stopTrader(reason)
 	if startButton then
 		startButton.Text = "Start"
 	end
+	if stoppedOrderId and not completed then
+		local order = readHandoff()
+		if type(order) == "table" and order.orderId == stoppedOrderId and order.phase == "TRADING" then
+			order.phase = "ORDER_PENDING"
+			order.lastFailure = reason or "trader stopped"
+			order.lastFailureAt = os.time()
+			writeHandoff(order)
+		end
+	end
 	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
 end
 
-local function startTrader()
+local function startTrader(orderData)
 	if running then
 		return
+	end
+	if type(orderData) == "table" then
+		customerBox.Text = tostring(orderData.customerName or orderData.customer or "")
+		fruitBox.Text = tostring(orderData.requestedFruitName or orderData.fruitName or orderData.item or "")
+		fruitBox:SetAttribute("SelectedItemId", orderData.requestedId)
+		quantityBox.Text = tostring(math.max(1, tonumber(orderData.quantity) or 1))
 	end
 	local targetName = customerBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
 	local requestedId = fruitBox:GetAttribute("SelectedItemId")
@@ -878,6 +1085,7 @@ local function startTrader()
 	state = "WAITING_FOR_CUSTOMER"
 	session = {
 		id = sessionSequence,
+		orderId = type(orderData) == "table" and (orderData.orderId or orderData.order_id) or nil,
 		customerName = targetName,
 		requestedId = requestedId,
 		quantity = quantity,
@@ -886,7 +1094,25 @@ local function startTrader()
 		stageStartedAt = os.clock(),
 		addRequested = false,
 		lastRetween = 0,
+		externalOrder = type(orderData) == "table" and orderData or nil,
 	}
+	if type(orderData) == "table" then
+		orderData.phase = "TRADING"
+		orderData.startedAt = os.time()
+		orderData.tradingJobId = CONFIG.TradingJobId
+		orderData.requestedId = requestedId
+		orderData.requestedFruitName = fruitBox.Text
+		if orderData.order_id or orderData.orderId then
+			writeExternalOrder(orderData, "TRADING", "IN_PROGRESS")
+		end
+		local saved, saveError = writeHandoff(orderData)
+		if not saved then
+			writeLog("could not persist active order: " .. tostring(saveError))
+			running = false
+			session = nil
+			return
+		end
+	end
 	startButton.Text = "Stop"
 	local seat = emptyTradeSeat()
 	if seat then
@@ -1017,9 +1243,13 @@ local function startTrader()
 				local inventoryAfter = readInventory()
 				local before = session.inventoryBefore or 0
 				local after = type(inventoryAfter) == "table" and inventoryAmount(inventoryAfter, session.requestedId) or nil
-				if after and after <= before - session.quantity then
+					if after and after <= before - session.quantity then
 					writeLog("trade completed and requested item is no longer available")
 					setState("COOLDOWN", "trade verified; preparing farming handoff")
+						session.completed = true
+						if session.externalOrder then
+							writeExternalOrder(session.externalOrder, "FARMING", "COMPLETED")
+						end
 					local handedOff, handoffError = handoffToFarming(session)
 					if handedOff then
 						writeLog("trade verified; joining a farming server")
@@ -1149,4 +1379,32 @@ icon.Activated:Connect(function()
 end)
 
 gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-writeLog("enter customer username and fruit name")
+local pendingTradingOrder = nil
+local pendingFarmingHandoff = nil
+if startupOrder then
+	pendingTradingOrder = startupOrder
+elseif currentServerIsTrading() then
+	local savedOrder = readHandoff()
+	if type(savedOrder) ~= "table" then
+		savedOrder = ensureConfiguredOrder()
+	end
+	if type(savedOrder) == "table"
+		and savedOrder.phase == "ORDER_PENDING"
+		and savedOrder.tradingJobId == CONFIG.TradingJobId then
+		pendingTradingOrder = savedOrder
+	elseif type(savedOrder) == "table" and savedOrder.phase == "TRADING" then
+		warn("LocalTrader Version 3: active order found after restart; refusing to repeat the trade")
+	elseif type(savedOrder) == "table" and savedOrder.phase == "FARMING" then
+		pendingFarmingHandoff = savedOrder
+	end
+end
+
+if pendingFarmingHandoff then
+	writeLog("farming handoff found in trading server; leaving for a farming server")
+	beginTeleport("FARMING", pendingFarmingHandoff)
+elseif pendingTradingOrder then
+	writeLog("saved order found; starting automatically")
+	task.defer(startTrader, pendingTradingOrder)
+else
+	writeLog("enter customer username and fruit name")
+end
