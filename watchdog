@@ -812,10 +812,47 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
+        # Runtime timestamps are not persisted.  Therefore a freshly-created
+        # Target starts with last_rejoin=0.  Initialize the timer lifecycle here:
+        # - already-running Roblox: timer starts NOW (no immediate rejoin)
+        # - stopped Roblox: launch it NOW (timer starts when launch succeeds)
+        # This also fixes timer-only mode getting stuck forever on a stopped app.
+        self.poll_hub()
         for t in self.targets:
-            if t.enabled:
-                self.sync_localtrader_config(t)
+            if not t.enabled:
+                continue
+
+            self.sync_localtrader_config(t)
+            running, _ = self.inspect_process(t)
+
+            if running:
+                if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
+                    t.last_rejoin = time.time()
+                t.status = "trading" if t.hub_state == "TRADING" else "running"
                 self.heartbeat(t)
+                continue
+
+            if t.hub_state == "TRADING":
+                self.log.log(f"{t.label}: startup launch into TRADING")
+                ok = self.controller.launch_trading(t, self.trading_share_link)
+                if ok:
+                    t.status = "trading_joining"
+                    t.trading_join_attempted = True
+                    self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
+                else:
+                    t.status = "error"
+                    t.fail_streak += 1
+            else:
+                self.log.log(f"{t.label}: startup launch into FARMING")
+                ok = self.controller.launch(t)
+                if ok:
+                    t.status = "launching"
+                    t.last_rejoin = time.time()
+                    self.notify(t, t.status, "farming_launch_sent")
+                else:
+                    t.status = "error"
+                    t.fail_streak += 1
+            self.heartbeat(t)
 
         try:
             last_tick = 0.0
