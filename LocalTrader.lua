@@ -1,1144 +1,1252 @@
--- Blox Fruits Version 1 local trader.
--- Requires an executor with readfile/loadstring or a runtime ItemIds table.
--- No namecall hooks are used. Trade calls are made directly through the game's remotes.
-
-warn("LocalTrader: script execution started")
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-
-local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
-
-local function startupNotice(message, isError)
-	local playerGui = LocalPlayer and (LocalPlayer:FindFirstChildOfClass("PlayerGui")
-		or LocalPlayer:WaitForChild("PlayerGui", 10))
-	if not playerGui then
-		warn("LocalTrader: " .. message)
-		return
-	end
-	local existing = playerGui:FindFirstChild("LocalTraderStartupNotice")
-	if existing then
-		existing:Destroy()
-	end
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "LocalTraderStartupNotice"
-	gui.ResetOnSpawn = false
-	gui.Parent = playerGui
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromOffset(520, 70)
-	label.Position = UDim2.fromOffset(20, 20)
-	label.BackgroundColor3 = isError and Color3.fromRGB(100, 35, 35) or Color3.fromRGB(35, 70, 105)
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.TextWrapped = true
-	label.TextSize = 14
-	label.Font = Enum.Font.Gotham
-	label.Text = message
-	label.Parent = gui
-	warn("LocalTrader: " .. message)
-	return gui
-end
-
-local GEN = (type(getgenv) == "function" and getgenv()) or _G
-local HUB_URL = tostring(GEN.WATCHDOG_HUB_URL or GEN.HUB_URL or ""):gsub("/$", "")
-local HUB_TOKEN = tostring(GEN.WATCHDOG_HUB_TOKEN or GEN.HUB_TOKEN or "")
-
-local CONFIG = {
-	TablePath = {"Map", "Dressrosa", "TradeTable"},
-	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
-	QuantumOnyxUrl = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua",
-	AcceptInterval = 1.5,
-	CustomerWaitTimeout = 180,
-	TradeStartTimeout = 30,
-	CompletionTimeout = 45,
-	InventoryRefreshInterval = 2,
-	MaxLogLines = 200,
-	RetweenInterval = 4,
-	HubPollInterval = 3,
-	FarmLoadRetryDelays = {0, 10, 30},
-}
-
--- LocalTrader no longer needs any JSON/file handoff. The watchdog owns the
--- local config, while the Hub owns the current trade request and state.
-local function hubGet(path)
-	if HUB_URL == "" then
-		return nil, "WATCHDOG_HUB_URL is not configured"
-	end
-	local separator = path:find("?", 1, true) and "&" or "?"
-	local url = HUB_URL .. path .. separator .. "_ts=" .. tostring(os.time())
-	if HUB_TOKEN ~= "" then
-		url = url .. "&token=" .. HttpService:UrlEncode(HUB_TOKEN)
-	end
-
-	local ok, result = pcall(function()
-		-- Prefer executor request() when available so the token can stay in the
-		-- private executor environment rather than in this public script.
-		if type(request) == "function" and HUB_TOKEN ~= "" then
-			local response = request({
-				Url = url,
-				Method = "GET",
-				Headers = {Authorization = "Bearer " .. HUB_TOKEN, Accept = "application/json"},
-			})
-			if type(response) ~= "table" then
-				error("invalid request() response")
-			end
-			local code = tonumber(response.StatusCode or response.status_code or 0) or 0
-			if code ~= 0 and (code < 200 or code >= 300) then
-				error("Hub HTTP " .. tostring(code) .. ": " .. tostring(response.Body or response.body or ""))
-			end
-			return HttpService:JSONDecode(tostring(response.Body or response.body or "{}"))
-		end
-		local body = game:HttpGet(url)
-		return HttpService:JSONDecode(body)
-	end)
-	if not ok then
-		return nil, tostring(result)
-	end
-	if type(result) ~= "table" then
-		return nil, "Hub returned invalid JSON"
-	end
-	return result
-end
-
-local function hubPollOrder()
-	local data, err = hubGet("/api/v1/order-user/" .. tostring(LocalPlayer.UserId))
-	if not data then
-		return nil, err
-	end
-	if data.ok == false then
-		return nil, tostring(data.error or "Hub request failed")
-	end
-	return data
-end
-
-local function hubComplete(orderId)
-	if not orderId or tostring(orderId) == "" then
-		return false, "missing order id"
-	end
-	local data, err = hubGet("/api/v1/trade-complete-user/" .. tostring(LocalPlayer.UserId)
-		.. "?request_id=" .. HttpService:UrlEncode(tostring(orderId)))
-	if not data then
-		return false, err
-	end
-	return data.ok == true, tostring(data.error or "")
-end
-
-local function loadQuantumOnyx()
-	local attempt = 0
-	local function runAttempt()
-		attempt = attempt + 1
-		local ok, result = pcall(function()
-			local source = game:HttpGet(CONFIG.QuantumOnyxUrl)
-			local chunk = loadstring(source)
-			assert(type(chunk) == "function", "QuantumOnyx did not compile")
-			return chunk()
-		end)
-		if ok then
-			warn("LocalTrader: QuantumOnyx load executed")
-		elseif attempt < #CONFIG.FarmLoadRetryDelays then
-			warn("LocalTrader: QuantumOnyx load failed; retrying: " .. tostring(result))
-			task.delay(CONFIG.FarmLoadRetryDelays[attempt + 1] or 30, runAttempt)
-		else
-			warn("LocalTrader: QuantumOnyx load failed after retries: " .. tostring(result))
-		end
-	end
-	task.delay(CONFIG.FarmLoadRetryDelays[1] or 0, runAttempt)
-end
-
-if HUB_URL == "" then
-	startupNotice("Hub URL is not configured. Set WATCHDOG_HUB_URL in your private executor loader.", true)
-	return
-end
-
-local startupOrder = nil
-local startupHubData, startupHubError = hubPollOrder()
-if startupHubData and type(startupHubData.request) == "table"
-	and tostring(startupHubData.desired_state or "FARMING"):upper() == "TRADING" then
-	startupOrder = startupHubData.request
-	startupOrder.orderId = startupOrder.orderId or startupOrder.order_id or startupOrder.request_id
-	startupOrder.customerName = startupOrder.customerName or startupOrder.customer
-	startupOrder.requestedFruitName = startupOrder.requestedFruitName or startupOrder.item
-	startupNotice("Hub order found. Starting local trader.", false)
-else
-	if startupHubError then
-		warn("LocalTrader: Hub poll failed at startup: " .. tostring(startupHubError))
-	end
-	-- No active trade belongs to this account. This is the normal farming path.
-	loadQuantumOnyx()
-end
-
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-assert(Remotes, "ReplicatedStorage.Remotes was not found")
-
-local TradeEvent = Remotes:WaitForChild("TradeEvent", 15)
-local TradeFunction = Remotes:WaitForChild("TradeFunction", 15)
-local CommF = Remotes:WaitForChild("CommF_", 15)
-assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
-
-local state = "TRADING"
-local running = false
-local session = nil
-local latestTradeState = nil
-local lastAccept = 0
-local lastOfferSignature = nil
-local lastLoggedOfferSignature = nil
-local connections = {}
-local logLines = {}
-local sessionSequence = 0
-
-local function disconnectAll()
-	for _, connection in ipairs(connections) do
-		pcall(function()
-			connection:Disconnect()
-		end)
-	end
-	connections = {}
-end
-
-local function connect(signal, callback)
-	local connection = signal:Connect(callback)
-	connections[#connections + 1] = connection
-	return connection
-end
-
-local function normalize(value)
-	return tostring(value or ""):lower():gsub("[%s%p]+", "")
-end
-
-local function loadItemIds()
-	if type(_G.ItemIds) == "table" then
-		return _G.ItemIds
-	end
-
-	if type(loadstring) == "function" and type(game.HttpGet) == "function" then
-		local ok, result = pcall(function()
-			return loadstring(game:HttpGet(CONFIG.ItemIdsUrl))()
-		end)
-		if ok and type(result) == "table" then
-			return result
-		end
-	end
-
-	if type(readfile) == "function" and type(loadstring) == "function" then
-		local ok, result = pcall(function()
-			return loadstring(readfile("itemIds.lua"))()
-		end)
-		if ok and type(result) == "table" then
-			return result
-		end
-	end
-
-	return nil
-end
-
-local ItemIds = loadItemIds()
-local itemByName = {}
-
-if ItemIds then
-	for id, record in pairs(ItemIds) do
-		if type(record) == "table" and record[2] then
-			local key = normalize(record[2])
-			itemByName[key] = itemByName[key] or {}
-			itemByName[key][#itemByName[key] + 1] = {
-				id = tonumber(id) or id,
-				type = tostring(record[1]),
-				name = record[2],
-			}
-		end
-	end
-end
-
-local function resolveItemId(name)
-	local wanted = normalize(name)
-	if wanted == "" then
-		return nil, "enter a fruit name"
-	end
-	if not ItemIds then
-		return nil, "itemIds.lua could not be loaded"
-	end
-
-	local function physicalMatches(records)
-		local matches = {}
-		for _, record in ipairs(records or {}) do
-			if record.type == "PhysicalFruit" then
-				matches[#matches + 1] = record
-			end
-		end
-		return matches
-	end
-
-	local exactMatches = physicalMatches(itemByName[wanted])
-	if #exactMatches == 1 then
-		return exactMatches[1].id
-	elseif #exactMatches > 1 then
-		return nil, "multiple tradable physical fruits share this name; use an ItemId"
-	end
-
-	local matches = {}
-	for normalizedName, records in pairs(itemByName) do
-		if normalizedName:find(wanted, 1, true) then
-			for _, record in ipairs(physicalMatches(records)) do
-				matches[#matches + 1] = record
-			end
-		end
-	end
-	if #matches == 1 then
-		return matches[1].id
-	elseif #matches > 1 then
-		return nil, "ambiguous tradable fruit name; use the full name or ItemId"
-	end
-	return nil, "no tradable PhysicalFruit with that name was found"
-end
-
-local function itemRecord(itemId)
-	local record = ItemIds and ItemIds[itemId]
-	if not record then
-		record = ItemIds and ItemIds[tonumber(itemId)]
-	end
-	return record
-end
-
-local function isTradablePhysicalFruit(itemId)
-	local record = itemRecord(itemId)
-	return type(record) == "table" and record[1] == "PhysicalFruit"
-end
-
-local function inventoryEntry(items, wantedId)
-	for _, item in pairs(items or {}) do
-		if tonumber(item.ItemId) == tonumber(wantedId) then
-			return item
-		end
-	end
-	return nil
-end
-
-local function readInventory()
-	local ok, result = pcall(function()
-		return CommF:InvokeServer("getTradeInventory")
-	end)
-	if not ok then
-		return nil, "getTradeInventory failed: " .. tostring(result)
-	end
-	if type(result) ~= "table" or type(result.Items) ~= "table" then
-		return nil, "getTradeInventory returned an unexpected shape"
-	end
-	return result.Items
-end
-
-local function getAvailablePhysicalFruits(items)
-	local available = {}
-	for _, item in pairs(items or {}) do
-		local id = tonumber(item.ItemId)
-		local record = id and ItemIds and ItemIds[id]
-		local tradeType = tostring(item.Type or "")
-		local isTradeableType = tradeType == "PhysicalMoveset"
-			or tradeType == "SpecialPhysicalFruit"
-		if id and record and record[1] == "PhysicalFruit" and isTradeableType
-			and (tonumber(item.Amount) or 0) > 0 then
-			available[#available + 1] = {
-				id = id,
-				name = tostring(record[2]),
-				amount = tonumber(item.Amount) or 0,
-			}
-		end
-	end
-	table.sort(available, function(a, b)
-		return a.name:lower() < b.name:lower()
-	end)
-	return available
-end
-
-local function inventoryAmount(items, wantedId)
-	local total = 0
-	for _, item in pairs(items) do
-		if tonumber(item.ItemId) == tonumber(wantedId) then
-			total = total + (tonumber(item.Amount) or 0)
-		end
-	end
-	return total
-end
-
-local function offerItems(offer)
-	return offer and type(offer.Items) == "table" and offer.Items or {}
-end
-
-local function countItems(items)
-	local count = 0
-	for _, item in pairs(items) do
-		count = count + (tonumber(item.Amount) or 1)
-	end
-	return count
-end
-
-local function offerHasItem(items, wantedId, requiredAmount)
-	local amount = 0
-	for _, item in pairs(items) do
-		if tonumber(item.ItemId) == tonumber(wantedId) then
-			amount = amount + (tonumber(item.Amount) or 0)
-		end
-	end
-	return amount >= requiredAmount
-end
-
-local function offerSignature(tradeState)
-	if not tradeState or not tradeState.Offer then
-		return ""
-	end
-	local chunks = {}
-	for side = 1, 2 do
-		for key, item in pairs(offerItems(tradeState.Offer[side])) do
-			chunks[#chunks + 1] = string.format("%d:%s:%s:%s", side, tostring(key), tostring(item.Amount), tostring(item.Price))
-		end
-	end
-	table.sort(chunks)
-	return table.concat(chunks, "|") .. "|ready=" .. tostring(tradeState.State and tradeState.State.Ready)
-end
-
-local function offerSummary(items)
-	local parts = {}
-	for _, item in pairs(items or {}) do
-		parts[#parts + 1] = string.format("%s x%s [%s]", tostring(item.ItemId), tostring(item.Amount), tostring(item.Type))
-	end
-	table.sort(parts)
-	return #parts > 0 and table.concat(parts, ", ") or "empty"
-end
-
-local function findTable()
-	local current = workspace
-	for _, name in ipairs(CONFIG.TablePath) do
-		current = current and current:FindFirstChild(name)
-	end
-	return current
-end
-
-local function tableSeats()
-	local model = findTable()
-	if not model then
-		return nil, nil
-	end
-	return model:FindFirstChild("P1"), model:FindFirstChild("P2")
-end
-
-local function emptyTradeSeat()
-	local p1, p2 = tableSeats()
-	if p1 and not p1.Occupant then
-		return p1
-	end
-	if p2 and not p2.Occupant then
-		return p2
-	end
-	return p1 or p2
-end
-
-local function isSeatedAtTradeTable()
-	local character = LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if not humanoid or not humanoid.Sit then
-		return false
-	end
-	local p1, p2 = tableSeats()
-	return (p1 and p1.Occupant == humanoid) or (p2 and p2.Occupant == humanoid) or false
-end
-
-local function tweenToSeat(seat)
-	if not seat then
-		return false, "trade table seat was not found"
-	end
-	local character = LocalPlayer.Character
-	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-	if not rootPart then
-		return false, "character root was not found"
-	end
-	local target = seat.CFrame + Vector3.new(0, 2.5, 0)
-	local distance = (rootPart.Position - target.Position).Magnitude
-	if distance <= 5 then
-		rootPart.CFrame = target
-		return true
-	end
-	local duration = math.clamp(distance / 100, 0.25, 8)
-	local tween = game:GetService("TweenService"):Create(
-		rootPart,
-		TweenInfo.new(duration, Enum.EasingStyle.Linear),
-		{CFrame = target}
-	)
-	tween:Play()
-	local completed = false
-	tween.Completed:Connect(function()
-		completed = true
-	end)
-	local deadline = os.clock() + duration + 1
-	while not completed and os.clock() < deadline and running do
-		task.wait()
-	end
-	return (rootPart.Position - target.Position).Magnitude <= 8
-end
-
-local function jumpOutOfTrade()
-	local character = LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-	if not humanoid or not rootPart then
-		return false
-	end
-	pcall(function()
-		-- Jump first so Roblox releases the seat before we tween clear of the table.
-		local seat = humanoid.SeatPart
-		local escapeCFrame
-		if seat then
-			escapeCFrame = seat.CFrame * CFrame.new(0, 3, 10)
-		else
-			local p1, p2 = tableSeats()
-			local tablePart = p1 or p2
-			if tablePart then
-				escapeCFrame = tablePart.CFrame * CFrame.new(0, 3, 10)
-			end
-		end
-		humanoid.Jump = true
-		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-		local releaseDeadline = os.clock() + 1
-		while humanoid.SeatPart and os.clock() < releaseDeadline do
-			task.wait()
-		end
-		if humanoid.SeatPart then
-			-- Fallback if the seat did not release from the jump request.
-			humanoid.Sit = false
-			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-			task.wait()
-		end
-		if escapeCFrame then
-			local distance = (rootPart.Position - escapeCFrame.Position).Magnitude
-			local tween = game:GetService("TweenService"):Create(
-				rootPart,
-				TweenInfo.new(math.clamp(distance / 35, 0.25, 1), Enum.EasingStyle.Linear),
-				{CFrame = escapeCFrame}
-			)
-			tween:Play()
-			tween.Completed:Wait()
-		end
-	end)
-	return true
-end
-
-local function getLocalSide(tradeState)
-	if not tradeState or not tradeState.Trader then
-		return nil
-	end
-	if tonumber(tradeState.Trader[1]) == LocalPlayer.UserId then
-		return 1
-	elseif tonumber(tradeState.Trader[2]) == LocalPlayer.UserId then
-		return 2
-	end
-	return nil
-end
-
--- -------------------------------------------------------------------------
--- GUI
--- -------------------------------------------------------------------------
-local oldGui = LocalPlayer:FindFirstChild("LocalTraderGui")
-if oldGui then
-	oldGui:Destroy()
-end
-
-local gui = Instance.new("ScreenGui")
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-local root = Instance.new("Frame")
-root.Size = UDim2.fromOffset(430, 370)
-root.Position = UDim2.new(0, 20, 0, 80)
-root.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
-root.BorderSizePixel = 0
-root.Parent = gui
-
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 7)
-corner.Parent = root
-
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 32)
-titleBar.BackgroundColor3 = Color3.fromRGB(42, 46, 57)
-titleBar.BorderSizePixel = 0
-titleBar.Parent = root
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -45, 1, 0)
-title.Position = UDim2.fromOffset(10, 0)
-title.BackgroundTransparency = 1
-title.Text = "Local Trader v1"
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.Parent = titleBar
-
-local minimize = Instance.new("TextButton")
-minimize.Size = UDim2.fromOffset(28, 24)
-minimize.Position = UDim2.new(1, -34, 0, 4)
-minimize.Text = "-"
-minimize.TextColor3 = Color3.fromRGB(255, 255, 255)
-minimize.BackgroundColor3 = Color3.fromRGB(65, 70, 84)
-minimize.BorderSizePixel = 0
-minimize.Parent = titleBar
-
-local icon = Instance.new("TextButton")
-icon.Size = UDim2.fromOffset(48, 48)
-icon.Position = root.Position
-icon.Text = "LT"
-icon.TextColor3 = Color3.fromRGB(255, 255, 255)
-icon.Font = Enum.Font.GothamBold
-icon.TextSize = 16
-icon.BackgroundColor3 = Color3.fromRGB(42, 46, 57)
-icon.Visible = false
-icon.Parent = gui
-
-local function label(text, position, size)
-	local object = Instance.new("TextLabel")
-	object.Size = size or UDim2.fromOffset(120, 24)
-	object.Position = position
-	object.BackgroundTransparency = 1
-	object.Text = text
-	object.TextColor3 = Color3.fromRGB(210, 215, 225)
-	object.Font = Enum.Font.Gotham
-	object.TextSize = 12
-	object.TextXAlignment = Enum.TextXAlignment.Left
-	object.Parent = root
-	return object
-end
-
-local function textbox(placeholder, position)
-	local object = Instance.new("TextBox")
-	object.Size = UDim2.fromOffset(270, 25)
-	object.Position = position
-	object.PlaceholderText = placeholder
-	object.Text = ""
-	object.ClearTextOnFocus = false
-	object.BackgroundColor3 = Color3.fromRGB(32, 35, 43)
-	object.TextColor3 = Color3.fromRGB(235, 235, 235)
-	object.Font = Enum.Font.Gotham
-	object.TextSize = 12
-	object.BorderSizePixel = 0
-	object.Parent = root
-	return object
-end
-
-label("Customer username", UDim2.fromOffset(12, 48))
-local customerBox = textbox("exact Roblox username", UDim2.fromOffset(140, 47))
-label("Requested fruit", UDim2.fromOffset(12, 82))
-local fruitBox = textbox("name from itemIds.lua", UDim2.fromOffset(140, 81))
-fruitBox:GetPropertyChangedSignal("Text"):Connect(function()
-	fruitBox:SetAttribute("SelectedItemId", nil)
-end)
-local fruitDropdown = Instance.new("ScrollingFrame")
-fruitDropdown.Size = UDim2.fromOffset(270, 120)
-fruitDropdown.Position = UDim2.fromOffset(140, 107)
-fruitDropdown.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
-fruitDropdown.BorderSizePixel = 0
-fruitDropdown.ScrollBarThickness = 5
-fruitDropdown.Visible = false
-fruitDropdown.ZIndex = 10
-fruitDropdown.Parent = root
-
-local fruitLayout = Instance.new("UIListLayout")
-fruitLayout.Padding = UDim.new(0, 2)
-fruitLayout.Parent = fruitDropdown
-
-local function clearFruitDropdown()
-	for _, child in ipairs(fruitDropdown:GetChildren()) do
-		if child:IsA("TextButton") then
-			child:Destroy()
-		end
-	end
-end
-
-local function populateFruitDropdown(items)
-	clearFruitDropdown()
-	for _, entry in ipairs(getAvailablePhysicalFruits(items)) do
-		local option = Instance.new("TextButton")
-		option.Size = UDim2.new(1, -6, 0, 24)
-		option.BackgroundColor3 = Color3.fromRGB(45, 50, 62)
-		option.BorderSizePixel = 0
-		option.TextColor3 = Color3.fromRGB(235, 235, 235)
-		option.Font = Enum.Font.Gotham
-		option.TextSize = 12
-		option.TextXAlignment = Enum.TextXAlignment.Left
-		option.Text = string.format("  %s  (x%d)", entry.name, entry.amount)
-		option.ZIndex = 11
-		option.Activated:Connect(function()
-			fruitBox.Text = entry.name
-			fruitBox:SetAttribute("SelectedItemId", entry.id)
-			fruitDropdown.Visible = false
-		end)
-		option.Parent = fruitDropdown
-	end
-	fruitDropdown.CanvasSize = UDim2.fromOffset(0, fruitLayout.AbsoluteContentSize.Y)
-	fruitDropdown.Visible = true
-end
-
-fruitBox.Focused:Connect(function()
-	local inventory = readInventory()
-	if type(inventory) == "table" then
-		populateFruitDropdown(inventory)
-	end
-end)
-
-local refreshFruits = Instance.new("TextButton")
-refreshFruits.Size = UDim2.fromOffset(26, 25)
-refreshFruits.Position = UDim2.fromOffset(384, 81)
-refreshFruits.Text = "R"
-refreshFruits.TextColor3 = Color3.fromRGB(255, 255, 255)
-refreshFruits.Font = Enum.Font.GothamBold
-refreshFruits.TextSize = 12
-refreshFruits.BackgroundColor3 = Color3.fromRGB(56, 95, 150)
-refreshFruits.BorderSizePixel = 0
-refreshFruits.Activated:Connect(function()
-	local inventory = readInventory()
-	if type(inventory) == "table" then
-		populateFruitDropdown(inventory)
-	end
-end)
-refreshFruits.Parent = root
-label("Quantity", UDim2.fromOffset(12, 116))
-local quantityBox = textbox("1", UDim2.fromOffset(140, 115))
-quantityBox.Text = "1"
-
-local status = label("Status: IDLE", UDim2.fromOffset(12, 151), UDim2.new(1, -24, 0, 45))
-status.TextWrapped = true
-status.TextColor3 = Color3.fromRGB(150, 220, 160)
-
-local logBox = Instance.new("TextBox")
-logBox.Size = UDim2.new(1, -24, 0, 62)
-logBox.Position = UDim2.fromOffset(12, 200)
-logBox.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
-logBox.TextColor3 = Color3.fromRGB(205, 210, 220)
-logBox.Font = Enum.Font.Code
-logBox.TextSize = 11
-logBox.TextXAlignment = Enum.TextXAlignment.Left
-logBox.TextYAlignment = Enum.TextYAlignment.Top
-logBox.MultiLine = true
-logBox.TextEditable = false
-logBox.ClearTextOnFocus = false
-logBox.Text = ""
-logBox.Parent = root
-
-local function writeLog(message)
-	logLines[#logLines + 1] = os.date("%H:%M:%S") .. " " .. message
-	while #logLines > CONFIG.MaxLogLines do
-		table.remove(logLines, 1)
-	end
-	logBox.Text = table.concat(logLines, "\n")
-	status.Text = "Status: " .. state .. "\n" .. message
-end
-
-local function setState(nextState, message)
-	local previous = state
-	state = nextState
-	if session then
-		session.stageStartedAt = os.clock()
-	end
-	if previous ~= nextState or message then
-		writeLog(string.format("state %s -> %s%s", previous, nextState, message and (": " .. message) or ""))
-	end
-end
-
-local function copyLog()
-	local text = table.concat(logLines, "\n")
-	if text == "" then
-		writeLog("log is empty")
-		return
-	end
-	local copied = false
-	if type(setclipboard) == "function" then
-		copied = pcall(setclipboard, text)
-	end
-	if not copied and type(clipboard) == "table" and type(clipboard.set) == "function" then
-		copied = pcall(clipboard.set, text)
-	end
-	writeLog(copied and "copied full log" or "clipboard API unavailable")
-end
-
-local function button(text, position, width, callback, color)
-	local object = Instance.new("TextButton")
-	object.Size = UDim2.fromOffset(width, 25)
-	object.Position = position
-	object.Text = text
-	object.TextColor3 = Color3.fromRGB(255, 255, 255)
-	object.Font = Enum.Font.Gotham
-	object.TextSize = 12
-	object.BackgroundColor3 = color or Color3.fromRGB(56, 95, 150)
-	object.BorderSizePixel = 0
-	object.Activated:Connect(callback)
-	object.Parent = root
-	return object
-end
-
-local startButton
-local function stopTrader(reason)
-	local stoppedSessionId = session and session.id
-	local stoppedOrderId = session and session.orderId
-	local completed = session and session.completed
-	running = false
-	state = "IDLE"
-	latestTradeState = nil
-	session = nil
-	lastOfferSignature = nil
-	lastLoggedOfferSignature = nil
-	disconnectAll()
-	if startButton then
-		startButton.Text = "Start"
-	end
-	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
-end
-
-local function startTrader(orderData)
-	if running then
-		return
-	end
-	if type(orderData) == "table" then
-		customerBox.Text = tostring(orderData.customerName or orderData.customer or "")
-		fruitBox.Text = tostring(orderData.requestedFruitName or orderData.fruitName or orderData.item or "")
-		fruitBox:SetAttribute("SelectedItemId", orderData.requestedId)
-		quantityBox.Text = tostring(math.max(1, tonumber(orderData.quantity) or 1))
-	end
-	local targetName = customerBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-	local requestedId = fruitBox:GetAttribute("SelectedItemId")
-	local resolveError
-	if not requestedId then
-		requestedId, resolveError = resolveItemId(fruitBox.Text)
-	end
-	local quantity = math.max(1, tonumber(quantityBox.Text) or 1)
-	if targetName == "" then
-		writeLog("enter a customer username")
-		return
-	end
-	if not requestedId then
-		writeLog(resolveError)
-		return
-	end
-	local inventory, inventoryError = readInventory()
-	if not inventory then
-		writeLog(inventoryError)
-		return
-	end
-	local requestedEntry = inventoryEntry(inventory, requestedId)
-	local requestedType = requestedEntry and tostring(requestedEntry.Type) or ""
-	local inventoryTradeable = requestedType == "PhysicalMoveset"
-		or requestedType == "SpecialPhysicalFruit"
-	if not isTradablePhysicalFruit(requestedId) or not inventoryTradeable then
-		writeLog("selected item is not a tradable PhysicalFruit")
-		return
-	end
-	if inventoryAmount(inventory, requestedId) < quantity then
-		writeLog("insufficient requested fruit in inventory")
-		return
-	end
-	populateFruitDropdown(inventory)
-	fruitDropdown.Visible = false
-
-	running = true
-	sessionSequence = sessionSequence + 1
-	state = "WAITING_FOR_CUSTOMER"
-	session = {
-		id = sessionSequence,
-		orderId = type(orderData) == "table" and (orderData.orderId or orderData.order_id) or nil,
-		customerName = targetName,
-		requestedId = requestedId,
-		quantity = quantity,
-		inventoryBefore = inventoryAmount(inventory, requestedId),
-		startedAt = os.clock(),
-		stageStartedAt = os.clock(),
-		addRequested = false,
-		lastRetween = 0,
-		hubOrder = type(orderData) == "table" and orderData or nil,
-	}
-	startButton.Text = "Stop"
-	local seat = emptyTradeSeat()
-	if seat then
-		setState("TRAVELING_TO_TABLE")
-		local moved, moveError = tweenToSeat(seat)
-		if not moved then
-			stopTrader(moveError or "could not reach trade table")
-			return
-		end
-		session.lastRetween = os.clock()
-		setState("WAITING_FOR_CUSTOMER")
-	end
-	writeLog(string.format("ready: %s x%d (ItemId %s, catalog=%s, inventory=%s)",
-		fruitBox.Text, quantity, tostring(requestedId), tostring(itemRecord(requestedId) and itemRecord(requestedId)[1]), tostring(requestedType)))
-	if isSeatedAtTradeTable() then
-		writeLog("session " .. tostring(session.id) .. " started; worker seated")
-	else
-		writeLog("session " .. tostring(session.id) .. " started; worker reached table and is waiting to sit")
-	end
-
-	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
-		if not running or not session then
-			return
-		end
-		if type(tradeState) ~= "table" then
-			return
-		end
-		if session.ignoreTrade then
-			if eventName == "leave" then
-				session.ignoreTrade = false
-				session.localSide = nil
-				session.addRequested = false
-				lastOfferSignature = nil
-				lastLoggedOfferSignature = nil
-				latestTradeState = nil
-				setState("WAITING_FOR_CUSTOMER", "unwanted trade ended")
-				session.startedAt = os.clock()
-				writeLog("unwanted trade ended; continuing to wait for the assigned customer")
-			end
-			return
-		end
-		latestTradeState = tradeState
-
-		if eventName == "start" then
-			local localSide = getLocalSide(tradeState)
-			local otherSide = localSide == 1 and 2 or 1
-			local otherId = localSide and tradeState.Trader[otherSide]
-			local otherPlayer = otherId and Players:GetPlayerByUserId(otherId)
-			if not otherPlayer or otherPlayer.Name:lower() ~= session.customerName:lower() then
-				session.ignoreTrade = true
-				setState("WAITING_FOR_CUSTOMER", "wrong customer; jumping out")
-				latestTradeState = nil
-				session.startedAt = os.clock()
-				writeLog("wrong customer; jumping out and continuing to wait")
-				jumpOutOfTrade()
-				return
-			end
-			setState("TRADE_STARTED")
-			session.localSide = localSide
-			session.startedAt = os.clock()
-			writeLog(string.format("trade started with %s (UserId %s, localSide=%d)", otherPlayer.Name, tostring(otherId), localSide))
-		elseif eventName == "update_state" then
-			if not session.localSide then
-				session.localSide = getLocalSide(tradeState)
-			end
-			local localSide = session.localSide
-			local otherSide = localSide == 1 and 2 or 1
-			if not localSide then
-				return
-			end
-
-			local localItems = offerItems(tradeState.Offer[localSide])
-			local customerItems = offerItems(tradeState.Offer[otherSide])
-			local localHasRequested = offerHasItem(localItems, session.requestedId, session.quantity)
-			local signature = offerSignature(tradeState)
-			if signature ~= lastLoggedOfferSignature then
-				lastLoggedOfferSignature = signature
-				writeLog(string.format("offers: worker={%s}; customer={%s}; ready=%s/%s; state=%s",
-					offerSummary(localItems), offerSummary(customerItems),
-					tostring(tradeState.State.Ready[localSide]), tostring(tradeState.State.Ready[otherSide]),
-					tostring(tradeState.State.Type)))
-			end
-
-			if not localHasRequested and not session.addRequested and tradeState.State.Type == "NotReady" then
-				setState("OFFERING_ORDER_ITEM")
-				session.addRequested = true
-				local ok, result = pcall(function()
-					for _ = 1, session.quantity do
-						local added = TradeFunction:InvokeServer("addItem", session.requestedId, 1)
-						if added == false then
-							return false
-						end
-					end
-					return true
-				end)
-				if not ok then
-					session.addRequested = false
-					writeLog("addItem failed: " .. tostring(result))
-				else
-					writeLog("requested fruit add requested")
-				end
-			elseif localHasRequested and tradeState.State.Type == "NotReady" then
-				setState("WAITING_FOR_CUSTOMER_OFFER")
-				if countItems(customerItems) > 0
-					and tradeState.State.Ready[localSide] ~= true
-					and os.clock() - lastAccept >= CONFIG.AcceptInterval then
-					lastOfferSignature = signature
-					lastAccept = os.clock()
-					setState("ACCEPTING")
-					local ok, result = pcall(function()
-						return TradeFunction:InvokeServer("accept")
-					end)
-					writeLog(ok and "accept requested" or ("accept failed: " .. tostring(result)))
-				end
-			elseif tradeState.State.Type == "Countdown" then
-				setState("COUNTDOWN")
-				writeLog("countdown started; leaving table is not allowed")
-			elseif tradeState.State.Type == "Processing" then
-				setState("PROCESSING")
-				writeLog("trade processing")
-			end
-		elseif eventName == "countdown_cancel" then
-			setState("TRADE_STARTED")
-			writeLog("countdown canceled; waiting for a stable offer")
-		elseif eventName == "leave" then
-			if tradeState.State and tradeState.State.Type == "Processing" then
-				setState("VERIFYING_INVENTORY")
-				local inventoryAfter = readInventory()
-				local before = session.inventoryBefore or 0
-				local after = type(inventoryAfter) == "table" and inventoryAmount(inventoryAfter, session.requestedId) or nil
-					if after and after <= before - session.quantity then
-					writeLog("trade completed and requested item is no longer available")
-					setState("COOLDOWN", "trade verified; preparing farming handoff")
-						session.completed = true
-						local completedOk, completedError = hubComplete(session.orderId)
-						if completedOk then
-							writeLog("trade verified; Hub marked request completed and FARMING")
-							stopTrader("completed; watchdog will relaunch farming")
-						else
-							writeLog("trade verified, but Hub completion failed: " .. tostring(completedError))
-							stopTrader("completed locally; Hub completion failed")
-						end
-				else
-					writeLog("processing ended, but inventory verification failed")
-					stopTrader("verification failed")
-				end
-			else
-				setState("WAITING_FOR_CUSTOMER", "customer left")
-				latestTradeState = nil
-				session.startedAt = os.clock()
-				session.addRequested = false
-				session.localSide = nil
-				lastOfferSignature = nil
-				lastLoggedOfferSignature = nil
-				writeLog("customer left; waiting for the customer to sit again")
-			end
-		end
-	end)
-end
-
-local function retryTrader()
-	if running then
-		stopTrader("retry requested")
-		task.wait(0.2)
-	end
-	startTrader()
-end
-
-startButton = button("Start", UDim2.fromOffset(12, 270), 195, startTrader)
-button("Stop", UDim2.fromOffset(220, 270), 195, function()
-	stopTrader("stopped by user")
-end)
-button("Retry", UDim2.fromOffset(12, 300), 128, retryTrader, Color3.fromRGB(120, 95, 50))
-button("Copy Log", UDim2.fromOffset(149, 300), 128, copyLog, Color3.fromRGB(65, 105, 145))
-button("Clear Log", UDim2.fromOffset(286, 300), 129, function()
-	logLines = {}
-	logBox.Text = ""
-	writeLog("log cleared")
-end, Color3.fromRGB(90, 65, 90))
-
-local function retweenToTableIfNeeded()
-	if not running or not session or session.ignoreTrade or state ~= "WAITING_FOR_CUSTOMER" then
-		return
-	end
-	if os.clock() - session.lastRetween < CONFIG.RetweenInterval then
-		return
-	end
-	local character = LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if humanoid and humanoid.Sit then
-		return
-	end
-	local p1, p2 = tableSeats()
-	local targetSeat = (p1 and not p1.Occupant and p1) or (p2 and not p2.Occupant and p2)
-	if not targetSeat then
-		return
-	end
-	session.lastRetween = os.clock()
-	setState("TRAVELING_TO_TABLE")
-	local moved, errorMessage = tweenToSeat(targetSeat)
-	if moved then
-		setState("WAITING_FOR_CUSTOMER", "re-tween complete")
-		writeLog("re-tweened to trade table")
-	else
-		setState("WAITING_FOR_CUSTOMER", "re-tween failed")
-		writeLog("re-tween failed: " .. tostring(errorMessage))
-	end
-end
-
-RunService.Heartbeat:Connect(function()
-	if not running or not session then
-		return
-	end
-	retweenToTableIfNeeded()
-	local elapsed = os.clock() - (session.stageStartedAt or session.startedAt)
-	if state == "WAITING_FOR_CUSTOMER" and elapsed > CONFIG.CustomerWaitTimeout then
-		setState("TIMEOUT")
-		stopTrader("customer arrival timeout")
-	elseif state == "TRADE_STARTED" and elapsed > CONFIG.TradeStartTimeout then
-		setState("TIMEOUT")
-		stopTrader("trade offer timeout")
-	elseif state ~= "WAITING_FOR_CUSTOMER" and state ~= "IDLE"
-		and state ~= "PROCESSING" and state ~= "VERIFYING_INVENTORY"
-		and state ~= "TIMEOUT" and elapsed > CONFIG.CompletionTimeout then
-		setState("TIMEOUT")
-		stopTrader("stage timeout: " .. state)
-	end
-end)
-
-local dragging = false
-titleBar.InputBegan:Connect(function(input)
-	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
-		return
-	end
-	local startPosition = input.Position
-	local origin = root.Position
-	local moveConnection
-	moveConnection = UserInputService.InputChanged:Connect(function(change)
-		if change.UserInputType == Enum.UserInputType.MouseMovement then
-			root.Position = UDim2.new(0, origin.X.Offset + change.Position.X - startPosition.X, 0, origin.Y.Offset + change.Position.Y - startPosition.Y)
-		end
-	end)
-	local endConnection
-	endConnection = UserInputService.InputEnded:Connect(function(change)
-		if change.UserInputType == Enum.UserInputType.MouseButton1 then
-			moveConnection:Disconnect()
-			endConnection:Disconnect()
-		end
-	end)
-end)
-
-minimize.Activated:Connect(function()
-	icon.Position = root.Position
-	root.Visible = false
-	icon.Visible = true
-end)
-icon.Activated:Connect(function()
-	root.Position = icon.Position
-	root.Visible = true
-	icon.Visible = false
-end)
-
-gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-local pendingTradingOrder = startupOrder
-if pendingTradingOrder then
-	writeLog("Hub order found; starting automatically")
-	task.defer(startTrader, pendingTradingOrder)
-else
-	writeLog("waiting for Hub trade request")
-	local hubPollRunning = true
-	task.spawn(function()
-		while hubPollRunning do
-			task.wait(CONFIG.HubPollInterval)
-			if not running then
-				local data, err = hubPollOrder()
-				if data and tostring(data.desired_state or "FARMING"):upper() == "TRADING"
-					and type(data.request) == "table" then
-					local order = data.request
-					order.orderId = order.orderId or order.order_id or order.request_id
-					order.customerName = order.customerName or order.customer
-					order.requestedFruitName = order.requestedFruitName or order.item
-					writeLog("Hub order received: " .. tostring(order.orderId))
-					task.spawn(startTrader, order)
-				elseif err then
-					warn("LocalTrader: Hub poll failed: " .. tostring(err))
-				end
-			end
-		end
-	end)
-end
+#!/usr/bin/env python3
+# ============================================================================
+# ROBLOX WATCHDOG v3.1 - interactive edition for Termux (rooted Android)
+# + optional Hub control for FARMING <-> TRADING transitions
+#
+# Hub connection model:
+#   PC:    hub.py listening on 0.0.0.0:8787
+#   PHONE: rw.py polls http://PC_LAN_IP:8787 every few seconds
+#
+# No environment variables are required. Hub URL/token live in
+# watchdog_config.json and can be edited from the menu.
+# ============================================================================
+
+import base64
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "3.1"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
+LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
+ORDER_PATH = os.environ.get(
+    "LOCALTRADER_ORDER_PATH",
+    os.path.join(BASE_DIR, "LocalTrader_Order.json"),
+)
+LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/ArceusX/Workspace"
+LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
+
+PACKAGE_MARKERS = ["roblox", "rbx"]
+CLONER_BLOCKLIST = [
+    "installer", "manager", "clone", "cloner", "parallel", "space", "island",
+    "virtual", "multi", "dual", "2accounts", "multiple", "sandbox"
+]
+
+DEFAULT_TRADING_SHARE_LINK = (
+    "https://www.roblox.com/share?code="
+    "4e51df338208544d9be433e960693f11&type=Server"
+)
+DEFAULT_HUB_POLL_SEC = 3
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def clear_screen() -> None:
+    os.system("clear")
+
+
+def parse_private_link(value: str) -> str:
+    """Extract a Roblox private-server code from share/legacy URLs or a bare code."""
+    if not value:
+        return ""
+    value = value.strip()
+    m = re.search(r"[?&](?:code|privateServerLinkCode|linkCode)=([^&]+)", value, re.I)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    m = re.search(r"/share\?[^#]*?code=([^&]+)", value, re.I)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,}", value):
+        return value
+    return ""
+
+
+def account_id_for_target(t: "Target") -> str:
+    if t.hub_id:
+        return t.hub_id
+    raw = f"{t.package}:{t.user_id}".encode("utf-8")
+    return "rbx-" + hashlib.sha1(raw).hexdigest()[:12]
+
+
+_TERMINAL: Optional["Terminal"] = None
+
+
+def _resane_tty() -> None:
+    """Re-applies forced-sane termios settings if a Terminal is active. Safe
+    no-op if called before the terminal is set up or if termios isn't
+    available at all (e.g. no controlling tty)."""
+    if _TERMINAL is not None:
+        _TERMINAL.sane()
+
+
+class Terminal:
+    def __init__(self) -> None:
+        self._fd = None
+        self._old = None
+        self._sane = None
+        try:
+            self._fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(self._fd)
+            # Force sane mode proactively (ICANON/ECHO/ISIG), rather than just
+            # preserving whatever the incoming terminal state was. Some
+            # remote/cloud-phone pty bridges start in a broken state (no line
+            # buffering, no echo, Ctrl+C not delivered) - preserving that is
+            # preserving the bug.
+            sane = termios.tcgetattr(self._fd)
+            sane[3] |= (termios.ICANON | termios.ECHO | termios.ISIG)
+            termios.tcsetattr(self._fd, termios.TCSANOW, sane)
+            self._sane = sane
+        except Exception:
+            self._fd = None
+            self._old = None
+
+    def sane(self) -> None:
+        """Re-apply the forced-sane settings. Call this after any subprocess
+        invocation (especially `su`) that might have changed terminal mode -
+        a root-manager permission prompt can flip raw mode to draw itself,
+        and if it's killed by a timeout before finishing, it never restores
+        the original mode on its own."""
+        if self._fd is None or self._sane is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSANOW, self._sane)
+        except Exception:
+            pass
+
+    def restore_original(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.restore_original()
+
+
+class Logger:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.lines: List[str] = []
+
+    def log(self, msg: str) -> None:
+        line = f"[{now_str()}] {msg}"
+        self.lines.append(line)
+        self.lines = self.lines[-80:]
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+class Shell:
+    def __init__(self, logger: Logger):
+        self.logger = logger
+        self._cache: Dict[str, str] = {}
+
+    def run(self, cmd: str, timeout: int = 10, check: bool = False) -> subprocess.CompletedProcess:
+        self.logger.log("$ " + cmd)
+        try:
+            # NOTE: stdin is intentionally left connected (inherited), not
+            # redirected to DEVNULL. Some root-manager prompts on this class
+            # of device are text-based and read the yes/no answer from
+            # stdin rather than showing a graphical system dialog - cutting
+            # stdin off makes su fail silently forever, since the prompt can
+            # never be answered. We rely on _resane_tty() below to clean up
+            # any terminal-mode side effects instead of blocking input.
+            p = subprocess.run(cmd, shell=True, text=True, capture_output=True,
+                              timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Caught HERE, not just at individual call sites - force_stop(),
+            # launch(), and launch_trading() call .root()/.run() directly
+            # without their own try/except, so an uncaught timeout here
+            # (e.g. su hanging on an unanswered root prompt) would otherwise
+            # crash the whole script instead of just failing this one call.
+            self.logger.log(f"TIMEOUT after {timeout}s: {cmd}")
+            _resane_tty()
+            return subprocess.CompletedProcess(args=cmd, returncode=124, stdout="",
+                                               stderr=f"timeout after {timeout}s")
+        except FileNotFoundError as e:
+            self.logger.log(f"NOT FOUND: {cmd}: {e}")
+            return subprocess.CompletedProcess(args=cmd, returncode=127, stdout="",
+                                               stderr=str(e))
+        finally:
+            # Always re-sanitize afterward: a root prompt can flip terminal
+            # mode to draw itself, and if it's killed by our own timeout
+            # before finishing, it never gets the chance to restore it.
+            _resane_tty()
+        if p.stdout.strip():
+            self.logger.log(p.stdout.strip()[-1000:])
+        if p.stderr.strip():
+            self.logger.log("ERR " + p.stderr.strip()[-1000:])
+        if check and p.returncode != 0:
+            raise RuntimeError(f"command failed ({p.returncode}): {cmd}")
+        return p
+
+    def out(self, cmd: str, timeout: int = 10) -> str:
+        try:
+            return self.run(cmd, timeout=timeout).stdout.strip()
+        except Exception as e:
+            self.logger.log(f"shell exception: {e}")
+            return ""
+
+    def cached(self, key: str, cmd: str, ttl: float = 5.0) -> str:
+        stamp = f"__time__:{key}"
+        last = getattr(self, stamp, 0.0)
+        if time.monotonic() - last < ttl and key in self._cache:
+            return self._cache[key]
+        value = self.out(cmd)
+        self._cache[key] = value
+        setattr(self, stamp, time.monotonic())
+        return value
+
+    def is_root(self) -> bool:
+        """True only if THIS process is already running as uid 0. Rare under
+        Termux even on a fully rooted device, since Termux runs unprivileged
+        and elevates per-command via su - this does NOT tell you whether su
+        elevation is available, only whether the su-prefix can be skipped."""
+        return self.out("id -u") == "0"
+
+    def has_root_access(self) -> bool:
+        """True if privilege elevation actually works, regardless of whether
+        the calling process is already root. This is the check that answers
+        'can this tool do privileged things' - is_root() alone answers a
+        different question and will read as False on nearly every real
+        rooted-via-su device, which is exactly why root kept reporting as
+        'not detected' even when su worked fine for individual commands."""
+        if self.is_root():
+            return True
+        out = self.out("su -c id", timeout=15)
+        return "uid=0" in out
+
+    def root(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
+        if self.is_root():
+            return self.run(cmd, timeout=timeout)
+        return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
+
+    def root_out(self, cmd: str, timeout: int = 10) -> str:
+        try:
+            return self.root(cmd, timeout=timeout).stdout.strip()
+        except Exception as e:
+            self.logger.log(f"root exception: {e}")
+            return ""
+
+
+class Detector:
+    def __init__(self, shell: Shell):
+        self.s = shell
+
+    def scan(self) -> List[Dict[str, Any]]:
+        packages: Dict[str, Dict[str, Any]] = {}
+        raw = self.s.root_out("pm list packages -U 2>/dev/null")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("package:"):
+                continue
+            body = line[8:]
+            parts = body.split()
+            package = parts[0]
+            uid = 0
+            for p in parts[1:]:
+                if p.startswith("uid:"):
+                    try:
+                        uid = int(p[4:])
+                    except ValueError:
+                        pass
+            low = package.lower()
+            if not any(x in low for x in PACKAGE_MARKERS):
+                continue
+            if any(x in low for x in CLONER_BLOCKLIST):
+                continue
+            packages[package] = {"package": package, "uid": uid}
+
+        # Fallback to pm list packages when -U is unavailable.
+        if not packages:
+            raw = self.s.root_out("pm list packages 2>/dev/null")
+            for line in raw.splitlines():
+                if line.startswith("package:"):
+                    package = line[8:].strip()
+                    low = package.lower()
+                    if any(x in low for x in PACKAGE_MARKERS) and not any(x in low for x in CLONER_BLOCKLIST):
+                        packages[package] = {"package": package, "uid": 0}
+
+        return list(packages.values())
+
+    def processes(self) -> str:
+        return self.s.root_out("ps -A 2>/dev/null")
+
+    def package_path(self, package: str) -> str:
+        return self.s.root_out(f"pm path {shlex.quote(package)} 2>/dev/null")
+
+
+@dataclass
+class Target:
+    package: str
+    user_id: int = 0
+    place_id: str = ""
+    private_link: str = ""
+    rejoin_interval_min: int = 45
+    label: str = ""
+    enabled: bool = True
+    hub_id: str = ""
+    clone_folder: str = ""
+
+    last_rejoin: float = 0.0
+    last_launch: float = 0.0
+    last_heartbeat: float = 0.0
+    cpu: str = "-"
+    stale: bool = False
+    fail_streak: int = 0
+    cooldown_until: float = 0.0
+    restarts: int = 0
+    not_running_streak: int = 0
+    status: str = "stopped"
+    hub_state: str = "FARMING"
+    hub_request_id: str = ""
+    hub_version: int = 0
+    hub_error: str = ""
+    trading_join_attempted: bool = False
+    local_order_phase: str = ""
+    local_order_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            self.label = self.package
+        if not self.hub_id:
+            self.hub_id = account_id_for_target(self)
+
+
+class HubClient:
+    """Tiny stdlib-only client for hub.py."""
+
+    def __init__(self, base_url: str, token: str, logger: Logger, timeout: int = 5):
+        self.base_url = base_url.rstrip("/")
+        self.token = token.strip()
+        self.logger = logger
+        self.timeout = timeout
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.token)
+
+    def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = self.base_url + path
+        data = None
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Hub HTTP {e.code}: {body[:300]}")
+        except Exception as e:
+            raise RuntimeError(str(e))
+
+    def heartbeat(self, t: Target, status: str, mode: str) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/heartbeat", {
+            "account_id": t.hub_id,
+            "package": t.package,
+            "user_id": t.user_id,
+            "label": t.label,
+            "status": status,
+            "mode": mode,
+        })
+
+    def poll(self, t: Target) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/poll/" + urllib.parse.quote(t.hub_id, safe=""))
+
+    def event(self, t: Target, status: str, event: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        body = {
+            "account_id": t.hub_id,
+            "status": status,
+            "event": event,
+            "extra": extra or {},
+        }
+        return self._request("POST", "/api/v1/event", body)
+
+
+class Controller:
+    def __init__(self, shell: Shell, logger: Logger):
+        self.s = shell
+        self.log = logger
+
+    def pid(self, package: str) -> str:
+        out = self.s.root_out(f"pidof {shlex.quote(package)} 2>/dev/null")
+        if out:
+            return out.split()[0]
+        out = self.s.root_out(f"ps -A 2>/dev/null | grep -F {shlex.quote(package)} | grep -v grep")
+        if out:
+            m = re.search(r"\b(\d+)\b", out)
+            if m:
+                return m.group(1)
+        return ""
+
+    def is_running(self, package: str) -> bool:
+        return bool(self.pid(package))
+
+    def force_stop(self, t: Target) -> None:
+        self.s.root(f"am force-stop {shlex.quote(t.package)} 2>/dev/null", timeout=10)
+        time.sleep(1)
+
+    def launch(self, t: Target) -> bool:
+        """Launch farming/public/private configured server using the target's existing settings."""
+        if not t.place_id:
+            self.log.log(f"{t.label}: no place_id configured")
+            return False
+        code = parse_private_link(t.private_link)
+        intents: List[str] = []
+        if code:
+            intents.append(
+                f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
+            )
+            intents.append(
+                f"roblox://placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
+            )
+        intents.append(f"roblox://placeId={urllib.parse.quote(t.place_id)}")
+        intents.append(f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}")
+
+        for url in intents:
+            self.log.log(f"{t.label}: launching farming URL {url}")
+            # Keep -p for normal launch so the correct clone is selected.
+            p = self.s.root(
+                "am start -W -a android.intent.action.VIEW -d "
+                + shlex.quote(url) + " -p " + shlex.quote(t.package),
+                timeout=20,
+            )
+            if p.returncode == 0:
+                t.last_launch = time.time()
+                t.status = "launching"
+                return True
+        return False
+
+    def launch_trading(self, t: Target, share_link: str) -> bool:
+        """Use Roblox's share-link deep link. This is the mechanism proven to join the trading PS."""
+        code = parse_private_link(share_link)
+        if not code:
+            self.log.log(f"{t.label}: invalid trading share link")
+            return False
+
+        uri = (
+            "roblox://navigation/share_links?code="
+            + urllib.parse.quote(code)
+            + "&type=Server"
+        )
+
+        # First try exact clone package. If that clone does not register the share-link
+        # intent, fall back to Android's normal resolver.
+        commands = [
+            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri) + " -p " + shlex.quote(t.package),
+            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri),
+        ]
+        for i, cmd in enumerate(commands, 1):
+            self.log.log(f"{t.label}: trading deep-link attempt {i}")
+            p = self.s.root(cmd, timeout=25)
+            if p.returncode == 0:
+                t.last_launch = time.time()
+                t.status = "trading_joining"
+                return True
+        return False
+
+    def _wait(self, t: Target, seconds: int = 15) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.is_running(t.package):
+                return True
+            time.sleep(0.5)
+        return False
+
+
+class Watchdog:
+    # How many consecutive "not running" polls are required before it's
+    # treated as a real crash rather than a flaky `pidof`/su read. A single
+    # bad reading firing a restart is what made this feel like it was
+    # "rejoining even when it doesn't need to."
+    NOT_RUNNING_CONFIRM_TICKS = 3
+
+    def __init__(
+        self,
+        targets: List[Target],
+        interval_sec: int,
+        hang_sec: int,
+        trading_share_link: str,
+        hub_url: str,
+        hub_token: str,
+        hub_poll_sec: int,
+        logger: Logger,
+        crash_restart_enabled: bool = False,
+        order_path: str = ORDER_PATH,
+    ):
+        self.targets = targets
+        self.interval_sec = max(5, int(interval_sec))
+        self.hang_sec = max(15, int(hang_sec))
+        self.trading_share_link = trading_share_link or DEFAULT_TRADING_SHARE_LINK
+        self.log = logger
+        self.shell = Shell(logger)
+        self.detector = Detector(self.shell)
+        self.controller = Controller(self.shell, logger)
+        self.hub = HubClient(hub_url, hub_token, logger)
+        self.hub_poll_sec = max(1, int(hub_poll_sec or DEFAULT_HUB_POLL_SEC))
+        self.crash_restart_enabled = crash_restart_enabled
+        self.order_path = order_path or ORDER_PATH
+        self.running = False
+        self.next_hub_poll = 0.0
+
+    def mode(self, t: Target) -> str:
+        return "TRADING" if t.hub_state == "TRADING" else "FARMING"
+
+    def heartbeat(self, t: Target) -> None:
+        if not self.hub.enabled:
+            return
+        try:
+            self.hub.heartbeat(t, t.status, self.mode(t))
+            t.last_heartbeat = time.time()
+            t.hub_error = ""
+        except Exception as e:
+            t.hub_error = str(e)
+            self.log.log(f"{t.label}: hub heartbeat failed: {e}")
+
+    def notify(self, t: Target, status: str, event: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        if not self.hub.enabled:
+            return
+        try:
+            self.hub.event(t, status, event, extra)
+        except Exception as e:
+            t.hub_error = str(e)
+            self.log.log(f"{t.label}: hub event failed: {e}")
+
+    def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
+        """Publish Hub connection/state into ArceusX clone Workspace.
+
+        Each clone has its own executor Workspace.  The config is deliberately
+        relative on the Lua side (readfile("LocalTrader_Hub.json")); rw.py
+        writes the corresponding absolute Android path here.
+        """
+        if not self.hub.enabled:
+            return
+
+        if target is not None:
+            clone_name = target.clone_folder
+            if not clone_name:
+                m = re.search(r"RobloxClone\d+", target.label or "")
+                clone_name = m.group(0) if m else ""
+            if not clone_name:
+                # Auto-setup / old configs have no explicit mapping.  Use the
+                # target's ordinal in the configured target list as the clone
+                # number, which matches the normal RobloxClone001... layout.
+                try:
+                    ordinal = self.targets.index(target) + 1
+                except ValueError:
+                    ordinal = 1
+                clone_name = f"RobloxClone{ordinal:03d}"
+            target.clone_folder = clone_name
+            dirs = f"/storage/emulated/0/{clone_name}/ArceusX/Workspace"
+        else:
+            dirs = LOCALTRADER_WORKSPACE_GLOB
+
+        payload = json.dumps({
+            "version": 2,
+            "hub_url": self.hub.base_url,
+            "hub_token": self.hub.token,
+            "hub_poll_sec": self.hub_poll_sec,
+            "mode": "TRADING" if target and target.hub_state == "TRADING" else "FARMING",
+            "account_id": target.hub_id if target else "",
+        }, ensure_ascii=False, separators=(",", ":"))
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        cmd = (
+            "for d in " + dirs + "; do "
+            "[ -d \"$d\" ] || continue; "
+            "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+            "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+            "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; "
+            "done"
+        )
+        result = self.shell.root(cmd, timeout=15)
+        if result.returncode != 0:
+            self.log.log(f"LocalTrader config sync failed: {result.stderr.strip()[:300]}")
+
+    def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
+        """Write the complete order for LocalTrader before opening Roblox."""
+        order = {
+            "version": 3,
+            "phase": "TRADING_ROUTE",
+            "status": "PENDING",
+            "order_id": str(request.get("request_id", "")),
+            "request_id": str(request.get("request_id", "")),
+            "customer": str(request.get("customer", "")).strip(),
+            "item": str(request.get("item", "")).strip(),
+            "quantity": max(1, int(request.get("quantity", 1) or 1)),
+            "trading_share_link": self.trading_share_link,
+            "account_id": t.hub_id,
+            "updated_at": now_str(),
+        }
+        if not order["order_id"] or not order["customer"] or not order["item"]:
+            self.log.log(f"{t.label}: hub order is missing request_id, customer, or item")
+            return False
+        tmp = self.order_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.order_path)), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(order, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.order_path)
+            t.local_order_id = order["order_id"]
+            t.local_order_phase = order["phase"]
+            self.log.log(f"{t.label}: saved local order {order['order_id']}")
+            return True
+        except Exception as e:
+            self.log.log(f"{t.label}: local order save failed: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def read_local_order(self) -> Optional[Dict[str, Any]]:
+        try:
+            with open(self.order_path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+            return value if isinstance(value, dict) else None
+        except Exception:
+            return None
+
+    def sync_local_order(self, t: Target) -> None:
+        order = self.read_local_order()
+        if not order or order.get("account_id") != t.hub_id:
+            return
+        phase = str(order.get("phase", ""))
+        order_id = str(order.get("order_id", order.get("request_id", "")))
+        if order_id != t.local_order_id:
+            return
+        if phase == t.local_order_phase:
+            return
+        t.local_order_phase = phase
+        if phase == "FARMING" and order.get("status") == "COMPLETED":
+            self.notify(t, "completed", "trade_completed", {
+                "request_id": order_id,
+                "customer": order.get("customer", ""),
+                "item": order.get("item", ""),
+                "quantity": order.get("quantity", 1),
+            })
+
+    def poll_hub(self) -> None:
+        if not self.hub.enabled:
+            return
+        now = time.time()
+        if now < self.next_hub_poll:
+            return
+        self.next_hub_poll = now + self.hub_poll_sec
+        for t in self.targets:
+            if not t.enabled:
+                continue
+            try:
+                data = self.hub.poll(t)
+                desired = str(data.get("desired_state", "FARMING")).upper()
+                if desired not in ("FARMING", "TRADING"):
+                    desired = "FARMING"
+                version = int(data.get("version", 0) or 0)
+                req = data.get("request") or {}
+                t.hub_request_id = str(req.get("request_id", ""))
+
+                if version != t.hub_version or desired != t.hub_state:
+                    old = t.hub_state
+                    t.hub_version = version
+                    t.hub_state = desired
+                    self.log.log(
+                        f"{t.label}: hub desired state {old} -> {desired}"
+                        + (f" request={t.hub_request_id}" if t.hub_request_id else "")
+                    )
+                    if desired == "TRADING" and old != "TRADING":
+                        if self.save_local_order(req, t):
+                            self.enter_trading(t)
+                        else:
+                            t.status = "error"
+                    elif desired == "FARMING" and old == "TRADING":
+                        self.return_to_farming(t)
+                elif desired == "TRADING" and req and t.local_order_id != str(req.get("request_id", "")):
+                    if self.save_local_order(req, t):
+                        self.enter_trading(t)
+                t.hub_error = ""
+            except Exception as e:
+                t.hub_error = str(e)
+                self.log.log(f"{t.label}: hub poll failed: {e}")
+
+    def enter_trading(self, t: Target) -> None:
+        if not t.enabled:
+            return
+        self.sync_localtrader_config(t)
+        self.log.log(f"{t.label}: ENTER TRADING")
+        t.status = "switching_to_trading"
+        self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
+        self.controller.force_stop(t)
+        time.sleep(1)
+        ok = self.controller.launch_trading(t, self.trading_share_link)
+        t.trading_join_attempted = True
+        if ok:
+            t.status = "trading_joining"
+            t.fail_streak = 0
+            self.log.log(f"{t.label}: trading deep link sent")
+            self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
+        else:
+            t.status = "error"
+            t.fail_streak += 1
+            self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
+
+    def return_to_farming(self, t: Target) -> None:
+        self.sync_localtrader_config(t)
+        self.log.log(f"{t.label}: RETURN TO FARMING")
+        t.status = "switching_to_farming"
+        self.notify(t, t.status, "return_to_farming")
+        self.controller.force_stop(t)
+        time.sleep(1)
+        ok = self.controller.launch(t)
+        t.trading_join_attempted = False
+        if ok:
+            t.status = "launching"
+            t.last_rejoin = time.time()
+            self.notify(t, t.status, "farming_launch_sent")
+        else:
+            t.status = "error"
+            t.fail_streak += 1
+
+    def restart(self, t: Target, reason: str) -> None:
+        if time.time() < t.cooldown_until:
+            return
+        t.restarts += 1
+        t.fail_streak += 1
+        self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
+        t.status = "restarting"
+        self.notify(t, t.status, "restart", {"reason": reason})
+        self.controller.force_stop(t)
+        time.sleep(1)
+        if t.hub_state == "TRADING":
+            ok = self.controller.launch_trading(t, self.trading_share_link)
+        else:
+            ok = self.controller.launch(t)
+            t.last_rejoin = time.time()
+        if ok:
+            t.status = "launching" if t.hub_state == "FARMING" else "trading_joining"
+            t.fail_streak = 0
+        else:
+            t.status = "error"
+            t.cooldown_until = time.time() + min(300, 15 * (2 ** min(t.fail_streak, 4)))
+
+    def inspect_process(self, t: Target) -> Tuple[bool, str]:
+        pid = self.controller.pid(t.package)
+        if not pid:
+            return False, "not running"
+        return True, pid
+
+    def tick(self, t: Target) -> None:
+        if not t.enabled:
+            t.status = "disabled"
+            return
+
+        self.sync_local_order(t)
+
+        running, detail = self.inspect_process(t)
+        t.stale = False
+
+        if not running:
+            t.not_running_streak += 1
+            if self.crash_restart_enabled and t.not_running_streak >= self.NOT_RUNNING_CONFIRM_TICKS:
+                # Confirmed across several consecutive polls, not just one
+                # possibly-flaky reading - restart into trading or farming.
+                self.restart(t, "process not running")
+                t.not_running_streak = 0
+                self.heartbeat(t)
+                return
+            # Crash-restart disabled (default) or not yet confirmed: report
+            # it honestly on the dashboard, but let the scheduled timer be
+            # the only thing that actually restarts anything.
+            t.status = f"not running ({t.not_running_streak}x, waiting for timer)"
+            self.heartbeat(t)
+            return
+
+        t.not_running_streak = 0
+        t.status = "trading" if t.hub_state == "TRADING" else "running"
+        t.fail_streak = 0
+
+        # Scheduled rejoin applies only to farming. Trading accounts remain in the
+        # persistent trading server until Hub changes desired_state back to FARMING.
+        if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
+            if time.time() - t.last_rejoin >= t.rejoin_interval_min * 60:
+                self.restart(t, "scheduled rejoin")
+
+        self.heartbeat(t)
+
+    def run(self) -> None:
+        self.running = True
+        self.log.log(f"Watchdog v{VERSION} started with {len(self.targets)} target(s)")
+        if self.hub.enabled:
+            self.log.log(f"Hub enabled: {self.hub.base_url}, poll={self.hub_poll_sec}s")
+        else:
+            self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
+
+        for t in self.targets:
+            if t.enabled:
+                self.sync_localtrader_config(t)
+                self.heartbeat(t)
+
+        try:
+            last_tick = 0.0
+            while self.running:
+                self.poll_hub()
+                now = time.time()
+                if now - last_tick >= self.interval_sec:
+                    last_tick = now
+                    for t in self.targets:
+                        try:
+                            self.tick(t)
+                        except Exception as e:
+                            t.status = "error"
+                            self.log.log(f"{t.label}: tick exception: {e}")
+                            self.log.log(traceback.format_exc()[-2000:])
+                # One-second granularity means Hub commands are seen promptly even
+                # when the normal watchdog interval is much larger.
+                time.sleep(1)
+        finally:
+            self.running = False
+            self.log.log("Watchdog stopped")
+
+    def stop(self) -> None:
+        self.running = False
+
+    def render(self) -> str:
+        lines = []
+        lines.append(f"ROBLOX WATCHDOG v{VERSION} | {now_str()}")
+        lines.append("=" * 86)
+        hubtxt = self.hub.base_url if self.hub.enabled else "OFF"
+        cr = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
+        lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr}")
+        lines.append("-")
+        for i, t in enumerate(self.targets, 1):
+            pid = self.controller.pid(t.package) or "-"
+            age = "-"
+            if t.last_rejoin:
+                age = f"{int((time.time()-t.last_rejoin)/60)}m"
+            lines.append(
+                f"{i:02d} {t.label[:18]:18} {t.package[:28]:28} "
+                f"PID={pid:>7} MODE={t.hub_state:7} STATUS={t.status:20} REJOIN={age:>5}"
+            )
+            if t.hub_error:
+                lines.append(f"    HUB ERROR: {t.hub_error[:180]}")
+        lines.append("=" * 86)
+        lines.append("Ctrl+C to stop")
+        return "\n".join(lines)
+
+
+class App:
+    def __init__(self) -> None:
+        self.logger = Logger(LOG_PATH)
+        self.shell = Shell(self.logger)
+        self.detector = Detector(self.shell)
+        self.targets: List[Target] = []
+        self.interval_sec = 20
+        self.hang_sec = 90
+        self.crash_restart_enabled = False
+        self.trading_share_link = DEFAULT_TRADING_SHARE_LINK
+        self.hub_url = ""
+        self.hub_token = ""
+        self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
+        self.order_path = ORDER_PATH
+        self.load()
+
+    def load(self) -> None:
+        if not os.path.exists(CONFIG_PATH):
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                c = json.load(f)
+            self.interval_sec = int(c.get("check_interval_sec", 20))
+            self.hang_sec = int(c.get("hang_detection_sec", 90))
+            self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
+            self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
+            hub = c.get("hub", {}) or {}
+            self.hub_url = str(hub.get("url", ""))
+            self.hub_token = str(hub.get("token", ""))
+            self.hub_poll_sec = int(hub.get("poll_sec", DEFAULT_HUB_POLL_SEC))
+            self.order_path = str(c.get("order_path", ORDER_PATH))
+            self.targets = [Target(**x) for x in c.get("targets", [])]
+        except Exception as e:
+            self.logger.log(f"config load failed: {e}")
+
+    def save(self) -> None:
+        data = {
+            "version": VERSION,
+            "check_interval_sec": self.interval_sec,
+            "hang_detection_sec": self.hang_sec,
+            "crash_restart_enabled": self.crash_restart_enabled,
+            "trading_share_link": self.trading_share_link,
+            "hub": {
+                "url": self.hub_url,
+                "token": self.hub_token,
+                "poll_sec": self.hub_poll_sec,
+            },
+            "order_path": self.order_path,
+            "targets": [],
+        }
+        for t in self.targets:
+            d = dataclasses.asdict(t)
+            # Runtime values should not be persisted.
+            for k in [
+                "last_rejoin", "last_launch", "last_heartbeat", "cpu", "stale",
+                "fail_streak", "cooldown_until", "restarts", "status", "hub_state",
+                "hub_request_id", "hub_version", "hub_error", "trading_join_attempted",
+                "not_running_streak",
+                "local_order_phase", "local_order_id",
+            ]:
+                d.pop(k, None)
+            data["targets"].append(d)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        self.logger.log("configuration saved")
+
+    def ask(self, prompt: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        try:
+            value = input(prompt + suffix + ": ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        return value if value else default
+
+    def yesno(self, prompt: str, default: bool = True) -> bool:
+        d = "Y/n" if default else "y/N"
+        value = input(f"{prompt} [{d}]: ").strip().lower()
+        if not value:
+            return default
+        return value in ("y", "yes", "1", "true")
+
+    def setup_wizard(self) -> None:
+        clear_screen()
+        print(f"ROBLOX WATCHDOG v{VERSION} — Auto Setup")
+        print("=" * 70)
+        print("This setup configures the Android watchdog. Hub settings are optional here.")
+        print()
+        if not self.shell.has_root_access():
+            print("[!] Root was not detected. The watchdog needs root for reliable process/package control.")
+        else:
+            print("[OK] Root detected (su elevation confirmed)")
+
+        found = self.detector.scan()
+        print(f"\nDetected Roblox-like packages: {len(found)}")
+        for i, p in enumerate(found, 1):
+            print(f"  {i}. {p['package']} (uid {p['uid']})")
+        print()
+
+        selected: List[Target] = []
+        if found:
+            raw = self.ask("Select packages by numbers, comma-separated", "1")
+            try:
+                indexes = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                indexes = [1]
+            for idx in indexes:
+                if 1 <= idx <= len(found):
+                    p = found[idx - 1]
+                    selected.append(Target(package=p["package"], user_id=p["uid"]))
+
+        if not selected:
+            package = self.ask("Roblox package name")
+            if package:
+                selected = [Target(package=package)]
+
+        place = self.ask("Farming Place ID", self.targets[0].place_id if self.targets else "2753915549")
+        farming_link = self.ask(
+            "Farming private-server share/legacy link (optional)",
+            self.targets[0].private_link if self.targets else ""
+        )
+        interval = self.ask("Rejoin interval in minutes", str(self.targets[0].rejoin_interval_min if self.targets else 45))
+        try:
+            interval_i = max(0, int(interval))
+        except ValueError:
+            interval_i = 45
+
+        for t in selected:
+            t.place_id = place
+            t.private_link = farming_link
+            t.rejoin_interval_min = interval_i
+
+        self.targets = selected
+        self.trading_share_link = self.ask("Trading private-server share link", self.trading_share_link)
+
+        if self.yesno("Configure Hub now?", bool(self.hub_url and self.hub_token)):
+            self.hub_settings(interactive=True)
+
+        self.save()
+        print("\nSetup saved. Press Enter...")
+        input()
+
+    def hub_settings(self, interactive: bool = False) -> None:
+        clear_screen()
+        print("HUB SETTINGS")
+        print("=" * 70)
+        print("The Hub runs on your PC. The phone connects to the PC's LAN IP.")
+        print("Example: http://192.168.1.50:8787")
+        print("The token is printed by hub.py when it starts.")
+        print()
+        self.hub_url = self.ask("Hub URL", self.hub_url)
+        self.hub_token = self.ask("Hub token", self.hub_token)
+        try:
+            self.hub_poll_sec = max(1, int(self.ask("Hub poll interval (seconds)", str(self.hub_poll_sec))))
+        except ValueError:
+            self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
+        self.save()
+        if interactive:
+            return
+        print("\nHub settings saved. Press Enter...")
+        input()
+
+    def scan_packages(self) -> None:
+        clear_screen()
+        print("ROBLOX PACKAGE SCAN")
+        print("=" * 70)
+        found = self.detector.scan()
+        if not found:
+            print("No matching packages found.")
+        else:
+            for i, p in enumerate(found, 1):
+                print(f"{i:02d}. {p['package']}  uid={p['uid']}")
+                path = self.detector.package_path(p["package"])
+                if path:
+                    print(f"    {path}")
+        input("\nPress Enter...")
+
+    def edit_instances(self) -> None:
+        while True:
+            clear_screen()
+            print("EDIT INSTANCES")
+            print("=" * 70)
+            if not self.targets:
+                print("No instances configured.")
+            for i, t in enumerate(self.targets, 1):
+                print(f"{i}. {t.label} | {t.package} | place={t.place_id} | enabled={t.enabled}")
+            print("\nA = add   D = delete   E = edit   B = back")
+            choice = input("> ").strip().lower()
+            if choice == "b":
+                self.save()
+                return
+            if choice == "a":
+                package = self.ask("Package")
+                if package:
+                    t = Target(package=package)
+                    t.label = self.ask("Label", package)
+                    t.place_id = self.ask("Place ID", "2753915549")
+                    t.private_link = self.ask("Farming private link", "")
+                    try:
+                        t.rejoin_interval_min = max(0, int(self.ask("Rejoin minutes", "45")))
+                    except ValueError:
+                        t.rejoin_interval_min = 45
+                    self.targets.append(t)
+                    self.save()
+            elif choice in ("d", "e"):
+                try:
+                    idx = int(self.ask("Instance number")) - 1
+                except ValueError:
+                    continue
+                if not (0 <= idx < len(self.targets)):
+                    continue
+                t = self.targets[idx]
+                if choice == "d":
+                    self.targets.pop(idx)
+                else:
+                    t.label = self.ask("Label", t.label)
+                    t.place_id = self.ask("Place ID", t.place_id)
+                    t.private_link = self.ask("Farming private link", t.private_link)
+                    try:
+                        t.rejoin_interval_min = max(0, int(self.ask("Rejoin minutes", str(t.rejoin_interval_min))))
+                    except ValueError:
+                        pass
+                    t.enabled = self.yesno("Enabled?", t.enabled)
+                self.save()
+
+    def diagnostics(self) -> None:
+        clear_screen()
+        print("DIAGNOSTICS")
+        print("=" * 70)
+        su_probe = self.shell.out("su -c id", timeout=15)
+        print(f"Root access (su elevation): {self.shell.has_root_access()}")
+        print(f"  raw `su -c id` output: {su_probe!r}")
+        print(f"Process already uid 0: {self.shell.is_root()}  (normally False under Termux, unrelated to su working)")
+        print(f"Config: {CONFIG_PATH}")
+        print(f"Log: {LOG_PATH}")
+        print(f"Hub: {self.hub_url or 'OFF'}")
+        print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
+        print(f"Trading link: {self.trading_share_link}")
+        print()
+        for t in self.targets:
+            print(f"{t.label}: package={t.package} running={self.shell.out('pidof ' + shlex.quote(t.package)) or 'no'} hub_id={t.hub_id}")
+        print()
+        input("Press Enter...")
+
+    def plain_mode(self) -> None:
+        clear_screen()
+        print("PLAIN MODE")
+        print("=" * 70)
+        print("Commands: start | stop <package> | launch <index> | trade <index> | status | back")
+        controller = Controller(self.shell, self.logger)
+        while True:
+            try:
+                cmd = input("plain> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if cmd == "back":
+                return
+            if cmd == "status":
+                for i, t in enumerate(self.targets, 1):
+                    print(i, t.package, controller.pid(t.package) or "stopped")
+            elif cmd.startswith("stop "):
+                p = cmd[5:].strip()
+                self.shell.root(f"am force-stop {shlex.quote(p)}")
+            elif cmd.startswith("launch "):
+                try:
+                    idx = int(cmd.split()[1]) - 1
+                    controller.launch(self.targets[idx])
+                except Exception as e:
+                    print(e)
+            elif cmd.startswith("trade "):
+                try:
+                    idx = int(cmd.split()[1]) - 1
+                    controller.force_stop(self.targets[idx])
+                    controller.launch_trading(self.targets[idx], self.trading_share_link)
+                except Exception as e:
+                    print(e)
+            elif cmd == "start":
+                self.start_watchdog()
+                return
+            else:
+                print("Unknown command")
+
+    def start_watchdog(self) -> None:
+        if not self.targets:
+            print("No targets configured. Run Auto Setup first.")
+            input("Press Enter...")
+            return
+        wd = Watchdog(
+            self.targets,
+            self.interval_sec,
+            self.hang_sec,
+            self.trading_share_link,
+            self.hub_url,
+            self.hub_token,
+            self.hub_poll_sec,
+            self.logger,
+            self.crash_restart_enabled,
+            self.order_path,
+        )
+
+        def sigint(_sig, _frame):
+            wd.stop()
+
+        old = signal.signal(signal.SIGINT, sigint)
+        clear_screen()
+        try:
+            print(wd.render())
+            wd.run()
+        finally:
+            signal.signal(signal.SIGINT, old)
+            clear_screen()
+
+    def menu(self) -> None:
+        while True:
+            clear_screen()
+            print(f"ROBLOX WATCHDOG v{VERSION}")
+            print("=" * 70)
+            print(f"Instances: {len(self.targets)}")
+            print(f"Hub: {self.hub_url or 'OFF'}")
+            print(f"Trading PS: {parse_private_link(self.trading_share_link) or 'INVALID'}")
+            print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
+            print()
+            print("1. Auto setup")
+            print("2. Start watchdog")
+            print("3. Scan packages")
+            print("4. Edit instances")
+            print("5. Hub settings")
+            print("6. Diagnostics")
+            print("7. Plain mode")
+            print("8. Toggle crash-restart")
+            print("0. Exit")
+            choice = input("\n> ").strip()
+            if choice == "1":
+                self.setup_wizard()
+            elif choice == "2":
+                self.start_watchdog()
+            elif choice == "3":
+                self.scan_packages()
+            elif choice == "4":
+                self.edit_instances()
+            elif choice == "5":
+                self.hub_settings()
+            elif choice == "6":
+                self.diagnostics()
+            elif choice == "7":
+                self.plain_mode()
+            elif choice == "8":
+                self.crash_restart_enabled = not self.crash_restart_enabled
+                self.save()
+                state = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
+                print(f"\nCrash-restart is now {state}.")
+                if self.crash_restart_enabled:
+                    print(f"(requires {Watchdog.NOT_RUNNING_CONFIRM_TICKS} consecutive")
+                    print(" 'not running' polls before it actually restarts anything,")
+                    print(" to avoid a single flaky pidof/su read triggering a restart.)")
+                input("Press Enter...")
+            elif choice == "0":
+                return
+
+
+def headless_start() -> int:
+    global _TERMINAL
+    _TERMINAL = Terminal()
+    app = App()
+    if not app.targets:
+        print("No targets configured. Run: python3 rw.py")
+        return 1
+    with _TERMINAL:
+        app.start_watchdog()
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "start":
+        return headless_start()
+    global _TERMINAL
+    _TERMINAL = Terminal()
+    with _TERMINAL:
+        App().menu()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
