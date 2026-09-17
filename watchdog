@@ -163,11 +163,15 @@ class Shell:
     def run(self, cmd: str, timeout: int = 10, check: bool = False) -> subprocess.CompletedProcess:
         self.logger.log("$ " + cmd)
         try:
-            # stdin=DEVNULL: whatever this command spawns (especially `su`,
-            # which may launch a root-manager permission prompt) can't read
-            # from or otherwise take over the real controlling terminal.
+            # NOTE: stdin is intentionally left connected (inherited), not
+            # redirected to DEVNULL. Some root-manager prompts on this class
+            # of device are text-based and read the yes/no answer from
+            # stdin rather than showing a graphical system dialog - cutting
+            # stdin off makes su fail silently forever, since the prompt can
+            # never be answered. We rely on _resane_tty() below to clean up
+            # any terminal-mode side effects instead of blocking input.
             p = subprocess.run(cmd, shell=True, text=True, capture_output=True,
-                              timeout=timeout, stdin=subprocess.DEVNULL)
+                              timeout=timeout)
         except subprocess.TimeoutExpired:
             # Caught HERE, not just at individual call sites - force_stop(),
             # launch(), and launch_trading() call .root()/.run() directly
