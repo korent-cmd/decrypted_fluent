@@ -89,6 +89,23 @@ class _CRLFStdout:
 
 sys.stdout = _CRLFStdout(sys.stdout)
 
+
+def _resane_tty() -> None:
+    """
+    Re-applies the forced-sane termios settings. Called after every subprocess
+    invocation that touches `su`, because a root-manager permission prompt can
+    change terminal mode to draw itself, and if that process gets killed
+    (e.g. by our own timeout) before it finishes, it never restores the
+    original mode - leaving the terminal broken from that point on. This is
+    a no-op if termios isn't available or nothing was ever changed.
+    """
+    if _old_termios is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _sane)
+    except Exception:
+        pass
+
 VERSION = "3.0"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "watchdog_config.json")
@@ -320,16 +337,22 @@ class Shell:
         details = []
         for i, argv in enumerate(attempts):
             try:
-                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+                # stdin=DEVNULL: su/the root-manager prompt behind it can't
+                # read from or otherwise take over our real terminal at all.
+                r = subprocess.run(argv, capture_output=True, text=True,
+                                   timeout=20, stdin=subprocess.DEVNULL)
             except FileNotFoundError:
                 details.append(f"{' '.join(argv)} -> su binary not found on PATH")
                 break
             except subprocess.TimeoutExpired:
                 details.append(f"{' '.join(argv)} -> timed out after 20s "
                                f"(often means a root prompt is waiting for a tap)")
+                _resane_tty()
                 if i == 0:
                     time.sleep(2)   # give a pending prompt a moment before retry
                 continue
+            finally:
+                _resane_tty()
 
             out = (r.stdout or "").strip()
             errtxt = (r.stderr or "").strip()
@@ -346,11 +369,15 @@ class Shell:
     def run(self, cmd: str, timeout: int = 25, root: bool = True) -> Tuple[int, str]:
         argv = ["su", "-c", cmd] if (root and self.has_root) else ["sh", "-c", cmd]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(argv, capture_output=True, text=True,
+                               timeout=timeout, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return 124, ""
         except FileNotFoundError:
             return 127, ""
+        finally:
+            if argv[0] == "su":
+                _resane_tty()
         return r.returncode, (r.stdout or "") + (r.stderr or "")
 
     def out(self, cmd: str, timeout: int = 25, root: bool = True) -> str:
