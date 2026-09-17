@@ -34,6 +34,10 @@ VERSION = "3.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
+ORDER_PATH = os.environ.get(
+    "LOCALTRADER_ORDER_PATH",
+    os.path.join(BASE_DIR, "LocalTrader_Order.json"),
+)
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -321,6 +325,8 @@ class Target:
     hub_version: int = 0
     hub_error: str = ""
     trading_join_attempted: bool = False
+    local_order_phase: str = ""
+    local_order_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -494,6 +500,7 @@ class Watchdog:
         hub_poll_sec: int,
         logger: Logger,
         crash_restart_enabled: bool = False,
+        order_path: str = ORDER_PATH,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -506,6 +513,7 @@ class Watchdog:
         self.hub = HubClient(hub_url, hub_token, logger)
         self.hub_poll_sec = max(1, int(hub_poll_sec or DEFAULT_HUB_POLL_SEC))
         self.crash_restart_enabled = crash_restart_enabled
+        self.order_path = order_path or ORDER_PATH
         self.running = False
         self.next_hub_poll = 0.0
 
@@ -531,6 +539,70 @@ class Watchdog:
         except Exception as e:
             t.hub_error = str(e)
             self.log.log(f"{t.label}: hub event failed: {e}")
+
+    def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
+        """Write the complete order for LocalTrader before opening Roblox."""
+        order = {
+            "version": 3,
+            "phase": "TRADING_ROUTE",
+            "status": "PENDING",
+            "order_id": str(request.get("request_id", "")),
+            "request_id": str(request.get("request_id", "")),
+            "customer": str(request.get("customer", "")).strip(),
+            "item": str(request.get("item", "")).strip(),
+            "quantity": max(1, int(request.get("quantity", 1) or 1)),
+            "trading_share_link": self.trading_share_link,
+            "account_id": t.hub_id,
+            "updated_at": now_str(),
+        }
+        if not order["order_id"] or not order["customer"] or not order["item"]:
+            self.log.log(f"{t.label}: hub order is missing request_id, customer, or item")
+            return False
+        tmp = self.order_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.order_path)), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(order, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.order_path)
+            t.local_order_id = order["order_id"]
+            t.local_order_phase = order["phase"]
+            self.log.log(f"{t.label}: saved local order {order['order_id']}")
+            return True
+        except Exception as e:
+            self.log.log(f"{t.label}: local order save failed: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def read_local_order(self) -> Optional[Dict[str, Any]]:
+        try:
+            with open(self.order_path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+            return value if isinstance(value, dict) else None
+        except Exception:
+            return None
+
+    def sync_local_order(self, t: Target) -> None:
+        order = self.read_local_order()
+        if not order or order.get("account_id") != t.hub_id:
+            return
+        phase = str(order.get("phase", ""))
+        order_id = str(order.get("order_id", order.get("request_id", "")))
+        if order_id != t.local_order_id:
+            return
+        if phase == t.local_order_phase:
+            return
+        t.local_order_phase = phase
+        if phase == "FARMING" and order.get("status") == "COMPLETED":
+            self.notify(t, "completed", "trade_completed", {
+                "request_id": order_id,
+                "customer": order.get("customer", ""),
+                "item": order.get("item", ""),
+                "quantity": order.get("quantity", 1),
+            })
 
     def poll_hub(self) -> None:
         if not self.hub.enabled:
@@ -560,9 +632,15 @@ class Watchdog:
                         + (f" request={t.hub_request_id}" if t.hub_request_id else "")
                     )
                     if desired == "TRADING" and old != "TRADING":
-                        self.enter_trading(t)
+                        if self.save_local_order(req, t):
+                            self.enter_trading(t)
+                        else:
+                            t.status = "error"
                     elif desired == "FARMING" and old == "TRADING":
                         self.return_to_farming(t)
+                elif desired == "TRADING" and req and t.local_order_id != str(req.get("request_id", "")):
+                    if self.save_local_order(req, t):
+                        self.enter_trading(t)
                 t.hub_error = ""
             except Exception as e:
                 t.hub_error = str(e)
@@ -636,6 +714,8 @@ class Watchdog:
         if not t.enabled:
             t.status = "disabled"
             return
+
+        self.sync_local_order(t)
 
         running, detail = self.inspect_process(t)
         t.stale = False
@@ -783,6 +863,7 @@ class App:
                 "fail_streak", "cooldown_until", "restarts", "status", "hub_state",
                 "hub_request_id", "hub_version", "hub_error", "trading_join_attempted",
                 "not_running_streak",
+                "local_order_phase", "local_order_id",
             ]:
                 d.pop(k, None)
             data["targets"].append(d)
@@ -1022,6 +1103,7 @@ class App:
             self.hub_poll_sec,
             self.logger,
             self.crash_restart_enabled,
+            self.order_path,
         )
 
         def sigint(_sig, _frame):
