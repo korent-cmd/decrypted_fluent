@@ -32,6 +32,59 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+# ==============================================================================
+# TERMINAL SANITY (fixes: text drifting rightward line by line, can't type)
+# ==============================================================================
+#
+# Some remote/cloud-phone terminal bridges leave the pty in "raw" mode: '\n'
+# moves down a row without returning to column 0 (text drifts right every
+# line), and keystrokes aren't echoed or line-buffered (looks like you can't
+# type at all). Both are pty settings, not a Python bug - but we don't get to
+# choose the environment, so we defend against it in two ways:
+#
+#   1. Force the pty back to canonical+echo mode on startup, if we're allowed
+#      to touch it. This is what usually fixes "I can't type."
+#   2. Wrap stdout so every '\n' we write is actually '\r\n'. This makes text
+#      render correctly at column 0 even if something re-breaks raw mode
+#      later (e.g. a subprocess we call resets it). Sending an extra '\r' is
+#      always harmless on a normal, correctly configured terminal too.
+
+try:
+    import termios
+    _fd = sys.stdin.fileno()
+    _old_termios = termios.tcgetattr(_fd)
+    _sane = termios.tcgetattr(_fd)
+    _sane[3] |= (termios.ICANON | termios.ECHO)   # lflags: line buffering + echo
+    termios.tcsetattr(_fd, termios.TCSANOW, _sane)
+except Exception:
+    _old_termios = None
+
+
+class _CRLFStdout:
+    """Passthrough wrapper that guarantees '\\n' always returns to column 0,
+    regardless of whether the pty is doing that translation itself."""
+
+    def __init__(self, wrapped):
+        self._w = wrapped
+
+    def write(self, s: str) -> int:
+        return self._w.write(s.replace("\n", "\r\n"))
+
+    def flush(self) -> None:
+        self._w.flush()
+
+    def isatty(self) -> bool:
+        try:
+            return self._w.isatty()
+        except Exception:
+            return False
+
+    def fileno(self) -> int:
+        return self._w.fileno()
+
+
+sys.stdout = _CRLFStdout(sys.stdout)
+
 VERSION = "3.0"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "watchdog_config.json")
@@ -1255,4 +1308,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        if _old_termios is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _old_termios)
+            except Exception:
+                pass
