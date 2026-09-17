@@ -60,7 +60,7 @@ MIN_CONFIDENCE = 2
 
 class C:
     """ANSI colors, auto-disabled when output isn't a terminal."""
-    _on = False
+    _on = sys.stdout.isatty()
     RESET = "\033[0m" if _on else ""
     BOLD = "\033[1m" if _on else ""
     DIM = "\033[2m" if _on else ""
@@ -72,8 +72,14 @@ class C:
 
 
 def clear() -> None:
-    """Disabled in safe/plain mode; ANSI clear codes can break Termux frontends."""
-    return
+    """Full clear. Skipped only in plain mode (menu 6), never during the
+    render loop. NOTE: this must stay reachable - the menu redraws by calling
+    clear() every loop, so disabling it unconditionally makes every screen
+    stack underneath the last one instead of refreshing."""
+    if not C._on:
+        return
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
 
 
 class Screen:
@@ -241,23 +247,31 @@ class Shell:
     def _probe_root(self) -> bool:
         """
         Tries several invocation styles because su implementations differ
-        (Magisk, KernelSU, APatch, vendor/cloud-phone brokers). Records what
-        actually happened so Diagnostics can show it instead of a bare
-        yes/no that hides *why* it failed.
+        (Magisk, KernelSU, APatch, vendor/cloud-phone brokers). Uses a real
+        timeout, not 5s - a root-manager permission prompt needs a manual
+        tap the first time a new process asks for su, and 5s is often not
+        enough for that to happen, which shows up as a false "no root."
         """
         attempts = [
             ["su", "-c", "id"],
+            ["su", "-c", "id"],   # retry once: first call often just triggers
+                                   # the root-grant prompt/notification and
+                                   # returns before the user has tapped it
+            ["su", "0", "id"],
+            ["su", "-mm", "-c", "id"],
         ]
         details = []
         for i, argv in enumerate(attempts):
             try:
-                r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
             except FileNotFoundError:
                 details.append(f"{' '.join(argv)} -> su binary not found on PATH")
                 break
             except subprocess.TimeoutExpired:
                 details.append(f"{' '.join(argv)} -> timed out after 20s "
                                f"(often means a root prompt is waiting for a tap)")
+                if i == 0:
+                    time.sleep(2)   # give a pending prompt a moment before retry
                 continue
 
             out = (r.stdout or "").strip()
@@ -589,8 +603,14 @@ class Controller:
             urls.append(f"https://www.roblox.com/games/start?placeId={t.place_id}")
 
         for url in urls:
+            # -p pins resolution to this exact package. Without it, Android
+            # has to guess which installed Roblox (real app vs. a clone)
+            # should handle the link - with more than one candidate that
+            # guess can go to the wrong instance, trigger a disambiguation
+            # dialog nobody's there to tap, or fail to resolve at all. That
+            # produces exactly "something opened, but never joined the game".
             cmd = (f"am start -W {uf} -a android.intent.action.VIEW "
-                   f"-d {shlex.quote(url)}")
+                   f"-d {shlex.quote(url)} -p {shlex.quote(t.package)}")
             rc, out = self.sh.run(cmd, timeout=35)
             logline(f"[{t.name}] launch intent rc={rc}: {url}",
                      "INFO" if rc == 0 else "WARN")
@@ -598,6 +618,13 @@ class Controller:
                 compact = " ".join(out.strip().split())[:220]
                 logline(f"[{t.name}] am start: {compact}",
                          "INFO" if rc == 0 else "WARN")
+            if "Error: Activity not started" in out or "does not exist" in out:
+                # -p found no matching activity in this package for this URL
+                # scheme - move on to the next URL template rather than
+                # waiting out the full timeout for something that can't work.
+                logline(f"[{t.name}] {t.package} has no handler for this "
+                        f"URL form, trying next", "WARN")
+                continue
             if self._wait(t, 30):
                 time.sleep(5)
                 return True
@@ -860,7 +887,7 @@ class App:
 
         # step 1 - root
         print(f"\n  {C.BOLD}Step 1/4 · Root access{C.RESET}")
-        print("DEBUG: reached Step 1 without probing root")
+        self.sh.has_root = self.sh._probe_root()
         if self.sh.has_root:
             ok("Root confirmed (su works)")
         else:
@@ -1205,6 +1232,16 @@ def main() -> int:
             return 1
         Watchdog(app.sh, app.targets, app.interval, app.hang).run()
         return 0
+
+    # Some Termux/cloud-phone terminal front-ends don't report isatty()
+    # correctly even though input works fine. Don't block on it - just drop
+    # ANSI color/cursor/clear codes so a genuinely non-terminal session
+    # (piped, detached) still prints something sane instead of raw escapes.
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        if C._on:
+            App.toggle_plain()
+        warn("Terminal capabilities not detected - running in plain mode.")
+        warn("If input doesn't respond, use: python3 rw.py start (after Auto setup).")
 
     try:
         App().menu()
