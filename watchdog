@@ -7,8 +7,9 @@
 #   PC:    hub.py listening on 0.0.0.0:8787
 #   PHONE: rw.py polls http://PC_LAN_IP:8787 every few seconds
 #
-# No environment variables are required. Hub URL/token live in
-# watchdog_config.json and can be edited from the menu.
+# No JSON configuration files are required. Edit the constants below, or use
+# the interactive menu for the current run. Hub URL/token are compiled into
+# this script so it can be pasted directly into Termux.
 # ============================================================================
 
 import dataclasses
@@ -30,14 +31,31 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.1"
+VERSION = "3.2-no-json"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
-ORDER_PATH = os.environ.get(
-    "LOCALTRADER_ORDER_PATH",
-    os.path.join(BASE_DIR, "LocalTrader_Order.json"),
-)
+
+# ============================================================================
+# PASTE-AND-RUN CONFIGURATION
+# ============================================================================
+# Put your Cloudflare public Hub URL here. No trailing slash.
+HUB_URL = "https://YOUR-HUB-DOMAIN.example.com"
+# Copy the Token printed by hub.py here.
+HUB_TOKEN = "PASTE_YOUR_HUB_TOKEN_HERE"
+
+# Trading PS share link proven to work with the Android deep-link route.
+TRADING_SHARE_LINK = "https://www.roblox.com/share?code=4e51df338208544d9be433e960693f11&type=Server"
+
+# Farming defaults. Change these once instead of creating a JSON file.
+FARM_PLACE_ID = "2753915549"
+FARMING_PRIVATE_LINK = ""
+REJOIN_INTERVAL_MIN = 45
+HUB_POLL_SEC = 3
+CRASH_RESTART_ENABLED = False
+
+# If True, direct `python3 rw.py start` automatically uses every detected
+# Roblox-like package, with the defaults above.
+AUTO_DETECT_TARGETS = True
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -175,7 +193,7 @@ class Shell:
             # never be answered. We rely on _resane_tty() below to clean up
             # any terminal-mode side effects instead of blocking input.
             p = subprocess.run(cmd, shell=True, text=True, capture_output=True,
-                              timeout=timeout)
+                              stdin=subprocess.DEVNULL, timeout=timeout)
         except subprocess.TimeoutExpired:
             # Caught HERE, not just at individual call sites - force_stop(),
             # launch(), and launch_trading() call .root()/.run() directly
@@ -500,7 +518,6 @@ class Watchdog:
         hub_poll_sec: int,
         logger: Logger,
         crash_restart_enabled: bool = False,
-        order_path: str = ORDER_PATH,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -513,7 +530,6 @@ class Watchdog:
         self.hub = HubClient(hub_url, hub_token, logger)
         self.hub_poll_sec = max(1, int(hub_poll_sec or DEFAULT_HUB_POLL_SEC))
         self.crash_restart_enabled = crash_restart_enabled
-        self.order_path = order_path or ORDER_PATH
         self.running = False
         self.next_hub_poll = 0.0
 
@@ -540,69 +556,15 @@ class Watchdog:
             t.hub_error = str(e)
             self.log.log(f"{t.label}: hub event failed: {e}")
 
-    def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
-        """Write the complete order for LocalTrader before opening Roblox."""
-        order = {
-            "version": 3,
-            "phase": "TRADING_ROUTE",
-            "status": "PENDING",
-            "order_id": str(request.get("request_id", "")),
-            "request_id": str(request.get("request_id", "")),
-            "customer": str(request.get("customer", "")).strip(),
-            "item": str(request.get("item", "")).strip(),
-            "quantity": max(1, int(request.get("quantity", 1) or 1)),
-            "trading_share_link": self.trading_share_link,
-            "account_id": t.hub_id,
-            "updated_at": now_str(),
-        }
-        if not order["order_id"] or not order["customer"] or not order["item"]:
-            self.log.log(f"{t.label}: hub order is missing request_id, customer, or item")
+    def validate_request(self, request: Dict[str, Any], t: Target) -> bool:
+        request_id = str(request.get("request_id", ""))
+        customer = str(request.get("customer", "")).strip()
+        item = str(request.get("item", "")).strip()
+        if not request_id or not customer or not item:
+            self.log.log(f"{t.label}: Hub request missing request_id, customer, or item")
             return False
-        tmp = self.order_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.order_path)), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(order, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.order_path)
-            t.local_order_id = order["order_id"]
-            t.local_order_phase = order["phase"]
-            self.log.log(f"{t.label}: saved local order {order['order_id']}")
-            return True
-        except Exception as e:
-            self.log.log(f"{t.label}: local order save failed: {e}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            return False
-
-    def read_local_order(self) -> Optional[Dict[str, Any]]:
-        try:
-            with open(self.order_path, "r", encoding="utf-8") as f:
-                value = json.load(f)
-            return value if isinstance(value, dict) else None
-        except Exception:
-            return None
-
-    def sync_local_order(self, t: Target) -> None:
-        order = self.read_local_order()
-        if not order or order.get("account_id") != t.hub_id:
-            return
-        phase = str(order.get("phase", ""))
-        order_id = str(order.get("order_id", order.get("request_id", "")))
-        if order_id != t.local_order_id:
-            return
-        if phase == t.local_order_phase:
-            return
-        t.local_order_phase = phase
-        if phase == "FARMING" and order.get("status") == "COMPLETED":
-            self.notify(t, "completed", "trade_completed", {
-                "request_id": order_id,
-                "customer": order.get("customer", ""),
-                "item": order.get("item", ""),
-                "quantity": order.get("quantity", 1),
-            })
+        t.hub_request_id = request_id
+        return True
 
     def poll_hub(self) -> None:
         if not self.hub.enabled:
@@ -632,14 +594,14 @@ class Watchdog:
                         + (f" request={t.hub_request_id}" if t.hub_request_id else "")
                     )
                     if desired == "TRADING" and old != "TRADING":
-                        if self.save_local_order(req, t):
+                        if self.validate_request(req, t):
                             self.enter_trading(t)
                         else:
                             t.status = "error"
                     elif desired == "FARMING" and old == "TRADING":
                         self.return_to_farming(t)
-                elif desired == "TRADING" and req and t.local_order_id != str(req.get("request_id", "")):
-                    if self.save_local_order(req, t):
+                elif desired == "TRADING" and req and t.hub_request_id != str(req.get("request_id", "")):
+                    if self.validate_request(req, t):
                         self.enter_trading(t)
                 t.hub_error = ""
             except Exception as e:
@@ -714,8 +676,6 @@ class Watchdog:
         if not t.enabled:
             t.status = "disabled"
             return
-
-        self.sync_local_order(t)
 
         running, detail = self.inspect_process(t)
         t.stale = False
@@ -824,52 +784,36 @@ class App:
         self.load()
 
     def load(self) -> None:
-        if not os.path.exists(CONFIG_PATH):
-            return
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                c = json.load(f)
-            self.interval_sec = int(c.get("check_interval_sec", 20))
-            self.hang_sec = int(c.get("hang_detection_sec", 90))
-            self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
-            self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
-            hub = c.get("hub", {}) or {}
-            self.hub_url = str(hub.get("url", ""))
-            self.hub_token = str(hub.get("token", ""))
-            self.hub_poll_sec = int(hub.get("poll_sec", DEFAULT_HUB_POLL_SEC))
-            self.targets = [Target(**x) for x in c.get("targets", [])]
-        except Exception as e:
-            self.logger.log(f"config load failed: {e}")
+        # Deliberately no JSON config. This script is intended to be pasteable
+        # as a single file on devices where companion files cannot be added.
+        self.interval_sec = 20
+        self.hang_sec = 90
+        self.crash_restart_enabled = CRASH_RESTART_ENABLED
+        self.trading_share_link = TRADING_SHARE_LINK
+        self.hub_url = HUB_URL
+        self.hub_token = HUB_TOKEN
+        self.hub_poll_sec = HUB_POLL_SEC
+        if AUTO_DETECT_TARGETS:
+            try:
+                found = self.detector.scan()
+                self.targets = [
+                    Target(
+                        package=p["package"],
+                        user_id=p["uid"],
+                        place_id=FARM_PLACE_ID,
+                        private_link=FARMING_PRIVATE_LINK,
+                        rejoin_interval_min=REJOIN_INTERVAL_MIN,
+                    )
+                    for p in found
+                ]
+            except Exception as e:
+                self.logger.log(f"auto-detect failed: {e}")
+                self.targets = []
 
     def save(self) -> None:
-        data = {
-            "version": VERSION,
-            "check_interval_sec": self.interval_sec,
-            "hang_detection_sec": self.hang_sec,
-            "crash_restart_enabled": self.crash_restart_enabled,
-            "trading_share_link": self.trading_share_link,
-            "hub": {
-                "url": self.hub_url,
-                "token": self.hub_token,
-                "poll_sec": self.hub_poll_sec,
-            },
-            "targets": [],
-        }
-        for t in self.targets:
-            d = dataclasses.asdict(t)
-            # Runtime values should not be persisted.
-            for k in [
-                "last_rejoin", "last_launch", "last_heartbeat", "cpu", "stale",
-                "fail_streak", "cooldown_until", "restarts", "status", "hub_state",
-                "hub_request_id", "hub_version", "hub_error", "trading_join_attempted",
-                "not_running_streak",
-                "local_order_phase", "local_order_id",
-            ]:
-                d.pop(k, None)
-            data["targets"].append(d)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        self.logger.log("configuration saved")
+        # Kept as a compatibility no-op because the menu calls save().
+        # Persistent settings live in the constants at the top of this file.
+        self.logger.log("configuration changes are runtime-only; edit constants to persist them")
 
     def ask(self, prompt: str, default: str = "") -> str:
         suffix = f" [{default}]" if default else ""
@@ -951,9 +895,9 @@ class App:
         clear_screen()
         print("HUB SETTINGS")
         print("=" * 70)
-        print("The Hub runs on your PC. The phone connects to the PC's LAN IP.")
-        print("Example: http://192.168.1.50:8787")
-        print("The token is printed by hub.py when it starts.")
+        print("The Hub is reached through its public URL (Cloudflare/VDS).")
+        print("Example: https://your-hub-domain.example.com")
+        print("The token is printed by hub.py when it starts and must be pasted into HUB_TOKEN.")
         print()
         self.hub_url = self.ask("Hub URL", self.hub_url)
         self.hub_token = self.ask("Hub token", self.hub_token)
@@ -1038,7 +982,7 @@ class App:
         print(f"Root access (su elevation): {self.shell.has_root_access()}")
         print(f"  raw `su -c id` output: {su_probe!r}")
         print(f"Process already uid 0: {self.shell.is_root()}  (normally False under Termux, unrelated to su working)")
-        print(f"Config: {CONFIG_PATH}")
+        print("Config: built-in constants (no JSON file)")
         print(f"Log: {LOG_PATH}")
         print(f"Hub: {self.hub_url or 'OFF'}")
         print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
@@ -1103,7 +1047,6 @@ class App:
             self.hub_poll_sec,
             self.logger,
             self.crash_restart_enabled,
-            self.order_path,
         )
 
         def sigint(_sig, _frame):
@@ -1171,7 +1114,7 @@ def headless_start() -> int:
     _TERMINAL = Terminal()
     app = App()
     if not app.targets:
-        print("No targets configured. Run: python3 rw.py")
+        print("No targets detected. Check PACKAGE_MARKERS/AUTO_DETECT_TARGETS in the built-in config.")
         return 1
     with _TERMINAL:
         app.start_watchdog()
