@@ -42,22 +42,14 @@ local function startupNotice(message, isError)
 	return gui
 end
 
+local GEN = (type(getgenv) == "function" and getgenv()) or _G
+local HUB_URL = tostring(GEN.WATCHDOG_HUB_URL or GEN.HUB_URL or ""):gsub("/$", "")
+local HUB_TOKEN = tostring(GEN.WATCHDOG_HUB_TOKEN or GEN.HUB_TOKEN or "")
+
 local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
 	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
 	QuantumOnyxUrl = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua",
-	-- Server selection is controlled by the watchdog private-server share link.
-	TradingJobId = "",
-	HandoffFile = "LocalTrader_V3_Handoff.json",
-	-- Set this to the same shared Android path written by rw(2).py.
-	OrderFile = "/sdcard/LocalTrader_Order.json",
-	OrderCustomerName = "",
-	OrderFruitName = "",
-	OrderQuantity = 1,
-	TeleportMaxAttempts = 5,
-	TeleportRetryDelays = {0, 5, 15, 30, 60},
-	FarmLoadMaxAttempts = 3,
-	FarmLoadRetryDelays = {0, 10, 30},
 	AcceptInterval = 1.5,
 	CustomerWaitTimeout = 180,
 	TradeStartTimeout = 30,
@@ -65,264 +57,79 @@ local CONFIG = {
 	InventoryRefreshInterval = 2,
 	MaxLogLines = 200,
 	RetweenInterval = 4,
+	HubPollInterval = 3,
+	FarmLoadRetryDelays = {0, 10, 30},
 }
 
-local function readHandoff()
-	if type(readfile) ~= "function" or type(HttpService.JSONDecode) ~= "function" then
-		return nil, "executor file persistence is unavailable"
+-- LocalTrader no longer needs any JSON/file handoff. The watchdog owns the
+-- local config, while the Hub owns the current trade request and state.
+local function hubGet(path)
+	if HUB_URL == "" then
+		return nil, "WATCHDOG_HUB_URL is not configured"
 	end
-	if type(isfile) == "function" and not isfile(CONFIG.HandoffFile) then
-		return nil, "handoff file does not exist"
+	local separator = path:find("?", 1, true) and "&" or "?"
+	local url = HUB_URL .. path .. separator .. "_ts=" .. tostring(os.time())
+	if HUB_TOKEN ~= "" then
+		url = url .. "&token=" .. HttpService:UrlEncode(HUB_TOKEN)
 	end
-	local ok, contents = pcall(readfile, CONFIG.HandoffFile)
-	if not ok or type(contents) ~= "string" or contents == "" then
-		return nil, "handoff file could not be read"
-	end
-	local decodedOk, record = pcall(function()
-		return HttpService:JSONDecode(contents)
-	end)
-	if not decodedOk or type(record) ~= "table" then
-		return nil, "handoff file contains invalid JSON"
-	end
-	return record
-end
 
-local function writeHandoff(record)
-	if type(writefile) ~= "function" then
-		return false, "executor writefile is unavailable"
-	end
-	local ok, encoded = pcall(function()
-		return HttpService:JSONEncode(record)
+	local ok, result = pcall(function()
+		-- Prefer executor request() when available so the token can stay in the
+		-- private executor environment rather than in this public script.
+		if type(request) == "function" and HUB_TOKEN ~= "" then
+			local response = request({
+				Url = url,
+				Method = "GET",
+				Headers = {Authorization = "Bearer " .. HUB_TOKEN, Accept = "application/json"},
+			})
+			if type(response) ~= "table" then
+				error("invalid request() response")
+			end
+			local code = tonumber(response.StatusCode or response.status_code or 0) or 0
+			if code ~= 0 and (code < 200 or code >= 300) then
+				error("Hub HTTP " .. tostring(code) .. ": " .. tostring(response.Body or response.body or ""))
+			end
+			return HttpService:JSONDecode(tostring(response.Body or response.body or "{}"))
+		end
+		local body = game:HttpGet(url)
+		return HttpService:JSONDecode(body)
 	end)
 	if not ok then
-		return false, "handoff state could not be encoded"
+		return nil, tostring(result)
 	end
-	local writeOk, writeError = pcall(writefile, CONFIG.HandoffFile, encoded)
-	if not writeOk then
-		return false, tostring(writeError)
+	if type(result) ~= "table" then
+		return nil, "Hub returned invalid JSON"
 	end
-	return true
+	return result
 end
 
-local function readExternalOrder()
-	if type(readfile) ~= "function" then
-		return nil
+local function hubPollOrder()
+	local data, err = hubGet("/api/v1/order-user/" .. tostring(LocalPlayer.UserId))
+	if not data then
+		return nil, err
 	end
-	local ok, contents = pcall(readfile, CONFIG.OrderFile)
-	if not ok or type(contents) ~= "string" or contents == "" then
-		return nil
+	if data.ok == false then
+		return nil, tostring(data.error or "Hub request failed")
 	end
-	local decodedOk, order = pcall(function()
-		return HttpService:JSONDecode(contents)
-	end)
-	if not decodedOk or type(order) ~= "table" then
-		return nil
-	end
-	if order.status == "COMPLETED" or order.status == "CANCELED" then
-		return nil
-	end
-	if order.phase ~= "TRADING_ROUTE" and order.phase ~= "TRADING" then
-		return nil
-	end
-	if tostring(order.customer or "") == "" or tostring(order.item or "") == "" then
-		return nil
-	end
-	return order
+	return data
 end
 
-local function writeExternalOrder(order, phase, status)
-	if type(writefile) ~= "function" or type(order) ~= "table" then
-		return false
+local function hubComplete(orderId)
+	if not orderId or tostring(orderId) == "" then
+		return false, "missing order id"
 	end
-	local updated = {}
-	for key, value in pairs(order) do
-		updated[key] = value
+	local data, err = hubGet("/api/v1/trade-complete-user/" .. tostring(LocalPlayer.UserId)
+		.. "?request_id=" .. HttpService:UrlEncode(tostring(orderId)))
+	if not data then
+		return false, err
 	end
-	updated.phase = phase
-	updated.status = status
-	updated.updated_at = os.time()
-	local ok, encoded = pcall(function()
-		return HttpService:JSONEncode(updated)
-	end)
-	if not ok then
-		return false
-	end
-	return pcall(writefile, CONFIG.OrderFile, encoded)
-end
-
-local function currentServerIsTrading()
-	return CONFIG.TradingJobId ~= "" and game.JobId == CONFIG.TradingJobId
-end
-
-local teleportInFlight = false
-local teleportMode = nil
-local teleportAttempt = 0
-
-local function teleportErrorText(result)
-	return tostring(result or "unknown teleport error")
-end
-
-local function teleportReachedDestination(mode, record)
-	if mode == "TRADING" then
-		return currentServerIsTrading()
-	end
-	return type(record) == "table"
-		and game.JobId ~= CONFIG.TradingJobId
-		and game.JobId ~= record.previousJobId
-end
-
-local function retryTeleport(mode, record)
-	if teleportInFlight then
-		return
-	end
-	if teleportAttempt >= CONFIG.TeleportMaxAttempts then
-		warn("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
-		return
-	end
-	teleportAttempt = teleportAttempt + 1
-	local attempt = teleportAttempt
-	local delaySeconds = CONFIG.TeleportRetryDelays[attempt] or 60
-	task.delay(delaySeconds, function()
-		if type(record) == "table" then
-			local latest = readHandoff()
-			if type(latest) ~= "table" or latest.phase ~= record.phase or latest.orderId ~= record.orderId then
-				return
-			end
-		end
-		local ok, result = pcall(function()
-			if mode == "TRADING" then
-				TeleportService:TeleportToPlaceInstance(game.PlaceId, CONFIG.TradingJobId, LocalPlayer)
-			else
-				TeleportService:Teleport(game.PlaceId)
-			end
-		end)
-		if ok then
-			teleportInFlight = true
-			warn(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
-			task.delay(15, function()
-				if teleportInFlight and not teleportReachedDestination(mode, record) then
-					teleportInFlight = false
-					warn("LocalTrader Version 3: teleport did not complete; retrying")
-					task.spawn(retryTeleport, mode, record)
-				end
-			end)
-		else
-			teleportInFlight = false
-			warn("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
-			task.spawn(retryTeleport, mode, record)
-		end
-	end)
-end
-
-local function beginTeleport(mode, record)
-	if teleportInFlight then
-		return true
-	end
-	teleportMode = mode
-	teleportAttempt = 0
-	teleportInFlight = false
-	retryTeleport(mode, record)
-	return true
-end
-
-TeleportService.TeleportInitFailed:Connect(function(player, result)
-	if player ~= LocalPlayer or not teleportMode then
-		return
-	end
-	teleportInFlight = false
-	warn("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
-	local record = readHandoff()
-	if type(record) == "table" then
-		task.spawn(retryTeleport, teleportMode, record)
-	else
-		task.spawn(retryTeleport, teleportMode)
-	end
-end)
-
-local function createConfiguredOrder()
-	local customerName = tostring(CONFIG.OrderCustomerName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-	local fruitName = tostring(CONFIG.OrderFruitName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-	local quantity = math.max(1, tonumber(CONFIG.OrderQuantity) or 1)
-	if customerName == "" or fruitName == "" then
-		return nil
-	end
-	return {
-		version = 3,
-		phase = "ORDER_PENDING",
-		orderId = HttpService:GenerateGUID(false),
-		customerName = customerName,
-		requestedFruitName = fruitName,
-		quantity = quantity,
-		tradingJobId = CONFIG.TradingJobId,
-		createdAt = os.time(),
-	}
-end
-
-local function ensureConfiguredOrder()
-	local existing = readHandoff()
-	if type(existing) == "table"
-		and (existing.phase == "ORDER_PENDING" or existing.phase == "FARMING" or existing.phase == "TRADING") then
-		return existing
-	end
-	local configured = createConfiguredOrder()
-	if not configured then
-		return nil
-	end
-	local saved, saveError = writeHandoff(configured)
-	if not saved then
-		warn("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
-		return nil
-	end
-	return configured
-end
-
-local function reportStartupConfiguration()
-	if CONFIG.TradingJobId == "" then
-		local externalOrder = readExternalOrder()
-		local farmingHandoff = readHandoff()
-		if externalOrder or (type(farmingHandoff) == "table" and farmingHandoff.phase == "FARMING") then
-			startupNotice("Share-link routing is active. Checking the external order or farming handoff.", false)
-			return true
-		end
-		startupNotice("TradingJobId is empty and no external order is pending.\nCurrent JobId: " .. tostring(game.JobId), true)
-		return false
-	end
-	if game.JobId == CONFIG.TradingJobId then
-		startupNotice("Trading server detected. Starting local trader.", false)
-	else
-		startupNotice("Non-trading server detected. Routing an order or checking farming handoff.\nCurrent JobId: " .. tostring(game.JobId), false)
-	end
-	return true
+	return data.ok == true, tostring(data.error or "")
 end
 
 local function loadQuantumOnyx()
-	local record = readHandoff()
-	if type(record) ~= "table" or record.phase ~= "FARMING" then
-		warn("LocalTrader Version 3: no FARMING handoff is pending")
-		return
-	end
-	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
-		warn("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
-		return
-	end
-
-	local attempt = (record.loadJobId == game.JobId and tonumber(record.loadAttempt)) or 0
-	if attempt >= CONFIG.FarmLoadMaxAttempts then
-		warn("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
-		return
-	end
-	attempt = attempt + 1
-	local delaySeconds = CONFIG.FarmLoadRetryDelays[attempt] or 30
-	task.delay(delaySeconds, function()
-		local latest = readHandoff()
-		if type(latest) ~= "table" or latest.phase ~= "FARMING" then
-			return
-		end
-		latest.loadJobId = game.JobId
-		latest.loadAttempt = attempt
-		latest.lastLoadAttemptAt = os.time()
-		writeHandoff(latest)
-
+	local attempt = 0
+	local function runAttempt()
+		attempt = attempt + 1
 		local ok, result = pcall(function()
 			local source = game:HttpGet(CONFIG.QuantumOnyxUrl)
 			local chunk = loadstring(source)
@@ -330,79 +137,37 @@ local function loadQuantumOnyx()
 			return chunk()
 		end)
 		if ok then
-			latest.phase = "FARMING"
-			latest.farmStatus = "LOAD_EXECUTED"
-			latest.farmLoadedAt = os.time()
-			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
-		elseif attempt < CONFIG.FarmLoadMaxAttempts then
-			warn("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
-			task.spawn(loadQuantumOnyx)
+			warn("LocalTrader: QuantumOnyx load executed")
+		elseif attempt < #CONFIG.FarmLoadRetryDelays then
+			warn("LocalTrader: QuantumOnyx load failed; retrying: " .. tostring(result))
+			task.delay(CONFIG.FarmLoadRetryDelays[attempt + 1] or 30, runAttempt)
 		else
-			latest.farmStatus = "LOAD_FAILED"
-			latest.lastError = tostring(result)
-			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+			warn("LocalTrader: QuantumOnyx load failed after retries: " .. tostring(result))
 		end
-	end)
+	end
+	task.delay(CONFIG.FarmLoadRetryDelays[1] or 0, runAttempt)
 end
 
-local function handoffToFarming(sessionData)
-	local record = {
-		version = 3,
-		phase = "FARMING",
-		farmStatus = "PENDING",
-		orderId = sessionData.orderId or sessionData.order_id or HttpService:GenerateGUID(false),
-		tradingJobId = CONFIG.TradingJobId,
-		previousJobId = game.JobId,
-		customerName = sessionData.customerName,
-		requestedId = sessionData.requestedId,
-		quantity = sessionData.quantity,
-		tradeSessionId = sessionData.id,
-		createdAt = os.time(),
-		loadJobId = nil,
-		loadAttempt = 0,
-		externalOrder = sessionData.externalOrder,
-	}
-	local saved, saveError = writeHandoff(record)
-	if not saved then
-		return false, "could not persist farming handoff: " .. tostring(saveError)
-	end
-	if not sessionData.externalOrder then
-		beginTeleport("FARMING", record)
-	else
-		warn("LocalTrader Version 3: external order completed; watchdog controls the farming relaunch")
-	end
-	return true
-end
-
-if not reportStartupConfiguration() then
+if HUB_URL == "" then
+	startupNotice("Hub URL is not configured. Set WATCHDOG_HUB_URL in your private executor loader.", true)
 	return
 end
 
-local startupOrder = readExternalOrder()
-local function isTradingPrivateServer()
-	return tostring(game.PrivateServerId or "") ~= ""
-end
-
-if startupOrder and not isTradingPrivateServer() then
-	startupNotice("Order is pending, but this is not a private trading server. Waiting for the watchdog share-link launch.", true)
-	return
-end
-
-if not startupOrder and not currentServerIsTrading() then
-	local pendingOrder = ensureConfiguredOrder()
-	if type(pendingOrder) == "table" then
-		warn("LocalTrader Version 3: local JobId handoff is obsolete; use the watchdog share-link route")
+local startupOrder = nil
+local startupHubData, startupHubError = hubPollOrder()
+if startupHubData and type(startupHubData.request) == "table"
+	and tostring(startupHubData.desired_state or "FARMING"):upper() == "TRADING" then
+	startupOrder = startupHubData.request
+	startupOrder.orderId = startupOrder.orderId or startupOrder.order_id or startupOrder.request_id
+	startupOrder.customerName = startupOrder.customerName or startupOrder.customer
+	startupOrder.requestedFruitName = startupOrder.requestedFruitName or startupOrder.item
+	startupNotice("Hub order found. Starting local trader.", false)
+else
+	if startupHubError then
+		warn("LocalTrader: Hub poll failed at startup: " .. tostring(startupHubError))
 	end
+	-- No active trade belongs to this account. This is the normal farming path.
 	loadQuantumOnyx()
-	return
-end
-
-local startupNoticeGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	and LocalPlayer.PlayerGui:FindFirstChild("LocalTraderStartupNotice")
-if startupNoticeGui then
-	startupNoticeGui:Destroy()
 end
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
@@ -1023,15 +788,6 @@ local function stopTrader(reason)
 	if startButton then
 		startButton.Text = "Start"
 	end
-	if stoppedOrderId and not completed then
-		local order = readHandoff()
-		if type(order) == "table" and order.orderId == stoppedOrderId and order.phase == "TRADING" then
-			order.phase = "ORDER_PENDING"
-			order.lastFailure = reason or "trader stopped"
-			order.lastFailureAt = os.time()
-			writeHandoff(order)
-		end
-	end
 	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
 end
 
@@ -1094,25 +850,8 @@ local function startTrader(orderData)
 		stageStartedAt = os.clock(),
 		addRequested = false,
 		lastRetween = 0,
-		externalOrder = type(orderData) == "table" and orderData or nil,
+		hubOrder = type(orderData) == "table" and orderData or nil,
 	}
-	if type(orderData) == "table" then
-		orderData.phase = "TRADING"
-		orderData.startedAt = os.time()
-		orderData.tradingJobId = CONFIG.TradingJobId
-		orderData.requestedId = requestedId
-		orderData.requestedFruitName = fruitBox.Text
-		if orderData.order_id or orderData.orderId then
-			writeExternalOrder(orderData, "TRADING", "IN_PROGRESS")
-		end
-		local saved, saveError = writeHandoff(orderData)
-		if not saved then
-			writeLog("could not persist active order: " .. tostring(saveError))
-			running = false
-			session = nil
-			return
-		end
-	end
 	startButton.Text = "Stop"
 	local seat = emptyTradeSeat()
 	if seat then
@@ -1247,17 +986,14 @@ local function startTrader(orderData)
 					writeLog("trade completed and requested item is no longer available")
 					setState("COOLDOWN", "trade verified; preparing farming handoff")
 						session.completed = true
-						if session.externalOrder then
-							writeExternalOrder(session.externalOrder, "FARMING", "COMPLETED")
+						local completedOk, completedError = hubComplete(session.orderId)
+						if completedOk then
+							writeLog("trade verified; Hub marked request completed and FARMING")
+							stopTrader("completed; watchdog will relaunch farming")
+						else
+							writeLog("trade verified, but Hub completion failed: " .. tostring(completedError))
+							stopTrader("completed locally; Hub completion failed")
 						end
-					local handedOff, handoffError = handoffToFarming(session)
-					if handedOff then
-						writeLog("trade verified; joining a farming server")
-						stopTrader("completed; farming handoff started")
-					else
-						writeLog(handoffError)
-						stopTrader("completed, but farming handoff failed")
-					end
 				else
 					writeLog("processing ended, but inventory verification failed")
 					stopTrader("verification failed")
@@ -1379,32 +1115,30 @@ icon.Activated:Connect(function()
 end)
 
 gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-local pendingTradingOrder = nil
-local pendingFarmingHandoff = nil
-if startupOrder then
-	pendingTradingOrder = startupOrder
-elseif currentServerIsTrading() then
-	local savedOrder = readHandoff()
-	if type(savedOrder) ~= "table" then
-		savedOrder = ensureConfiguredOrder()
-	end
-	if type(savedOrder) == "table"
-		and savedOrder.phase == "ORDER_PENDING"
-		and savedOrder.tradingJobId == CONFIG.TradingJobId then
-		pendingTradingOrder = savedOrder
-	elseif type(savedOrder) == "table" and savedOrder.phase == "TRADING" then
-		warn("LocalTrader Version 3: active order found after restart; refusing to repeat the trade")
-	elseif type(savedOrder) == "table" and savedOrder.phase == "FARMING" then
-		pendingFarmingHandoff = savedOrder
-	end
-end
-
-if pendingFarmingHandoff then
-	writeLog("farming handoff found in trading server; leaving for a farming server")
-	beginTeleport("FARMING", pendingFarmingHandoff)
-elseif pendingTradingOrder then
-	writeLog("saved order found; starting automatically")
+local pendingTradingOrder = startupOrder
+if pendingTradingOrder then
+	writeLog("Hub order found; starting automatically")
 	task.defer(startTrader, pendingTradingOrder)
 else
-	writeLog("enter customer username and fruit name")
+	writeLog("waiting for Hub trade request")
+	local hubPollRunning = true
+	task.spawn(function()
+		while hubPollRunning do
+			task.wait(CONFIG.HubPollInterval)
+			if not running then
+				local data, err = hubPollOrder()
+				if data and tostring(data.desired_state or "FARMING"):upper() == "TRADING"
+					and type(data.request) == "table" then
+					local order = data.request
+					order.orderId = order.orderId or order.order_id or order.request_id
+					order.customerName = order.customerName or order.customer
+					order.requestedFruitName = order.requestedFruitName or order.item
+					writeLog("Hub order received: " .. tostring(order.orderId))
+					task.spawn(startTrader, order)
+				elseif err then
+					warn("LocalTrader: Hub poll failed: " .. tostring(err))
+				end
+			end
+		end
+	end)
 end
