@@ -92,17 +92,41 @@ class Terminal:
 
     def sane(self) -> None:
         if self._fd is None:
+            _resane_tty()
             return
         try:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+            state = self._old if self._old is not None else _TTY_SANE_STATE
+            if state is not None:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, state)
         except Exception:
             pass
+        _resane_tty()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_args):
         self.sane()
+
+
+# Capture the terminal state as early as possible.  This is important for
+# `python3 rw.py start`, which does not go through the interactive menu first.
+try:
+    _TTY_FD = sys.stdin.fileno()
+    _TTY_SANE_STATE = termios.tcgetattr(_TTY_FD)
+except Exception:
+    _TTY_FD = None
+    _TTY_SANE_STATE = None
+
+
+def _resane_tty() -> None:
+    """Restore the terminal mode after commands such as `su` return/timeout."""
+    if _TTY_FD is None or _TTY_SANE_STATE is None:
+        return
+    try:
+        termios.tcsetattr(_TTY_FD, termios.TCSANOW, _TTY_SANE_STATE)
+    except Exception:
+        pass
 
 
 class Logger:
@@ -128,7 +152,22 @@ class Shell:
 
     def run(self, cmd: str, timeout: int = 10, check: bool = False) -> subprocess.CompletedProcess:
         self.logger.log("$ " + cmd)
-        p = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=timeout)
+        try:
+            # Never let child processes (especially `su` / Magisk prompts) read
+            # from or manipulate the real Termux terminal.
+            p = subprocess.run(
+                cmd,
+                shell=True,
+                text=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        finally:
+            # `su` can leave the tty in raw/no-echo mode even after timeout or
+            # process termination.  Restore it after every subprocess call.
+            _resane_tty()
+
         if p.stdout.strip():
             self.logger.log(p.stdout.strip()[-1000:])
         if p.stderr.strip():
@@ -160,7 +199,13 @@ class Shell:
     def root(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
         if self.is_root():
             return self.run(cmd, timeout=timeout)
-        return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
+        try:
+            # stdin is already DEVNULL inside run(); keep the explicit wrapper
+            # here because this is the exact boundary where root-manager prompts
+            # have previously corrupted the Termux tty.
+            return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
+        finally:
+            _resane_tty()
 
     def root_out(self, cmd: str, timeout: int = 10) -> str:
         try:
@@ -925,6 +970,7 @@ class App:
             wd.run()
         finally:
             signal.signal(signal.SIGINT, old)
+            _resane_tty()
             clear_screen()
 
     def menu(self) -> None:
@@ -964,12 +1010,17 @@ class App:
 
 
 def headless_start() -> int:
+    # `start` is the normal long-running mode and must have the same tty
+    # protection as the interactive menu.
     app = App()
     if not app.targets:
         print("No targets configured. Run: python3 rw.py")
         return 1
-    app.start_watchdog()
-    return 0
+    try:
+        app.start_watchdog()
+        return 0
+    finally:
+        _resane_tty()
 
 
 def main() -> int:
