@@ -54,7 +54,11 @@ try:
     _fd = sys.stdin.fileno()
     _old_termios = termios.tcgetattr(_fd)
     _sane = termios.tcgetattr(_fd)
-    _sane[3] |= (termios.ICANON | termios.ECHO)   # lflags: line buffering + echo
+    # ICANON: line buffering, ECHO: show what's typed, ISIG: Ctrl+C actually
+    # sends SIGINT. Missing ISIG specifically means Ctrl+C is silently
+    # swallowed - the watchdog dashboard loop becomes unstoppable by keyboard
+    # even though it looks like a normal terminal.
+    _sane[3] |= (termios.ICANON | termios.ECHO | termios.ISIG)
     termios.tcsetattr(_fd, termios.TCSANOW, _sane)
 except Exception:
     _old_termios = None
@@ -569,6 +573,7 @@ class Target:
     last_rejoin: Optional[datetime] = field(default=None, repr=False, compare=False)
     last_cpu: Optional[int] = field(default=None, repr=False, compare=False)
     stale_ticks: int = field(default=0, repr=False, compare=False)
+    stale_since: Optional[datetime] = field(default=None, repr=False, compare=False)
     fail_streak: int = field(default=0, repr=False, compare=False)
     cooldown_until: Optional[datetime] = field(default=None, repr=False, compare=False)
     restarts: int = field(default=0, repr=False, compare=False)
@@ -581,14 +586,19 @@ class Target:
 
     def to_config(self) -> dict:
         d = asdict(self)
-        for k in ("last_rejoin", "last_cpu", "stale_ticks", "fail_streak",
+        for k in ("last_rejoin", "last_cpu", "stale_ticks", "stale_since", "fail_streak",
                   "cooldown_until", "restarts", "status"):
             d.pop(k, None)
         return d
 
 
 class Controller:
-    HANG_TICKS = 3
+    # A farming loop can legitimately sit near-idle CPU-wise between actions.
+    # Requiring both a poll-count AND a minimum elapsed wall-clock time avoids
+    # treating "healthy but quiet" as "frozen" - the old version could false-
+    # positive and restart an already-successfully-joined instance on repeat.
+    HANG_TICKS = 6
+    HANG_MIN_SECONDS = 240
 
     def __init__(self, sh: Shell, hang_detection: bool = True):
         self.sh = sh
@@ -707,12 +717,18 @@ class Controller:
         if self.hang_detection:
             ticks = self.cpu_ticks(pids[0])
             if ticks is not None:
+                now = datetime.now()
                 if t.last_cpu is not None and ticks <= t.last_cpu:
                     t.stale_ticks += 1
+                    if t.stale_since is None:
+                        t.stale_since = now
                 else:
                     t.stale_ticks = 0
+                    t.stale_since = None
                 t.last_cpu = ticks
-                if t.stale_ticks >= self.HANG_TICKS:
+
+                elapsed = (now - t.stale_since).total_seconds() if t.stale_since else 0
+                if t.stale_ticks >= self.HANG_TICKS and elapsed >= self.HANG_MIN_SECONDS:
                     return "hung"
         return "ok"
 
@@ -729,6 +745,7 @@ class Controller:
         t.last_rejoin = datetime.now()
         t.last_cpu = None
         t.stale_ticks = 0
+        t.stale_since = None
         t.restarts += 1
 
         if success:
@@ -818,8 +835,29 @@ class Watchdog:
         for entry in LOG_BUFFER[-8:]:
             lines.append(entry)
         lines.append("")
-        lines.append(f"  {C.DIM}Ctrl+C to stop and return to the menu{C.RESET}")
+        lines.append(f"  {C.DIM}Type anything + Enter, or Ctrl+C, to stop{C.RESET}")
         return lines
+
+    def _stdin_wants_stop(self, timeout: float) -> bool:
+        """
+        Non-blocking check for a keypress, so the loop can always be broken by
+        typing - independent of whether this terminal delivers a real SIGINT
+        on Ctrl+C. Some remote/cloud-phone pty bridges don't, which otherwise
+        makes the dashboard unstoppable by keyboard.
+        """
+        try:
+            import select
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except Exception:
+            time.sleep(timeout)
+            return False
+        if not ready:
+            return False
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            return True
+        return True   # any keypress/line stops it - no need to parse content
 
     def run(self) -> None:
         global LIVE_MODE
@@ -838,6 +876,7 @@ class Watchdog:
         clear()
         Screen.hide_cursor()
         logline(f"watchdog started on {len(self.targets)} target(s)", "OK")
+        logline("press any key + Enter, or Ctrl+C, to stop", "INFO")
 
         try:
             while self.running:
@@ -853,7 +892,9 @@ class Watchdog:
                 total = self.interval + random.uniform(0, 3)
                 slept = 0.0
                 while self.running and slept < total:
-                    time.sleep(0.4)
+                    if self._stdin_wants_stop(0.4):
+                        self.running = False
+                        break
                     slept += 0.4
                     Screen.render(self.frame())
         except KeyboardInterrupt:
