@@ -217,7 +217,23 @@ class Shell:
         return value
 
     def is_root(self) -> bool:
+        """True only if THIS process is already running as uid 0. Rare under
+        Termux even on a fully rooted device, since Termux runs unprivileged
+        and elevates per-command via su - this does NOT tell you whether su
+        elevation is available, only whether the su-prefix can be skipped."""
         return self.out("id -u") == "0"
+
+    def has_root_access(self) -> bool:
+        """True if privilege elevation actually works, regardless of whether
+        the calling process is already root. This is the check that answers
+        'can this tool do privileged things' - is_root() alone answers a
+        different question and will read as False on nearly every real
+        rooted-via-su device, which is exactly why root kept reporting as
+        'not detected' even when su worked fine for individual commands."""
+        if self.is_root():
+            return True
+        out = self.out("su -c id", timeout=15)
+        return "uid=0" in out
 
     def root(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
         if self.is_root():
@@ -796,10 +812,10 @@ class App:
         print("=" * 70)
         print("This setup configures the Android watchdog. Hub settings are optional here.")
         print()
-        if not self.shell.is_root():
+        if not self.shell.has_root_access():
             print("[!] Root was not detected. The watchdog needs root for reliable process/package control.")
         else:
-            print("[OK] Root detected")
+            print("[OK] Root detected (su elevation confirmed)")
 
         found = self.detector.scan()
         print(f"\nDetected Roblox-like packages: {len(found)}")
@@ -937,7 +953,10 @@ class App:
         clear_screen()
         print("DIAGNOSTICS")
         print("=" * 70)
-        print(f"Root: {self.shell.is_root()}")
+        su_probe = self.shell.out("su -c id", timeout=15)
+        print(f"Root access (su elevation): {self.shell.has_root_access()}")
+        print(f"  raw `su -c id` output: {su_probe!r}")
+        print(f"Process already uid 0: {self.shell.is_root()}  (normally False under Termux, unrelated to su working)")
         print(f"Config: {CONFIG_PATH}")
         print(f"Log: {LOG_PATH}")
         print(f"Hub: {self.hub_url or 'OFF'}")
