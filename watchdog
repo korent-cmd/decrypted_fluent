@@ -79,54 +79,64 @@ def account_id_for_target(t: "Target") -> str:
     return "rbx-" + hashlib.sha1(raw).hexdigest()[:12]
 
 
+_TERMINAL: Optional["Terminal"] = None
+
+
+def _resane_tty() -> None:
+    """Re-applies forced-sane termios settings if a Terminal is active. Safe
+    no-op if called before the terminal is set up or if termios isn't
+    available at all (e.g. no controlling tty)."""
+    if _TERMINAL is not None:
+        _TERMINAL.sane()
+
+
 class Terminal:
     def __init__(self) -> None:
         self._fd = None
         self._old = None
+        self._sane = None
         try:
             self._fd = sys.stdin.fileno()
             self._old = termios.tcgetattr(self._fd)
+            # Force sane mode proactively (ICANON/ECHO/ISIG), rather than just
+            # preserving whatever the incoming terminal state was. Some
+            # remote/cloud-phone pty bridges start in a broken state (no line
+            # buffering, no echo, Ctrl+C not delivered) - preserving that is
+            # preserving the bug.
+            sane = termios.tcgetattr(self._fd)
+            sane[3] |= (termios.ICANON | termios.ECHO | termios.ISIG)
+            termios.tcsetattr(self._fd, termios.TCSANOW, sane)
+            self._sane = sane
         except Exception:
             self._fd = None
             self._old = None
 
     def sane(self) -> None:
-        if self._fd is None:
-            _resane_tty()
+        """Re-apply the forced-sane settings. Call this after any subprocess
+        invocation (especially `su`) that might have changed terminal mode -
+        a root-manager permission prompt can flip raw mode to draw itself,
+        and if it's killed by a timeout before finishing, it never restores
+        the original mode on its own."""
+        if self._fd is None or self._sane is None:
             return
         try:
-            state = self._old if self._old is not None else _TTY_SANE_STATE
-            if state is not None:
-                termios.tcsetattr(self._fd, termios.TCSADRAIN, state)
+            termios.tcsetattr(self._fd, termios.TCSANOW, self._sane)
         except Exception:
             pass
-        _resane_tty()
+
+    def restore_original(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_args):
-        self.sane()
-
-
-# Capture the terminal state as early as possible.  This is important for
-# `python3 rw.py start`, which does not go through the interactive menu first.
-try:
-    _TTY_FD = sys.stdin.fileno()
-    _TTY_SANE_STATE = termios.tcgetattr(_TTY_FD)
-except Exception:
-    _TTY_FD = None
-    _TTY_SANE_STATE = None
-
-
-def _resane_tty() -> None:
-    """Restore the terminal mode after commands such as `su` return/timeout."""
-    if _TTY_FD is None or _TTY_SANE_STATE is None:
-        return
-    try:
-        termios.tcsetattr(_TTY_FD, termios.TCSANOW, _TTY_SANE_STATE)
-    except Exception:
-        pass
+        self.restore_original()
 
 
 class Logger:
@@ -153,21 +163,30 @@ class Shell:
     def run(self, cmd: str, timeout: int = 10, check: bool = False) -> subprocess.CompletedProcess:
         self.logger.log("$ " + cmd)
         try:
-            # Never let child processes (especially `su` / Magisk prompts) read
-            # from or manipulate the real Termux terminal.
-            p = subprocess.run(
-                cmd,
-                shell=True,
-                text=True,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-                timeout=timeout,
-            )
-        finally:
-            # `su` can leave the tty in raw/no-echo mode even after timeout or
-            # process termination.  Restore it after every subprocess call.
+            # stdin=DEVNULL: whatever this command spawns (especially `su`,
+            # which may launch a root-manager permission prompt) can't read
+            # from or otherwise take over the real controlling terminal.
+            p = subprocess.run(cmd, shell=True, text=True, capture_output=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            # Caught HERE, not just at individual call sites - force_stop(),
+            # launch(), and launch_trading() call .root()/.run() directly
+            # without their own try/except, so an uncaught timeout here
+            # (e.g. su hanging on an unanswered root prompt) would otherwise
+            # crash the whole script instead of just failing this one call.
+            self.logger.log(f"TIMEOUT after {timeout}s: {cmd}")
             _resane_tty()
-
+            return subprocess.CompletedProcess(args=cmd, returncode=124, stdout="",
+                                               stderr=f"timeout after {timeout}s")
+        except FileNotFoundError as e:
+            self.logger.log(f"NOT FOUND: {cmd}: {e}")
+            return subprocess.CompletedProcess(args=cmd, returncode=127, stdout="",
+                                               stderr=str(e))
+        finally:
+            # Always re-sanitize afterward: a root prompt can flip terminal
+            # mode to draw itself, and if it's killed by our own timeout
+            # before finishing, it never gets the chance to restore it.
+            _resane_tty()
         if p.stdout.strip():
             self.logger.log(p.stdout.strip()[-1000:])
         if p.stderr.strip():
@@ -199,13 +218,7 @@ class Shell:
     def root(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
         if self.is_root():
             return self.run(cmd, timeout=timeout)
-        try:
-            # stdin is already DEVNULL inside run(); keep the explicit wrapper
-            # here because this is the exact boundary where root-manager prompts
-            # have previously corrupted the Termux tty.
-            return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
-        finally:
-            _resane_tty()
+        return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
 
     def root_out(self, cmd: str, timeout: int = 10) -> str:
         try:
@@ -281,6 +294,7 @@ class Target:
     fail_streak: int = 0
     cooldown_until: float = 0.0
     restarts: int = 0
+    not_running_streak: int = 0
     status: str = "stopped"
     hub_state: str = "FARMING"
     hub_request_id: str = ""
@@ -443,6 +457,12 @@ class Controller:
 
 
 class Watchdog:
+    # How many consecutive "not running" polls are required before it's
+    # treated as a real crash rather than a flaky `pidof`/su read. A single
+    # bad reading firing a restart is what made this feel like it was
+    # "rejoining even when it doesn't need to."
+    NOT_RUNNING_CONFIRM_TICKS = 3
+
     def __init__(
         self,
         targets: List[Target],
@@ -453,6 +473,7 @@ class Watchdog:
         hub_token: str,
         hub_poll_sec: int,
         logger: Logger,
+        crash_restart_enabled: bool = False,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -464,6 +485,7 @@ class Watchdog:
         self.controller = Controller(self.shell, logger)
         self.hub = HubClient(hub_url, hub_token, logger)
         self.hub_poll_sec = max(1, int(hub_poll_sec or DEFAULT_HUB_POLL_SEC))
+        self.crash_restart_enabled = crash_restart_enabled
         self.running = False
         self.next_hub_poll = 0.0
 
@@ -597,12 +619,24 @@ class Watchdog:
 
         running, detail = self.inspect_process(t)
         t.stale = False
+
         if not running:
-            # If a trading request is active, restart into trading, otherwise farming.
-            self.restart(t, "process not running")
+            t.not_running_streak += 1
+            if self.crash_restart_enabled and t.not_running_streak >= self.NOT_RUNNING_CONFIRM_TICKS:
+                # Confirmed across several consecutive polls, not just one
+                # possibly-flaky reading - restart into trading or farming.
+                self.restart(t, "process not running")
+                t.not_running_streak = 0
+                self.heartbeat(t)
+                return
+            # Crash-restart disabled (default) or not yet confirmed: report
+            # it honestly on the dashboard, but let the scheduled timer be
+            # the only thing that actually restarts anything.
+            t.status = f"not running ({t.not_running_streak}x, waiting for timer)"
             self.heartbeat(t)
             return
 
+        t.not_running_streak = 0
         t.status = "trading" if t.hub_state == "TRADING" else "running"
         t.fail_streak = 0
 
@@ -655,7 +689,8 @@ class Watchdog:
         lines.append(f"ROBLOX WATCHDOG v{VERSION} | {now_str()}")
         lines.append("=" * 86)
         hubtxt = self.hub.base_url if self.hub.enabled else "OFF"
-        lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s")
+        cr = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
+        lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr}")
         lines.append("-")
         for i, t in enumerate(self.targets, 1):
             pid = self.controller.pid(t.package) or "-"
@@ -681,6 +716,7 @@ class App:
         self.targets: List[Target] = []
         self.interval_sec = 20
         self.hang_sec = 90
+        self.crash_restart_enabled = False
         self.trading_share_link = DEFAULT_TRADING_SHARE_LINK
         self.hub_url = ""
         self.hub_token = ""
@@ -695,6 +731,7 @@ class App:
                 c = json.load(f)
             self.interval_sec = int(c.get("check_interval_sec", 20))
             self.hang_sec = int(c.get("hang_detection_sec", 90))
+            self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
@@ -709,6 +746,7 @@ class App:
             "version": VERSION,
             "check_interval_sec": self.interval_sec,
             "hang_detection_sec": self.hang_sec,
+            "crash_restart_enabled": self.crash_restart_enabled,
             "trading_share_link": self.trading_share_link,
             "hub": {
                 "url": self.hub_url,
@@ -723,7 +761,8 @@ class App:
             for k in [
                 "last_rejoin", "last_launch", "last_heartbeat", "cpu", "stale",
                 "fail_streak", "cooldown_until", "restarts", "status", "hub_state",
-                "hub_request_id", "hub_version", "hub_error", "trading_join_attempted"
+                "hub_request_id", "hub_version", "hub_error", "trading_join_attempted",
+                "not_running_streak",
             ]:
                 d.pop(k, None)
             data["targets"].append(d)
@@ -898,6 +937,7 @@ class App:
         print(f"Config: {CONFIG_PATH}")
         print(f"Log: {LOG_PATH}")
         print(f"Hub: {self.hub_url or 'OFF'}")
+        print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
         print(f"Trading link: {self.trading_share_link}")
         print()
         for t in self.targets:
@@ -958,6 +998,7 @@ class App:
             self.hub_token,
             self.hub_poll_sec,
             self.logger,
+            self.crash_restart_enabled,
         )
 
         def sigint(_sig, _frame):
@@ -970,7 +1011,6 @@ class App:
             wd.run()
         finally:
             signal.signal(signal.SIGINT, old)
-            _resane_tty()
             clear_screen()
 
     def menu(self) -> None:
@@ -981,6 +1021,7 @@ class App:
             print(f"Instances: {len(self.targets)}")
             print(f"Hub: {self.hub_url or 'OFF'}")
             print(f"Trading PS: {parse_private_link(self.trading_share_link) or 'INVALID'}")
+            print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
             print()
             print("1. Auto setup")
             print("2. Start watchdog")
@@ -989,6 +1030,7 @@ class App:
             print("5. Hub settings")
             print("6. Diagnostics")
             print("7. Plain mode")
+            print("8. Toggle crash-restart")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -1005,28 +1047,38 @@ class App:
                 self.diagnostics()
             elif choice == "7":
                 self.plain_mode()
+            elif choice == "8":
+                self.crash_restart_enabled = not self.crash_restart_enabled
+                self.save()
+                state = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
+                print(f"\nCrash-restart is now {state}.")
+                if self.crash_restart_enabled:
+                    print(f"(requires {Watchdog.NOT_RUNNING_CONFIRM_TICKS} consecutive")
+                    print(" 'not running' polls before it actually restarts anything,")
+                    print(" to avoid a single flaky pidof/su read triggering a restart.)")
+                input("Press Enter...")
             elif choice == "0":
                 return
 
 
 def headless_start() -> int:
-    # `start` is the normal long-running mode and must have the same tty
-    # protection as the interactive menu.
+    global _TERMINAL
+    _TERMINAL = Terminal()
     app = App()
     if not app.targets:
         print("No targets configured. Run: python3 rw.py")
         return 1
-    try:
+    with _TERMINAL:
         app.start_watchdog()
-        return 0
-    finally:
-        _resane_tty()
+    return 0
 
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1].lower() == "start":
         return headless_start()
-    with Terminal():
+    global _TERMINAL
+    _TERMINAL = Terminal()
+    with _TERMINAL:
         App().menu()
     return 0
 
