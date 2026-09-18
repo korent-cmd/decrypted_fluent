@@ -11,6 +11,7 @@
 # watchdog_config.json and can be edited from the menu.
 # ============================================================================
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -30,7 +31,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.2"
+VERSION = "3.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -38,6 +39,8 @@ ORDER_PATH = os.environ.get(
     "LOCALTRADER_ORDER_PATH",
     os.path.join(BASE_DIR, "LocalTrader_Order.json"),
 )
+LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -309,6 +312,7 @@ class Target:
     label: str = ""
     enabled: bool = True
     hub_id: str = ""
+    clone_folder: str = ""
 
     last_rejoin: float = 0.0
     last_launch: float = 0.0
@@ -327,7 +331,6 @@ class Target:
     trading_join_attempted: bool = False
     local_order_phase: str = ""
     local_order_id: str = ""
-    switch_in_flight: bool = False
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -416,102 +419,34 @@ class Controller:
         time.sleep(1)
 
     def launch(self, t: Target) -> bool:
-        """
-        Launch the exact configured Roblox clone.
-
-        Important: cloned Roblox packages do not necessarily register the same
-        VIEW/deep-link filters as the original app.  Therefore we first launch
-        the exact package through its LAUNCHER activity.  If a farming private
-        link exists, we then try the deep link against that same package.
-        """
+        """Launch farming/public/private configured server using the target's existing settings."""
         if not t.place_id:
             self.log.log(f"{t.label}: no place_id configured")
             return False
-
-        package = shlex.quote(t.package)
-
-        # Step 1: start THIS clone directly.  This is the reliable fallback
-        # even when the clone does not accept a roblox:// VIEW intent.
-        self.log.log(f"{t.label}: starting exact package {t.package}")
-        p = self.s.root(
-            f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
-            timeout=30,
-        )
-        if p.returncode == 0:
-            t.last_launch = time.time()
-            t.status = "launching"
-            self.log.log(f"{t.label}: exact package launcher accepted")
-        else:
-            self.log.log(
-                f"{t.label}: exact package launcher returned rc={p.returncode}"
+        code = parse_private_link(t.private_link)
+        intents: List[str] = []
+        if code:
+            intents.append(
+                f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
             )
-
-        # Give Android a moment to create the Roblox process before trying
-        # to hand it a place/private-server URI.
-        if self._wait(t, 8):
-            # If no private farming server is configured, the normal app launch
-            # is already enough; Roblox can continue from its normal entry point.
-            code = parse_private_link(t.private_link)
-            if not code:
-                return True
-
-            # Private farming server: try package-qualified deep links.
-            intents = [
-                (
-                    f"https://www.roblox.com/games/start?"
-                    f"placeId={urllib.parse.quote(t.place_id)}&"
-                    f"linkCode={urllib.parse.quote(code)}"
-                ),
-                (
-                    f"roblox://placeId={urllib.parse.quote(t.place_id)}&"
-                    f"linkCode={urllib.parse.quote(code)}"
-                ),
-            ]
-
-            for url in intents:
-                self.log.log(f"{t.label}: farming deep-link -> {url}")
-                p = self.s.root(
-                    "am start -W -a android.intent.action.VIEW -d "
-                    + shlex.quote(url)
-                    + " -p "
-                    + package,
-                    timeout=20,
-                )
-                if p.returncode == 0:
-                    t.last_launch = time.time()
-                    t.status = "launching"
-                    self.log.log(f"{t.label}: farming deep-link accepted")
-                    return True
-
-            # The clone is already running, so don't call the whole launch a
-            # failure merely because its deep-link filter rejected the URI.
-            self.log.log(
-                f"{t.label}: deep-link was not accepted by package; "
-                f"exact Roblox clone is nevertheless running"
+            intents.append(
+                f"roblox://placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
             )
-            return True
+        intents.append(f"roblox://placeId={urllib.parse.quote(t.place_id)}")
+        intents.append(f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}")
 
-        # Launcher did not produce a detectable process.  Try the package-
-        # qualified place URI as a final attempt.
-        urls = [
-            f"roblox://placeId={urllib.parse.quote(t.place_id)}",
-            f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}",
-        ]
-        for url in urls:
-            self.log.log(f"{t.label}: final package launch -> {url}")
+        for url in intents:
+            self.log.log(f"{t.label}: launching farming URL {url}")
+            # Keep -p for normal launch so the correct clone is selected.
             p = self.s.root(
                 "am start -W -a android.intent.action.VIEW -d "
-                + shlex.quote(url)
-                + " -p "
-                + package,
+                + shlex.quote(url) + " -p " + shlex.quote(t.package),
                 timeout=20,
             )
-            if p.returncode == 0 and self._wait(t, 8):
+            if p.returncode == 0:
                 t.last_launch = time.time()
                 t.status = "launching"
                 return True
-
-        self.log.log(f"{t.label}: all exact-package farming launch attempts failed")
         return False
 
     def launch_trading(self, t: Target, share_link: str) -> bool:
@@ -529,27 +464,17 @@ class Controller:
 
         # First try exact clone package. If that clone does not register the share-link
         # intent, fall back to Android's normal resolver.
-        # IMPORTANT: never fall back to Android's global resolver here.
-        # With cloned Roblox installations, a resolver launch can target a
-        # different clone and make unrelated accounts appear to "reset".
-        # The package-qualified launch is deliberately isolated to this target.
-        cmd = (
-            "am start -W -a android.intent.action.VIEW -d "
-            + shlex.quote(uri)
-            + " -p "
-            + shlex.quote(t.package)
-        )
-        self.log.log(f"{t.label}: trading deep-link -> {t.package}")
-        p = self.s.root(cmd, timeout=25)
-        if p.returncode == 0:
-            t.last_launch = time.time()
-            t.status = "trading_joining"
-            return True
-
-        self.log.log(
-            f"{t.label}: package-qualified trading deep link failed "
-            f"(rc={p.returncode}); refusing global resolver fallback"
-        )
+        commands = [
+            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri) + " -p " + shlex.quote(t.package),
+            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri),
+        ]
+        for i, cmd in enumerate(commands, 1):
+            self.log.log(f"{t.label}: trading deep-link attempt {i}")
+            p = self.s.root(cmd, timeout=25)
+            if p.returncode == 0:
+                t.last_launch = time.time()
+                t.status = "trading_joining"
+                return True
         return False
 
     def _wait(self, t: Target, seconds: int = 15) -> bool:
@@ -618,6 +543,99 @@ class Watchdog:
         except Exception as e:
             t.hub_error = str(e)
             self.log.log(f"{t.label}: hub event failed: {e}")
+
+    def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
+        """Publish Hub connection/state into each clone's Arceus X Workspace."""
+        if not self.hub.enabled:
+            self.log.log("LocalTrader config sync skipped: Hub is not enabled")
+            return
+
+        if target is not None:
+            clone_name = target.clone_folder
+
+            if not clone_name:
+                m = re.search(r"RobloxClone\d+", target.label or "")
+                clone_name = m.group(0) if m else ""
+
+            if not clone_name:
+                try:
+                    ordinal = self.targets.index(target) + 1
+                except ValueError:
+                    ordinal = 1
+                clone_name = f"RobloxClone{ordinal:03d}"
+
+            target.clone_folder = clone_name
+
+            workspace = (
+                f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+            )
+        else:
+            # Actual clone layout uses "Arceus X" with a space.
+            workspace = (
+                "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+            )
+
+        payload = json.dumps({
+            "version": 2,
+            "hub_url": self.hub.base_url,
+            "hub_token": self.hub.token,
+            "hub_poll_sec": self.hub_poll_sec,
+            "mode": (
+                "TRADING"
+                if target and target.hub_state == "TRADING"
+                else "FARMING"
+            ),
+            "account_id": target.hub_id if target else "",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+        encoded = base64.b64encode(
+            payload.encode("utf-8")
+        ).decode("ascii")
+
+        if target is not None:
+            # Quote the entire path because "Arceus X" contains a space.
+            workspace_q = shlex.quote(workspace)
+
+            cmd = (
+                "d=" + workspace_q + "; "
+                "[ -d \"$d\" ] || { "
+                "echo " + shlex.quote(
+                    f"Workspace does not exist: {workspace}"
+                ) + " >&2; "
+                "exit 2; "
+                "}; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) +
+                " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" +
+                LOCALTRADER_CONFIG_NAME + "\""
+            )
+        else:
+            # This branch supports syncing all clones.
+            cmd = (
+                "for d in /storage/emulated/0/RobloxClone*/"
+                "\"Arceus X\"/Workspace; do "
+                "[ -d \"$d\" ] || continue; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) +
+                " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" +
+                LOCALTRADER_CONFIG_NAME + "\"; "
+                "done"
+            )
+
+        result = self.shell.root(cmd, timeout=15)
+
+        if result.returncode != 0:
+            self.log.log(
+                "LocalTrader config sync failed: "
+                + result.stderr.strip()[:500]
+            )
+        else:
+            self.log.log(
+                f"{target.label if target else 'all clones'}: "
+                f"LocalTrader_Hub.json synced"
+            )
 
     def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
         """Write the complete order for LocalTrader before opening Roblox."""
@@ -707,10 +725,6 @@ class Watchdog:
                     t.hub_version = version
                     t.hub_state = desired
                     self.log.log(
-                        f"{t.label}: HUB POLL account={t.hub_id} desired={desired} "
-                        f"version={version} request={t.hub_request_id or '-'}"
-                    )
-                    self.log.log(
                         f"{t.label}: hub desired state {old} -> {desired}"
                         + (f" request={t.hub_request_id}" if t.hub_request_id else "")
                     )
@@ -730,69 +744,44 @@ class Watchdog:
                 self.log.log(f"{t.label}: hub poll failed: {e}")
 
     def enter_trading(self, t: Target) -> None:
-        if not t.enabled or t.switch_in_flight:
+        if not t.enabled:
             return
-        t.switch_in_flight = True
-        try:
-            self.log.log(f"{t.label}: ENTER TRADING")
-            t.status = "switching_to_trading"
-            self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
-
-            # Only this exact Android package is stopped.
-            self.controller.force_stop(t)
-            time.sleep(1)
-
-            ok = self.controller.launch_trading(t, self.trading_share_link)
-            t.trading_join_attempted = True
-            if ok:
-                t.status = "trading_joining"
-                t.fail_streak = 0
-                self.log.log(f"{t.label}: trading deep link sent to {t.package}")
-                self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
-            else:
-                t.status = "error"
-                t.fail_streak += 1
-                self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
-        finally:
-            t.switch_in_flight = False
+        self.sync_localtrader_config(t)
+        self.log.log(f"{t.label}: ENTER TRADING")
+        t.status = "switching_to_trading"
+        self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
+        self.controller.force_stop(t)
+        time.sleep(1)
+        ok = self.controller.launch_trading(t, self.trading_share_link)
+        t.trading_join_attempted = True
+        if ok:
+            t.status = "trading_joining"
+            t.fail_streak = 0
+            self.log.log(f"{t.label}: trading deep link sent")
+            self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
+        else:
+            t.status = "error"
+            t.fail_streak += 1
+            self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
 
     def return_to_farming(self, t: Target) -> None:
-        if not t.enabled or t.switch_in_flight:
-            return
-        t.switch_in_flight = True
-        try:
-            self.log.log(f"{t.label}: RETURN TO FARMING")
-            t.status = "switching_to_farming"
-            self.notify(t, t.status, "return_to_farming")
-
-            # Only this exact Android package is stopped.
-            self.controller.force_stop(t)
-            time.sleep(1)
-
-            ok = self.controller.launch(t)
-            t.trading_join_attempted = False
-            if ok:
-                t.status = "launching"
-                t.last_rejoin = time.time()
-                self.notify(t, t.status, "farming_launch_sent")
-            else:
-                t.status = "error"
-                t.fail_streak += 1
-        finally:
-            t.switch_in_flight = False
+        self.sync_localtrader_config(t)
+        self.log.log(f"{t.label}: RETURN TO FARMING")
+        t.status = "switching_to_farming"
+        self.notify(t, t.status, "return_to_farming")
+        self.controller.force_stop(t)
+        time.sleep(1)
+        ok = self.controller.launch(t)
+        t.trading_join_attempted = False
+        if ok:
+            t.status = "launching"
+            t.last_rejoin = time.time()
+            self.notify(t, t.status, "farming_launch_sent")
+        else:
+            t.status = "error"
+            t.fail_streak += 1
 
     def restart(self, t: Target, reason: str) -> None:
-        if t.switch_in_flight:
-            return
-        if time.time() < t.cooldown_until:
-            return
-        t.switch_in_flight = True
-        try:
-            self._restart_impl(t, reason)
-        finally:
-            t.switch_in_flight = False
-
-    def _restart_impl(self, t: Target, reason: str) -> None:
         if time.time() < t.cooldown_until:
             return
         t.restarts += 1
@@ -832,17 +821,6 @@ class Watchdog:
 
         if not running:
             t.not_running_streak += 1
-
-            # A freshly started watchdog must launch configured instances even
-            # when "crash-restart" is OFF.  That setting controls recovery from
-            # later crashes; it must not disable the initial auto-rejoin.
-            if t.last_launch <= 0 and t.not_running_streak >= 1:
-                self.log.log(f"{t.label}: initial launch")
-                self.restart(t, "initial launch")
-                t.not_running_streak = 0
-                self.heartbeat(t)
-                return
-
             if self.crash_restart_enabled and t.not_running_streak >= self.NOT_RUNNING_CONFIRM_TICKS:
                 # Confirmed across several consecutive polls, not just one
                 # possibly-flaky reading - restart into trading or farming.
@@ -877,9 +855,47 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
+        # Runtime timestamps are not persisted.  Therefore a freshly-created
+        # Target starts with last_rejoin=0.  Initialize the timer lifecycle here:
+        # - already-running Roblox: timer starts NOW (no immediate rejoin)
+        # - stopped Roblox: launch it NOW (timer starts when launch succeeds)
+        # This also fixes timer-only mode getting stuck forever on a stopped app.
+        self.poll_hub()
         for t in self.targets:
-            if t.enabled:
+            if not t.enabled:
+                continue
+
+            self.sync_localtrader_config(t)
+            running, _ = self.inspect_process(t)
+
+            if running:
+                if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
+                    t.last_rejoin = time.time()
+                t.status = "trading" if t.hub_state == "TRADING" else "running"
                 self.heartbeat(t)
+                continue
+
+            if t.hub_state == "TRADING":
+                self.log.log(f"{t.label}: startup launch into TRADING")
+                ok = self.controller.launch_trading(t, self.trading_share_link)
+                if ok:
+                    t.status = "trading_joining"
+                    t.trading_join_attempted = True
+                    self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
+                else:
+                    t.status = "error"
+                    t.fail_streak += 1
+            else:
+                self.log.log(f"{t.label}: startup launch into FARMING")
+                ok = self.controller.launch(t)
+                if ok:
+                    t.status = "launching"
+                    t.last_rejoin = time.time()
+                    self.notify(t, t.status, "farming_launch_sent")
+                else:
+                    t.status = "error"
+                    t.fail_streak += 1
+            self.heartbeat(t)
 
         try:
             last_tick = 0.0
