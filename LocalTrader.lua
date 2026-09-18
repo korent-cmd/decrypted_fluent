@@ -1506,3 +1506,5 @@ task.spawn(function()
 				task.defer(startTrader, order)
 			end
 		end
+	end
+end)
