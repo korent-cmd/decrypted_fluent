@@ -618,6 +618,92 @@ end
 
 debugLog("mode=TRADING; initializing trading system")
 
+-- Blox Fruits requires the player to belong to a team before the trading
+-- system can operate.  The farming script already handles this; LocalTrader
+-- does the same when it enters TRADING mode so a freshly joined clone is ready
+-- without manual interaction.
+local function ensureTradingTeam()
+	if LocalPlayer.Team then
+		debugLog("team already selected: " .. tostring(LocalPlayer.Team.Name))
+		return true
+	end
+
+	debugLog("no team selected; waiting for DataLoaded")
+	local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
+	if not dataLoaded then
+		dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
+	end
+	if not dataLoaded then
+		debugLog("DataLoaded did not appear; cannot select team")
+		return false
+	end
+
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+	if not remotes then
+		debugLog("ReplicatedStorage.Remotes not found while selecting team")
+		return false
+	end
+
+	local commF = remotes:WaitForChild("CommF_", 15)
+	if not commF then
+		debugLog("CommF_ not found while selecting team")
+		return false
+	end
+
+	local function trySetTeam(remoteCommand)
+		local ok, result = pcall(function()
+			return commF:InvokeServer(remoteCommand, "Pirates")
+		end)
+		debugLog(string.format(
+			"team request %s Pirates -> ok=%s result=%s",
+			remoteCommand,
+			tostring(ok),
+			tostring(result)
+		))
+		return ok
+	end
+
+	-- Current Blox Fruits scripts commonly use SetTeam2.  Keep SetTeam as a
+	-- compatibility fallback because older versions/scripts used that command.
+	if not trySetTeam("SetTeam2") then
+		debugLog("SetTeam2 failed; trying SetTeam")
+		trySetTeam("SetTeam")
+	end
+
+	local deadline = os.clock() + 15
+	while os.clock() < deadline do
+		if LocalPlayer.Team then
+			debugLog("team selected: " .. tostring(LocalPlayer.Team.Name))
+			if LocalPlayer.Character then
+				return true
+			end
+			break
+		end
+		task.wait(0.25)
+	end
+
+	if not LocalPlayer.Team then
+		debugLog("team selection did not register after 15s")
+		return false
+	end
+
+	-- Selecting a team can respawn the character.  Wait for the new character
+	-- before the trading code starts touching the trade table.
+	local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	if character then
+		debugLog("character ready after team selection")
+		return true
+	end
+
+	debugLog("team selected but character was not available")
+	return false
+end
+
+if not ensureTradingTeam() then
+	debugLog("TRADING startup stopped: team selection failed")
+	return
+end
+
 -- JobId is intentionally not used to identify the persistent trading server.
 -- The watchdog's share-link launch selects that server; the Hub selects the order.
 local startupOrder = readExternalOrder()
