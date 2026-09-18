@@ -2,8 +2,6 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 
-warn("LocalTrader: script execution started")
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
@@ -13,11 +11,94 @@ local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
+-- ============================================================================
+-- PERSISTENT DEBUG LOG
+-- Shows startup/Hub diagnostics on-screen because executor console output may
+-- not be visible. No console output calls are used by this script.
+-- ============================================================================
+local debugGui
+local debugLogBox
+local debugLines = {}
+local DEBUG_MAX_LINES = 120
+
+local function createDebugGui()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+    if not playerGui then
+        return false
+    end
+
+    local old = playerGui:FindFirstChild("LocalTraderDebugGui")
+    if old then
+        old:Destroy()
+    end
+
+    debugGui = Instance.new("ScreenGui")
+    debugGui.Name = "LocalTraderDebugGui"
+    debugGui.ResetOnSpawn = false
+    debugGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local frame = Instance.new("Frame")
+    frame.Name = "DebugFrame"
+    frame.Size = UDim2.fromOffset(520, 190)
+    frame.Position = UDim2.new(1, -540, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+    frame.BorderSizePixel = 0
+    frame.Parent = debugGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -12, 0, 25)
+    title.Position = UDim2.fromOffset(8, 3)
+    title.BackgroundTransparency = 1
+    title.Text = "LocalTrader diagnostics"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.Parent = frame
+
+    debugLogBox = Instance.new("TextBox")
+    debugLogBox.Size = UDim2.new(1, -16, 1, -34)
+    debugLogBox.Position = UDim2.fromOffset(8, 29)
+    debugLogBox.BackgroundColor3 = Color3.fromRGB(8, 10, 14)
+    debugLogBox.TextColor3 = Color3.fromRGB(215, 220, 230)
+    debugLogBox.Font = Enum.Font.Code
+    debugLogBox.TextSize = 11
+    debugLogBox.TextXAlignment = Enum.TextXAlignment.Left
+    debugLogBox.TextYAlignment = Enum.TextYAlignment.Top
+    debugLogBox.TextWrapped = false
+    debugLogBox.MultiLine = true
+    debugLogBox.TextEditable = false
+    debugLogBox.ClearTextOnFocus = false
+    debugLogBox.Text = ""
+    debugLogBox.Parent = frame
+
+    debugGui.Parent = playerGui
+    return true
+end
+
+local function debugLog(message)
+    local line = os.date("%H:%M:%S") .. " " .. tostring(message)
+    debugLines[#debugLines + 1] = line
+    while #debugLines > DEBUG_MAX_LINES do
+        table.remove(debugLines, 1)
+    end
+    if debugLogBox and debugLogBox.Parent then
+        debugLogBox.Text = table.concat(debugLines, "\n")
+    end
+end
+
+createDebugGui()
+debugLog("script execution started")
+
 local function startupNotice(message, isError)
 	local playerGui = LocalPlayer and (LocalPlayer:FindFirstChildOfClass("PlayerGui")
 		or LocalPlayer:WaitForChild("PlayerGui", 10))
 	if not playerGui then
-		warn("LocalTrader: " .. message)
+		debugLog("LocalTrader: " .. message)
 		return
 	end
 	local existing = playerGui:FindFirstChild("LocalTraderStartupNotice")
@@ -38,7 +119,7 @@ local function startupNotice(message, isError)
 	label.Font = Enum.Font.Gotham
 	label.Text = message
 	label.Parent = gui
-	warn("LocalTrader: " .. message)
+	debugLog("LocalTrader: " .. message)
 	return gui
 end
 
@@ -112,6 +193,8 @@ local HubConfig = {
 	url = "",
 	token = "",
 	poll = 3,
+	mode = "FARMING",
+	accountId = "",
 }
 
 local function loadHubConfig()
@@ -208,32 +291,17 @@ end
 local function readExternalOrder()
 	local configured, configError = loadHubConfig()
 	if not configured then
-		warn("LocalTrader: " .. tostring(configError))
+		debugLog("LocalTrader: " .. tostring(configError))
 		return nil
 	end
 	if HubConfig.mode ~= "TRADING" then
 		return nil
 	end
-	local endpoint
-	if HubConfig.accountId ~= "" then
-		endpoint = "/api/v1/order/" .. HubConfig.accountId
-	else
-		endpoint = "/api/v1/order-user/" .. tostring(LocalPlayer.UserId)
-	end
-
-	local data, err = hubRequest("GET", endpoint)
+	local data, err = hubRequest("GET", "/api/v1/order-user/" .. tostring(LocalPlayer.UserId))
 	if not data then
-		warn("LocalTrader: Hub poll failed: " .. tostring(err) .. " endpoint=" .. tostring(endpoint))
+		debugLog("LocalTrader: Hub poll failed: " .. tostring(err))
 		return nil
 	end
-
-	warn(
-		"LocalTrader: Hub poll ok endpoint=" .. tostring(endpoint)
-		.. " desired=" .. tostring(data.desired_state)
-		.. " account=" .. tostring(data.account_id)
-		.. " request=" .. tostring(data.request and data.request.request_id or "")
-	)
-
 	if data.desired_state ~= "TRADING" or type(data.request) ~= "table" then
 		return nil
 	end
@@ -283,10 +351,10 @@ local function writeExternalOrder(order, phase, status)
 		extra = extra,
 	})
 	if not data then
-		warn("LocalTrader: failed to report trade completion: " .. tostring(err))
+		debugLog("LocalTrader: failed to report trade completion: " .. tostring(err))
 		return false
 	end
-	warn("LocalTrader: trade completion reported to Hub")
+	debugLog("LocalTrader: trade completion reported to Hub")
 	return data.ok ~= false
 end
 
@@ -316,7 +384,7 @@ local function retryTeleport(mode, record)
 		return
 	end
 	if teleportAttempt >= CONFIG.TeleportMaxAttempts then
-		warn("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
+		debugLog("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
 		return
 	end
 	teleportAttempt = teleportAttempt + 1
@@ -338,17 +406,17 @@ local function retryTeleport(mode, record)
 		end)
 		if ok then
 			teleportInFlight = true
-			warn(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
+			debugLog(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
 			task.delay(15, function()
 				if teleportInFlight and not teleportReachedDestination(mode, record) then
 					teleportInFlight = false
-					warn("LocalTrader Version 3: teleport did not complete; retrying")
+					debugLog("LocalTrader Version 3: teleport did not complete; retrying")
 					task.spawn(retryTeleport, mode, record)
 				end
 			end)
 		else
 			teleportInFlight = false
-			warn("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
+			debugLog("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
 			task.spawn(retryTeleport, mode, record)
 		end
 	end)
@@ -370,7 +438,7 @@ TeleportService.TeleportInitFailed:Connect(function(player, result)
 		return
 	end
 	teleportInFlight = false
-	warn("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
+	debugLog("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
 	local record = readHandoff()
 	if type(record) == "table" then
 		task.spawn(retryTeleport, teleportMode, record)
@@ -410,7 +478,7 @@ local function ensureConfiguredOrder()
 	end
 	local saved, saveError = writeHandoff(configured)
 	if not saved then
-		warn("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
+		debugLog("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
 		return nil
 	end
 	return configured
@@ -419,17 +487,17 @@ end
 local function loadQuantumOnyx()
 	local record = readHandoff()
 	if type(record) ~= "table" or record.phase ~= "FARMING" then
-		warn("LocalTrader Version 3: no FARMING handoff is pending")
+		debugLog("LocalTrader Version 3: no FARMING handoff is pending")
 		return
 	end
 	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
-		warn("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
+		debugLog("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
 		return
 	end
 
 	local attempt = (record.loadJobId == game.JobId and tonumber(record.loadAttempt)) or 0
 	if attempt >= CONFIG.FarmLoadMaxAttempts then
-		warn("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
+		debugLog("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
 		return
 	end
 	attempt = attempt + 1
@@ -455,15 +523,15 @@ local function loadQuantumOnyx()
 			latest.farmStatus = "LOAD_EXECUTED"
 			latest.farmLoadedAt = os.time()
 			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
+			debugLog("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
 		elseif attempt < CONFIG.FarmLoadMaxAttempts then
-			warn("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
+			debugLog("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
 			task.spawn(loadQuantumOnyx)
 		else
 			latest.farmStatus = "LOAD_FAILED"
 			latest.lastError = tostring(result)
 			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+			debugLog("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
 		end
 	end)
 end
@@ -472,7 +540,7 @@ local function handoffToFarming(sessionData)
 	if sessionData and sessionData.externalOrder then
 		-- Hub completion already changes desired_state to FARMING. The Android
 		-- watchdog owns the actual relaunch, so LocalTrader must not teleport.
-		warn("LocalTrader: Hub completion acknowledged; watchdog will relaunch farming")
+		debugLog("LocalTrader: Hub completion acknowledged; watchdog will relaunch farming")
 		return true
 	end
 	local record = {
@@ -509,22 +577,136 @@ local function reportStartupConfiguration()
 end
 
 if not reportStartupConfiguration() then
+	debugLog("startup stopped: Hub configuration could not be loaded")
+	return
+end
+
+-- FARMING mode is intentionally passive here: LocalTrader does not build the
+-- trading GUI or touch trade remotes. It only restores QuantumOnyx farming.
+if HubConfig.mode == "FARMING" then
+	debugLog("mode=FARMING; skipping trading initialization")
+	local farmingRecord = readHandoff()
+	if type(farmingRecord) ~= "table" or farmingRecord.phase ~= "FARMING" then
+		farmingRecord = {
+			version = 3,
+			phase = "FARMING",
+			farmStatus = "PENDING",
+			orderId = HttpService:GenerateGUID(false),
+			tradingJobId = CONFIG.TradingJobId,
+			previousJobId = game.JobId,
+			createdAt = os.time(),
+			loadJobId = nil,
+			loadAttempt = 0,
+		}
+		local saved, saveError = writeHandoff(farmingRecord)
+		if saved then
+			debugLog("created FARMING handoff")
+		else
+			debugLog("could not create FARMING handoff: " .. tostring(saveError))
+		end
+	else
+		debugLog("existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
+	end
+	task.defer(loadQuantumOnyx)
+	return
+end
+
+if HubConfig.mode ~= "TRADING" then
+	debugLog("unknown mode=" .. tostring(HubConfig.mode) .. "; stopping safely")
+	return
+end
+
+debugLog("mode=TRADING; initializing trading system")
+
+-- Blox Fruits requires the player to belong to a team before the trading
+-- system can operate.  The farming script already handles this; LocalTrader
+-- does the same when it enters TRADING mode so a freshly joined clone is ready
+-- without manual interaction.
+local function ensureTradingTeam()
+	if LocalPlayer.Team then
+		debugLog("team already selected: " .. tostring(LocalPlayer.Team.Name))
+		return true
+	end
+
+	debugLog("no team selected; waiting for DataLoaded")
+	local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
+	if not dataLoaded then
+		dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
+	end
+	if not dataLoaded then
+		debugLog("DataLoaded did not appear; cannot select team")
+		return false
+	end
+
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+	if not remotes then
+		debugLog("ReplicatedStorage.Remotes not found while selecting team")
+		return false
+	end
+
+	local commF = remotes:WaitForChild("CommF_", 15)
+	if not commF then
+		debugLog("CommF_ not found while selecting team")
+		return false
+	end
+
+	local function trySetTeam(remoteCommand)
+		local ok, result = pcall(function()
+			return commF:InvokeServer(remoteCommand, "Pirates")
+		end)
+		debugLog(string.format(
+			"team request %s Pirates -> ok=%s result=%s",
+			remoteCommand,
+			tostring(ok),
+			tostring(result)
+		))
+		return ok
+	end
+
+	-- Current Blox Fruits scripts commonly use SetTeam2.  Keep SetTeam as a
+	-- compatibility fallback because older versions/scripts used that command.
+	if not trySetTeam("SetTeam2") then
+		debugLog("SetTeam2 failed; trying SetTeam")
+		trySetTeam("SetTeam")
+	end
+
+	local deadline = os.clock() + 15
+	while os.clock() < deadline do
+		if LocalPlayer.Team then
+			debugLog("team selected: " .. tostring(LocalPlayer.Team.Name))
+			if LocalPlayer.Character then
+				return true
+			end
+			break
+		end
+		task.wait(0.25)
+	end
+
+	if not LocalPlayer.Team then
+		debugLog("team selection did not register after 15s")
+		return false
+	end
+
+	-- Selecting a team can respawn the character.  Wait for the new character
+	-- before the trading code starts touching the trade table.
+	local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	if character then
+		debugLog("character ready after team selection")
+		return true
+	end
+
+	debugLog("team selected but character was not available")
+	return false
+end
+
+if not ensureTradingTeam() then
+	debugLog("TRADING startup stopped: team selection failed")
 	return
 end
 
 -- JobId is intentionally not used to identify the persistent trading server.
 -- The watchdog's share-link launch selects that server; the Hub selects the order.
 local startupOrder = readExternalOrder()
-if startupOrder then
-	startupNotice(
-		"Hub order loaded: " .. tostring(startupOrder.item)
-		.. " x" .. tostring(startupOrder.quantity)
-		.. " -> " .. tostring(startupOrder.customer),
-		false
-	)
-else
-	warn("LocalTrader: no active Hub order at startup")
-end
 
 local startupNoticeGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 	and LocalPlayer.PlayerGui:FindFirstChild("LocalTraderStartupNotice")
