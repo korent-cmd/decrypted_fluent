@@ -416,34 +416,102 @@ class Controller:
         time.sleep(1)
 
     def launch(self, t: Target) -> bool:
-        """Launch farming/public/private configured server using the target's existing settings."""
+        """
+        Launch the exact configured Roblox clone.
+
+        Important: cloned Roblox packages do not necessarily register the same
+        VIEW/deep-link filters as the original app.  Therefore we first launch
+        the exact package through its LAUNCHER activity.  If a farming private
+        link exists, we then try the deep link against that same package.
+        """
         if not t.place_id:
             self.log.log(f"{t.label}: no place_id configured")
             return False
-        code = parse_private_link(t.private_link)
-        intents: List[str] = []
-        if code:
-            intents.append(
-                f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
-            )
-            intents.append(
-                f"roblox://placeId={urllib.parse.quote(t.place_id)}&linkCode={urllib.parse.quote(code)}"
-            )
-        intents.append(f"roblox://placeId={urllib.parse.quote(t.place_id)}")
-        intents.append(f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}")
 
-        for url in intents:
-            self.log.log(f"{t.label}: launching farming URL {url}")
-            # Keep -p for normal launch so the correct clone is selected.
+        package = shlex.quote(t.package)
+
+        # Step 1: start THIS clone directly.  This is the reliable fallback
+        # even when the clone does not accept a roblox:// VIEW intent.
+        self.log.log(f"{t.label}: starting exact package {t.package}")
+        p = self.s.root(
+            f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+            timeout=30,
+        )
+        if p.returncode == 0:
+            t.last_launch = time.time()
+            t.status = "launching"
+            self.log.log(f"{t.label}: exact package launcher accepted")
+        else:
+            self.log.log(
+                f"{t.label}: exact package launcher returned rc={p.returncode}"
+            )
+
+        # Give Android a moment to create the Roblox process before trying
+        # to hand it a place/private-server URI.
+        if self._wait(t, 8):
+            # If no private farming server is configured, the normal app launch
+            # is already enough; Roblox can continue from its normal entry point.
+            code = parse_private_link(t.private_link)
+            if not code:
+                return True
+
+            # Private farming server: try package-qualified deep links.
+            intents = [
+                (
+                    f"https://www.roblox.com/games/start?"
+                    f"placeId={urllib.parse.quote(t.place_id)}&"
+                    f"linkCode={urllib.parse.quote(code)}"
+                ),
+                (
+                    f"roblox://placeId={urllib.parse.quote(t.place_id)}&"
+                    f"linkCode={urllib.parse.quote(code)}"
+                ),
+            ]
+
+            for url in intents:
+                self.log.log(f"{t.label}: farming deep-link -> {url}")
+                p = self.s.root(
+                    "am start -W -a android.intent.action.VIEW -d "
+                    + shlex.quote(url)
+                    + " -p "
+                    + package,
+                    timeout=20,
+                )
+                if p.returncode == 0:
+                    t.last_launch = time.time()
+                    t.status = "launching"
+                    self.log.log(f"{t.label}: farming deep-link accepted")
+                    return True
+
+            # The clone is already running, so don't call the whole launch a
+            # failure merely because its deep-link filter rejected the URI.
+            self.log.log(
+                f"{t.label}: deep-link was not accepted by package; "
+                f"exact Roblox clone is nevertheless running"
+            )
+            return True
+
+        # Launcher did not produce a detectable process.  Try the package-
+        # qualified place URI as a final attempt.
+        urls = [
+            f"roblox://placeId={urllib.parse.quote(t.place_id)}",
+            f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}",
+        ]
+        for url in urls:
+            self.log.log(f"{t.label}: final package launch -> {url}")
             p = self.s.root(
                 "am start -W -a android.intent.action.VIEW -d "
-                + shlex.quote(url) + " -p " + shlex.quote(t.package),
+                + shlex.quote(url)
+                + " -p "
+                + package,
                 timeout=20,
             )
-            if p.returncode == 0:
+            if p.returncode == 0 and self._wait(t, 8):
                 t.last_launch = time.time()
                 t.status = "launching"
                 return True
+
+        self.log.log(f"{t.label}: all exact-package farming launch attempts failed")
         return False
 
     def launch_trading(self, t: Target, share_link: str) -> bool:
@@ -764,6 +832,17 @@ class Watchdog:
 
         if not running:
             t.not_running_streak += 1
+
+            # A freshly started watchdog must launch configured instances even
+            # when "crash-restart" is OFF.  That setting controls recovery from
+            # later crashes; it must not disable the initial auto-rejoin.
+            if t.last_launch <= 0 and t.not_running_streak >= 1:
+                self.log.log(f"{t.label}: initial launch")
+                self.restart(t, "initial launch")
+                t.not_running_streak = 0
+                self.heartbeat(t)
+                return
+
             if self.crash_restart_enabled and t.not_running_streak >= self.NOT_RUNNING_CONFIRM_TICKS:
                 # Confirmed across several consecutive polls, not just one
                 # possibly-flaky reading - restart into trading or farming.
