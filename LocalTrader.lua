@@ -130,7 +130,7 @@ local CONFIG = {
 	-- Server selection is controlled by the watchdog private-server share link.
 	TradingJobId = "",
 	HandoffFile = "LocalTrader_V3_Handoff.json",
-	-- rw.py publishes this into each ArceusX Workspace.  LocalTrader reads it
+	-- rw.py publishes this into each Workspace.  LocalTrader reads it
 	-- relative to its own executor Workspace, so every clone gets its own copy.
 	HubConfigFile = "LocalTrader_Hub.json",
 	HubPollInterval = 3,
@@ -572,7 +572,7 @@ local function reportStartupConfiguration()
 		startupNotice("Hub connection is not available. " .. tostring(configError), true)
 		return false
 	end
-	startupNotice("Hub connection loaded from this clone's ArceusX Workspace (mode: " .. HubConfig.mode .. ").", false)
+	startupNotice("Hub connection loaded from this clone's Workspace (mode: " .. HubConfig.mode .. ").", false)
 	return true
 end
 
