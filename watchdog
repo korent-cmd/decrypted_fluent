@@ -569,7 +569,7 @@ class Watchdog:
                     ordinal = 1
                 clone_name = f"RobloxClone{ordinal:03d}"
             target.clone_folder = clone_name
-            dirs = f"/storage/emulated/0/{clone_name}/ArceusX/Workspace"
+            dirs = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
         else:
             dirs = LOCALTRADER_WORKSPACE_GLOB
 
