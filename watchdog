@@ -39,7 +39,7 @@ ORDER_PATH = os.environ.get(
     "LOCALTRADER_ORDER_PATH",
     os.path.join(BASE_DIR, "LocalTrader_Order.json"),
 )
-LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/ArceusX/Workspace"
+LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
 LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
@@ -545,54 +545,97 @@ class Watchdog:
             self.log.log(f"{t.label}: hub event failed: {e}")
 
     def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
-        """Publish Hub connection/state into ArceusX clone Workspace.
-
-        Each clone has its own executor Workspace.  The config is deliberately
-        relative on the Lua side (readfile("LocalTrader_Hub.json")); rw.py
-        writes the corresponding absolute Android path here.
-        """
+        """Publish Hub connection/state into each clone's Arceus X Workspace."""
         if not self.hub.enabled:
+            self.log.log("LocalTrader config sync skipped: Hub is not enabled")
             return
 
         if target is not None:
             clone_name = target.clone_folder
+
             if not clone_name:
                 m = re.search(r"RobloxClone\d+", target.label or "")
                 clone_name = m.group(0) if m else ""
+
             if not clone_name:
-                # Auto-setup / old configs have no explicit mapping.  Use the
-                # target's ordinal in the configured target list as the clone
-                # number, which matches the normal RobloxClone001... layout.
                 try:
                     ordinal = self.targets.index(target) + 1
                 except ValueError:
                     ordinal = 1
                 clone_name = f"RobloxClone{ordinal:03d}"
+
             target.clone_folder = clone_name
-            dirs = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+
+            workspace = (
+                f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+            )
         else:
-            dirs = LOCALTRADER_WORKSPACE_GLOB
+            # Actual clone layout uses "Arceus X" with a space.
+            workspace = (
+                "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+            )
 
         payload = json.dumps({
             "version": 2,
             "hub_url": self.hub.base_url,
             "hub_token": self.hub.token,
             "hub_poll_sec": self.hub_poll_sec,
-            "mode": "TRADING" if target and target.hub_state == "TRADING" else "FARMING",
+            "mode": (
+                "TRADING"
+                if target and target.hub_state == "TRADING"
+                else "FARMING"
+            ),
             "account_id": target.hub_id if target else "",
         }, ensure_ascii=False, separators=(",", ":"))
-        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-        cmd = (
-            "for d in " + dirs + "; do "
-            "[ -d \"$d\" ] || continue; "
-            "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
-            "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
-            "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; "
-            "done"
-        )
+
+        encoded = base64.b64encode(
+            payload.encode("utf-8")
+        ).decode("ascii")
+
+        if target is not None:
+            # Quote the entire path because "Arceus X" contains a space.
+            workspace_q = shlex.quote(workspace)
+
+            cmd = (
+                "d=" + workspace_q + "; "
+                "[ -d \"$d\" ] || { "
+                "echo " + shlex.quote(
+                    f"Workspace does not exist: {workspace}"
+                ) + " >&2; "
+                "exit 2; "
+                "}; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) +
+                " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" +
+                LOCALTRADER_CONFIG_NAME + "\""
+            )
+        else:
+            # This branch supports syncing all clones.
+            cmd = (
+                "for d in /storage/emulated/0/RobloxClone*/"
+                "\"Arceus X\"/Workspace; do "
+                "[ -d \"$d\" ] || continue; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) +
+                " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" +
+                LOCALTRADER_CONFIG_NAME + "\"; "
+                "done"
+            )
+
         result = self.shell.root(cmd, timeout=15)
+
         if result.returncode != 0:
-            self.log.log(f"LocalTrader config sync failed: {result.stderr.strip()[:300]}")
+            self.log.log(
+                "LocalTrader config sync failed: "
+                + result.stderr.strip()[:500]
+            )
+        else:
+            self.log.log(
+                f"{target.label if target else 'all clones'}: "
+                f"LocalTrader_Hub.json synced"
+            )
 
     def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
         """Write the complete order for LocalTrader before opening Roblox."""
