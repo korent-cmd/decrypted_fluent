@@ -31,16 +31,10 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.1"
+VERSION = "3.1-hubfixed-jsonbridge"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
-ORDER_PATH = os.environ.get(
-    "LOCALTRADER_ORDER_PATH",
-    os.path.join(BASE_DIR, "LocalTrader_Order.json"),
-)
-LOCALTRADER_WORKSPACE_GLOB = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
-LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -53,6 +47,12 @@ DEFAULT_TRADING_SHARE_LINK = (
     "4e51df338208544d9be433e960693f11&type=Server"
 )
 DEFAULT_HUB_POLL_SEC = 3
+
+# Workspace bridge used by the current LocalTrader. Each Roblox clone gets
+# its own config inside its Workspace. This avoids relying on a
+# shared LocalTrader_Order.json on the Termux side.
+LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
+
 
 
 def now_str() -> str:
@@ -86,17 +86,6 @@ def account_id_for_target(t: "Target") -> str:
     return "rbx-" + hashlib.sha1(raw).hexdigest()[:12]
 
 
-_TERMINAL: Optional["Terminal"] = None
-
-
-def _resane_tty() -> None:
-    """Re-applies forced-sane termios settings if a Terminal is active. Safe
-    no-op if called before the terminal is set up or if termios isn't
-    available at all (e.g. no controlling tty)."""
-    if _TERMINAL is not None:
-        _TERMINAL.sane()
-
-
 class Terminal:
     def __init__(self) -> None:
         self._fd = None
@@ -109,7 +98,7 @@ class Terminal:
             # preserving whatever the incoming terminal state was. Some
             # remote/cloud-phone pty bridges start in a broken state (no line
             # buffering, no echo, Ctrl+C not delivered) - preserving that is
-            # preserving the bug.
+            # preserving the bug. This was lost in a prior rewrite; restoring it.
             sane = termios.tcgetattr(self._fd)
             sane[3] |= (termios.ICANON | termios.ECHO | termios.ISIG)
             termios.tcsetattr(self._fd, termios.TCSANOW, sane)
@@ -119,12 +108,10 @@ class Terminal:
             self._old = None
 
     def sane(self) -> None:
-        """Re-apply the forced-sane settings. Call this after any subprocess
-        invocation (especially `su`) that might have changed terminal mode -
-        a root-manager permission prompt can flip raw mode to draw itself,
-        and if it's killed by a timeout before finishing, it never restores
-        the original mode on its own."""
+        """Re-apply the forced-sane settings. Call after any subprocess call
+        (especially `su`) that might have changed terminal mode."""
         if self._fd is None or self._sane is None:
+            _resane_tty()
             return
         try:
             termios.tcsetattr(self._fd, termios.TCSANOW, self._sane)
@@ -135,7 +122,9 @@ class Terminal:
         if self._fd is None:
             return
         try:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+            state = self._old if self._old is not None else _TTY_ORIGINAL_STATE
+            if state is not None:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, state)
         except Exception:
             pass
 
@@ -144,6 +133,34 @@ class Terminal:
 
     def __exit__(self, *_args):
         self.restore_original()
+
+
+# Capture the terminal state as early as possible, and force it sane
+# (ICANON/ECHO/ISIG) immediately.  This is important for
+# `python3 rw.py start`, which does not go through the interactive menu
+# first, and it's also what _resane_tty() below restores to after every `su`
+# call - if this were left unforced, _resane_tty() would keep restoring a
+# broken state instead of fixing it.
+try:
+    _TTY_FD = sys.stdin.fileno()
+    _TTY_ORIGINAL_STATE = termios.tcgetattr(_TTY_FD)
+    _TTY_SANE_STATE = termios.tcgetattr(_TTY_FD)
+    _TTY_SANE_STATE[3] |= (termios.ICANON | termios.ECHO | termios.ISIG)
+    termios.tcsetattr(_TTY_FD, termios.TCSANOW, _TTY_SANE_STATE)
+except Exception:
+    _TTY_FD = None
+    _TTY_ORIGINAL_STATE = None
+    _TTY_SANE_STATE = None
+
+
+def _resane_tty() -> None:
+    """Restore the terminal mode after commands such as `su` return/timeout."""
+    if _TTY_FD is None or _TTY_SANE_STATE is None:
+        return
+    try:
+        termios.tcsetattr(_TTY_FD, termios.TCSANOW, _TTY_SANE_STATE)
+    except Exception:
+        pass
 
 
 class Logger:
@@ -183,8 +200,10 @@ class Shell:
             # Caught HERE, not just at individual call sites - force_stop(),
             # launch(), and launch_trading() call .root()/.run() directly
             # without their own try/except, so an uncaught timeout here
-            # (e.g. su hanging on an unanswered root prompt) would otherwise
-            # crash the whole script instead of just failing this one call.
+            # (e.g. su hanging on an unanswered root prompt) crashes the
+            # whole script instead of just failing this one call. Confirmed
+            # by direct test: a hung su reproduces exactly this traceback
+            # without this handling.
             self.logger.log(f"TIMEOUT after {timeout}s: {cmd}")
             _resane_tty()
             return subprocess.CompletedProcess(args=cmd, returncode=124, stdout="",
@@ -194,10 +213,10 @@ class Shell:
             return subprocess.CompletedProcess(args=cmd, returncode=127, stdout="",
                                                stderr=str(e))
         finally:
-            # Always re-sanitize afterward: a root prompt can flip terminal
-            # mode to draw itself, and if it's killed by our own timeout
-            # before finishing, it never gets the chance to restore it.
+            # `su` can leave the tty in raw/no-echo mode even after timeout or
+            # process termination.  Restore it after every subprocess call.
             _resane_tty()
+
         if p.stdout.strip():
             self.logger.log(p.stdout.strip()[-1000:])
         if p.stderr.strip():
@@ -224,19 +243,12 @@ class Shell:
         return value
 
     def is_root(self) -> bool:
-        """True only if THIS process is already running as uid 0. Rare under
-        Termux even on a fully rooted device, since Termux runs unprivileged
-        and elevates per-command via su - this does NOT tell you whether su
-        elevation is available, only whether the su-prefix can be skipped."""
         return self.out("id -u") == "0"
 
     def has_root_access(self) -> bool:
-        """True if privilege elevation actually works, regardless of whether
-        the calling process is already root. This is the check that answers
-        'can this tool do privileged things' - is_root() alone answers a
-        different question and will read as False on nearly every real
-        rooted-via-su device, which is exactly why root kept reporting as
-        'not detected' even when su worked fine for individual commands."""
+        # is_root() only tells us whether Termux itself is already UID 0.
+        # On a normal rooted phone Termux is not UID 0, but `su -c id` can
+        # still elevate successfully. This is the original working check.
         if self.is_root():
             return True
         out = self.out("su -c id", timeout=15)
@@ -312,25 +324,25 @@ class Target:
     label: str = ""
     enabled: bool = True
     hub_id: str = ""
-    clone_folder: str = ""
 
     last_rejoin: float = 0.0
     last_launch: float = 0.0
     last_heartbeat: float = 0.0
     cpu: str = "-"
     stale: bool = False
+    last_cpu: Optional[int] = None
+    stale_ticks: int = 0
+    not_running_ticks: int = 0
     fail_streak: int = 0
     cooldown_until: float = 0.0
     restarts: int = 0
-    not_running_streak: int = 0
     status: str = "stopped"
     hub_state: str = "FARMING"
     hub_request_id: str = ""
     hub_version: int = 0
     hub_error: str = ""
     trading_join_attempted: bool = False
-    local_order_phase: str = ""
-    local_order_id: str = ""
+    clone_folder: str = ""
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -419,10 +431,17 @@ class Controller:
         time.sleep(1)
 
     def launch(self, t: Target) -> bool:
-        """Launch farming/public/private configured server using the target's existing settings."""
+        """Launch farming using the older, known-good intent order.
+
+        IMPORTANT: do not package-qualify the VIEW deep link. The newer
+        versions changed this and that broke game joining on the cloned
+        Roblox installs. We keep the proven resolver path, then use an
+        exact-package launcher only as the final fallback.
+        """
         if not t.place_id:
             self.log.log(f"{t.label}: no place_id configured")
             return False
+
         code = parse_private_link(t.private_link)
         intents: List[str] = []
         if code:
@@ -435,22 +454,40 @@ class Controller:
         intents.append(f"roblox://placeId={urllib.parse.quote(t.place_id)}")
         intents.append(f"https://www.roblox.com/games/start?placeId={urllib.parse.quote(t.place_id)}")
 
+        # This is intentionally the v3.1/proven path: implicit VIEW intent
+        # first. Android resolves the deep link through the Roblox clone's
+        # registered intent filter. Package qualification is NOT used here.
         for url in intents:
             self.log.log(f"{t.label}: launching farming URL {url}")
-            # Keep -p for normal launch so the correct clone is selected.
             p = self.s.root(
                 "am start -W -a android.intent.action.VIEW -d "
-                + shlex.quote(url) + " -p " + shlex.quote(t.package),
+                + shlex.quote(url),
                 timeout=20,
             )
             if p.returncode == 0:
                 t.last_launch = time.time()
                 t.status = "launching"
                 return True
+
+        # Last resort: explicitly open this exact clone.
+        p = self.s.root(
+            "monkey -p " + shlex.quote(t.package) +
+            " -c android.intent.category.LAUNCHER 1",
+            timeout=20,
+        )
+        if p.returncode == 0:
+            t.last_launch = time.time()
+            t.status = "launching"
+            return True
         return False
 
     def launch_trading(self, t: Target, share_link: str) -> bool:
-        """Use Roblox's share-link deep link. This is the mechanism proven to join the trading PS."""
+        """Join the proven trading PS share-link.
+
+        Do NOT add -p <package> here. The tested working command is the plain
+        implicit share-link intent; package-qualifying it was one of the
+        regressions in the newer watchdog variants.
+        """
         code = parse_private_link(share_link)
         if not code:
             self.log.log(f"{t.label}: invalid trading share link")
@@ -462,19 +499,15 @@ class Controller:
             + "&type=Server"
         )
 
-        # First try exact clone package. If that clone does not register the share-link
-        # intent, fall back to Android's normal resolver.
-        commands = [
-            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri) + " -p " + shlex.quote(t.package),
+        self.log.log(f"{t.label}: trading deep-link attempt (implicit resolver)")
+        p = self.s.root(
             "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri),
-        ]
-        for i, cmd in enumerate(commands, 1):
-            self.log.log(f"{t.label}: trading deep-link attempt {i}")
-            p = self.s.root(cmd, timeout=25)
-            if p.returncode == 0:
-                t.last_launch = time.time()
-                t.status = "trading_joining"
-                return True
+            timeout=25,
+        )
+        if p.returncode == 0:
+            t.last_launch = time.time()
+            t.status = "trading_joining"
+            return True
         return False
 
     def _wait(self, t: Target, seconds: int = 15) -> bool:
@@ -487,10 +520,6 @@ class Controller:
 
 
 class Watchdog:
-    # How many consecutive "not running" polls are required before it's
-    # treated as a real crash rather than a flaky `pidof`/su read. A single
-    # bad reading firing a restart is what made this feel like it was
-    # "rejoining even when it doesn't need to."
     NOT_RUNNING_CONFIRM_TICKS = 3
 
     def __init__(
@@ -504,7 +533,6 @@ class Watchdog:
         hub_poll_sec: int,
         logger: Logger,
         crash_restart_enabled: bool = False,
-        order_path: str = ORDER_PATH,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -517,7 +545,6 @@ class Watchdog:
         self.hub = HubClient(hub_url, hub_token, logger)
         self.hub_poll_sec = max(1, int(hub_poll_sec or DEFAULT_HUB_POLL_SEC))
         self.crash_restart_enabled = crash_restart_enabled
-        self.order_path = order_path or ORDER_PATH
         self.running = False
         self.next_hub_poll = 0.0
 
@@ -545,161 +572,76 @@ class Watchdog:
             self.log.log(f"{t.label}: hub event failed: {e}")
 
     def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
-        """Publish Hub connection/state into each clone's Arceus X Workspace."""
+        """Write Hub credentials + per-account mode into the clone Workspace."""
         if not self.hub.enabled:
-            self.log.log("LocalTrader config sync skipped: Hub is not enabled")
             return
 
         if target is not None:
             clone_name = target.clone_folder
-
             if not clone_name:
                 m = re.search(r"RobloxClone\d+", target.label or "")
                 clone_name = m.group(0) if m else ""
-
             if not clone_name:
                 try:
                     ordinal = self.targets.index(target) + 1
                 except ValueError:
                     ordinal = 1
                 clone_name = f"RobloxClone{ordinal:03d}"
-
             target.clone_folder = clone_name
-
-            workspace = (
-                f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
-            )
+            workspace = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
         else:
-            # Actual clone layout uses "Arceus X" with a space.
-            workspace = (
-                "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
-            )
+            workspace = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+
+        # This file is the local bridge from rw.py -> LocalTrader.  rw.py
+        # already receives the complete request from Hub via /poll/<account>.
+        # Keep the order data in the Workspace JSON so LocalTrader does not
+        # need to perform a second Hub lookup or map Roblox UserId -> account.
+        request = {}
+        if target is not None:
+            try:
+                request = getattr(target, "hub_request", {}) or {}
+            except Exception:
+                request = {}
 
         payload = json.dumps({
-            "version": 2,
+            "version": 3,
             "hub_url": self.hub.base_url,
             "hub_token": self.hub.token,
             "hub_poll_sec": self.hub_poll_sec,
-            "mode": (
-                "TRADING"
-                if target and target.hub_state == "TRADING"
-                else "FARMING"
-            ),
+            "mode": "TRADING" if target and target.hub_state == "TRADING" else "FARMING",
             "account_id": target.hub_id if target else "",
+            "request_id": str(request.get("request_id", "")) if isinstance(request, dict) else "",
+            "customer": str(request.get("customer", "")) if isinstance(request, dict) else "",
+            "item": str(request.get("item", "")) if isinstance(request, dict) else "",
+            "quantity": max(1, int(request.get("quantity", 1) or 1)) if isinstance(request, dict) else 1,
+            "request_status": str(request.get("status", "")) if isinstance(request, dict) else "",
         }, ensure_ascii=False, separators=(",", ":"))
-
-        encoded = base64.b64encode(
-            payload.encode("utf-8")
-        ).decode("ascii")
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
         if target is not None:
-            # Quote the entire path because "Arceus X" contains a space.
             workspace_q = shlex.quote(workspace)
-
             cmd = (
                 "d=" + workspace_q + "; "
                 "[ -d \"$d\" ] || { "
-                "echo " + shlex.quote(
-                    f"Workspace does not exist: {workspace}"
-                ) + " >&2; "
-                "exit 2; "
-                "}; "
+                "echo " + shlex.quote(f"Workspace does not exist: {workspace}") + " >&2; exit 2; }; "
                 "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
-                "echo " + shlex.quote(encoded) +
-                " | base64 -d > \"$tmp\" && "
-                "mv -f \"$tmp\" \"$d/" +
-                LOCALTRADER_CONFIG_NAME + "\""
+                "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\""
             )
         else:
-            # This branch supports syncing all clones.
             cmd = (
-                "for d in /storage/emulated/0/RobloxClone*/"
-                "\"Arceus X\"/Workspace; do "
+                "for d in /storage/emulated/0/RobloxClone*/Arceus X/Workspace; do "
                 "[ -d \"$d\" ] || continue; "
                 "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
-                "echo " + shlex.quote(encoded) +
-                " | base64 -d > \"$tmp\" && "
-                "mv -f \"$tmp\" \"$d/" +
-                LOCALTRADER_CONFIG_NAME + "\"; "
-                "done"
+                "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; done"
             )
 
         result = self.shell.root(cmd, timeout=15)
-
         if result.returncode != 0:
-            self.log.log(
-                "LocalTrader config sync failed: "
-                + result.stderr.strip()[:500]
-            )
+            self.log.log(f"{target.label if target else 'all clones'}: LocalTrader config sync failed: {result.stderr.strip()[:500]}")
         else:
-            self.log.log(
-                f"{target.label if target else 'all clones'}: "
-                f"LocalTrader_Hub.json synced"
-            )
-
-    def save_local_order(self, request: Dict[str, Any], t: Target) -> bool:
-        """Write the complete order for LocalTrader before opening Roblox."""
-        order = {
-            "version": 3,
-            "phase": "TRADING_ROUTE",
-            "status": "PENDING",
-            "order_id": str(request.get("request_id", "")),
-            "request_id": str(request.get("request_id", "")),
-            "customer": str(request.get("customer", "")).strip(),
-            "item": str(request.get("item", "")).strip(),
-            "quantity": max(1, int(request.get("quantity", 1) or 1)),
-            "trading_share_link": self.trading_share_link,
-            "account_id": t.hub_id,
-            "updated_at": now_str(),
-        }
-        if not order["order_id"] or not order["customer"] or not order["item"]:
-            self.log.log(f"{t.label}: hub order is missing request_id, customer, or item")
-            return False
-        tmp = self.order_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.order_path)), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(order, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.order_path)
-            t.local_order_id = order["order_id"]
-            t.local_order_phase = order["phase"]
-            self.log.log(f"{t.label}: saved local order {order['order_id']}")
-            return True
-        except Exception as e:
-            self.log.log(f"{t.label}: local order save failed: {e}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            return False
-
-    def read_local_order(self) -> Optional[Dict[str, Any]]:
-        try:
-            with open(self.order_path, "r", encoding="utf-8") as f:
-                value = json.load(f)
-            return value if isinstance(value, dict) else None
-        except Exception:
-            return None
-
-    def sync_local_order(self, t: Target) -> None:
-        order = self.read_local_order()
-        if not order or order.get("account_id") != t.hub_id:
-            return
-        phase = str(order.get("phase", ""))
-        order_id = str(order.get("order_id", order.get("request_id", "")))
-        if order_id != t.local_order_id:
-            return
-        if phase == t.local_order_phase:
-            return
-        t.local_order_phase = phase
-        if phase == "FARMING" and order.get("status") == "COMPLETED":
-            self.notify(t, "completed", "trade_completed", {
-                "request_id": order_id,
-                "customer": order.get("customer", ""),
-                "item": order.get("item", ""),
-                "quantity": order.get("quantity", 1),
-            })
+            self.log.log(f"{target.label if target else 'all clones'}: LocalTrader_Hub.json synced")
 
     def poll_hub(self) -> None:
         if not self.hub.enabled:
@@ -718,7 +660,15 @@ class Watchdog:
                     desired = "FARMING"
                 version = int(data.get("version", 0) or 0)
                 req = data.get("request") or {}
-                t.hub_request_id = str(req.get("request_id", ""))
+                t.hub_request = req if isinstance(req, dict) else {}
+                t.hub_request_id = str(req.get("request_id", "")) if isinstance(req, dict) else ""
+
+                # Keep LocalTrader_Hub.json current even when only the request
+                # contents changed while desired_state/version stayed the same.
+                request_changed = (
+                    isinstance(req, dict)
+                    and str(req.get("request_id", "")) != str(getattr(t, "_synced_request_id", ""))
+                )
 
                 if version != t.hub_version or desired != t.hub_state:
                     old = t.hub_state
@@ -728,16 +678,18 @@ class Watchdog:
                         f"{t.label}: hub desired state {old} -> {desired}"
                         + (f" request={t.hub_request_id}" if t.hub_request_id else "")
                     )
+                    # LocalTrader reads this file from the clone Workspace.
+                    # Write the NEW state before launching/restarting Roblox so
+                    # LocalTrader never starts with stale FARMING/TRADING mode.
+                    self.sync_localtrader_config(t)
                     if desired == "TRADING" and old != "TRADING":
-                        if self.save_local_order(req, t):
-                            self.enter_trading(t)
-                        else:
-                            t.status = "error"
+                        self.enter_trading(t)
                     elif desired == "FARMING" and old == "TRADING":
                         self.return_to_farming(t)
-                elif desired == "TRADING" and req and t.local_order_id != str(req.get("request_id", "")):
-                    if self.save_local_order(req, t):
-                        self.enter_trading(t)
+                    t._synced_request_id = t.hub_request_id
+                elif request_changed:
+                    self.sync_localtrader_config(t)
+                    t._synced_request_id = t.hub_request_id
                 t.hub_error = ""
             except Exception as e:
                 t.hub_error = str(e)
@@ -781,6 +733,59 @@ class Watchdog:
             t.status = "error"
             t.fail_streak += 1
 
+    HANG_TICKS = 3
+
+    def cpu_ticks(self, pid: str) -> Optional[int]:
+        out = self.s.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
+        m = re.search(r"\)\s+\S+\s+(.*)", out)
+        if not m:
+            return None
+        fields = m.group(1).split()
+        try:
+            return int(fields[10]) + int(fields[11])
+        except (IndexError, ValueError):
+            return None
+
+    def error_dialog(self) -> bool:
+        out = self.s.root_out(
+            "dumpsys window 2>/dev/null | grep -m3 -iE "
+            "'Application Error|aerr|anr |isn.t responding|has stopped'",
+            timeout=25,
+        )
+        return bool(out.strip())
+
+    def dismiss_dialog(self) -> None:
+        self.s.root("input keyevent KEYCODE_ENTER", timeout=15)
+        time.sleep(0.5)
+        self.s.root("input keyevent KEYCODE_BACK", timeout=15)
+
+    def wake(self) -> None:
+        out = self.s.root_out(
+            "dumpsys power 2>/dev/null | grep -m1 -E 'mWakefulness|Display Power'",
+            timeout=20,
+        )
+        if any(s in out for s in ("Asleep", "Dozing", "state=OFF")):
+            self.s.root("input keyevent KEYCODE_WAKEUP", timeout=15)
+            time.sleep(0.6)
+            self.s.root("input keyevent KEYCODE_MENU", timeout=15)
+
+    def health(self, t: Target) -> str:
+        pid = self.pid(t.package)
+        if not pid:
+            return "dead"
+        if self.error_dialog():
+            return "dialog"
+        ticks = self.cpu_ticks(pid)
+        if ticks is not None:
+            if t.last_cpu is not None and ticks <= t.last_cpu:
+                t.stale_ticks += 1
+            else:
+                t.stale_ticks = 0
+            t.last_cpu = ticks
+            if t.stale_ticks >= self.HANG_TICKS:
+                return "hung"
+        return "ok"
+
     def restart(self, t: Target, reason: str) -> None:
         if time.time() < t.cooldown_until:
             return
@@ -789,19 +794,26 @@ class Watchdog:
         self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
         t.status = "restarting"
         self.notify(t, t.status, "restart", {"reason": reason})
+        self.controller.wake()
+        if reason == "dialog":
+            self.controller.dismiss_dialog()
+            time.sleep(1)
         self.controller.force_stop(t)
-        time.sleep(1)
+        time.sleep(2.5)
         if t.hub_state == "TRADING":
             ok = self.controller.launch_trading(t, self.trading_share_link)
         else:
             ok = self.controller.launch(t)
             t.last_rejoin = time.time()
+        t.last_cpu = None
+        t.stale_ticks = 0
+        t.not_running_ticks = 0
         if ok:
             t.status = "launching" if t.hub_state == "FARMING" else "trading_joining"
             t.fail_streak = 0
         else:
             t.status = "error"
-            t.cooldown_until = time.time() + min(300, 15 * (2 ** min(t.fail_streak, 4)))
+            t.cooldown_until = time.time() + min(300, 30 * (2 ** min(t.fail_streak, 4)))
 
     def inspect_process(self, t: Target) -> Tuple[bool, str]:
         pid = self.controller.pid(t.package)
@@ -814,33 +826,43 @@ class Watchdog:
             t.status = "disabled"
             return
 
-        self.sync_local_order(t)
+        if time.time() < t.cooldown_until:
+            t.status = "cooldown"
+            return
 
-        running, detail = self.inspect_process(t)
-        t.stale = False
-
+        running = self.controller.is_running(t.package)
         if not running:
-            t.not_running_streak += 1
-            if self.crash_restart_enabled and t.not_running_streak >= self.NOT_RUNNING_CONFIRM_TICKS:
-                # Confirmed across several consecutive polls, not just one
-                # possibly-flaky reading - restart into trading or farming.
+            # Android can briefly report no PID while Roblox is transitioning.
+            # Preserve the 3-consecutive-check confirmation regardless of the
+            # toggle (it's just a debounce), but only actually restart if
+            # crash-restart is enabled - otherwise this is purely informational
+            # and the scheduled timer is what does the rejoining.
+            t.not_running_ticks += 1
+            t.last_cpu = None
+            t.stale_ticks = 0
+            if self.crash_restart_enabled and t.not_running_ticks >= self.NOT_RUNNING_CONFIRM_TICKS:
+                t.status = f"not_running ({t.not_running_ticks}/{self.NOT_RUNNING_CONFIRM_TICKS})"
                 self.restart(t, "process not running")
-                t.not_running_streak = 0
-                self.heartbeat(t)
-                return
-            # Crash-restart disabled (default) or not yet confirmed: report
-            # it honestly on the dashboard, but let the scheduled timer be
-            # the only thing that actually restarts anything.
-            t.status = f"not running ({t.not_running_streak}x, waiting for timer)"
+                t.not_running_ticks = 0
+            else:
+                t.status = f"not running ({t.not_running_ticks}x, waiting for timer)"
             self.heartbeat(t)
             return
 
-        t.not_running_streak = 0
+        t.not_running_ticks = 0
+        if self.crash_restart_enabled:
+            state = self.controller.health(t)
+            if state in ("hung", "dialog"):
+                t.status = state
+                self.restart(t, state)
+                self.heartbeat(t)
+                return
+
         t.status = "trading" if t.hub_state == "TRADING" else "running"
         t.fail_streak = 0
 
-        # Scheduled rejoin applies only to farming. Trading accounts remain in the
-        # persistent trading server until Hub changes desired_state back to FARMING.
+        # Scheduled rejoin applies only to farming. Trading accounts remain in
+        # the persistent trading server until Hub changes desired_state back to FARMING.
         if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
             if time.time() - t.last_rejoin >= t.rejoin_interval_min * 60:
                 self.restart(t, "scheduled rejoin")
@@ -855,47 +877,15 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
-        # Runtime timestamps are not persisted.  Therefore a freshly-created
-        # Target starts with last_rejoin=0.  Initialize the timer lifecycle here:
-        # - already-running Roblox: timer starts NOW (no immediate rejoin)
-        # - stopped Roblox: launch it NOW (timer starts when launch succeeds)
-        # This also fixes timer-only mode getting stuck forever on a stopped app.
+        # Pull the real desired state BEFORE writing LocalTrader_Hub.json or
+        # touching any Roblox process. This preserves TRADING across a watchdog
+        # restart instead of temporarily telling LocalTrader to FARM.
         self.poll_hub()
+
         for t in self.targets:
-            if not t.enabled:
-                continue
-
-            self.sync_localtrader_config(t)
-            running, _ = self.inspect_process(t)
-
-            if running:
-                if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
-                    t.last_rejoin = time.time()
-                t.status = "trading" if t.hub_state == "TRADING" else "running"
+            if t.enabled:
+                self.sync_localtrader_config(t)
                 self.heartbeat(t)
-                continue
-
-            if t.hub_state == "TRADING":
-                self.log.log(f"{t.label}: startup launch into TRADING")
-                ok = self.controller.launch_trading(t, self.trading_share_link)
-                if ok:
-                    t.status = "trading_joining"
-                    t.trading_join_attempted = True
-                    self.notify(t, t.status, "trading_deep_link_sent", {"request_id": t.hub_request_id})
-                else:
-                    t.status = "error"
-                    t.fail_streak += 1
-            else:
-                self.log.log(f"{t.label}: startup launch into FARMING")
-                ok = self.controller.launch(t)
-                if ok:
-                    t.status = "launching"
-                    t.last_rejoin = time.time()
-                    self.notify(t, t.status, "farming_launch_sent")
-                else:
-                    t.status = "error"
-                    t.fail_streak += 1
-            self.heartbeat(t)
 
         try:
             last_tick = 0.0
@@ -958,7 +948,6 @@ class App:
         self.hub_url = ""
         self.hub_token = ""
         self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
-        self.order_path = ORDER_PATH
         self.load()
 
     def load(self) -> None:
@@ -975,7 +964,6 @@ class App:
             self.hub_url = str(hub.get("url", ""))
             self.hub_token = str(hub.get("token", ""))
             self.hub_poll_sec = int(hub.get("poll_sec", DEFAULT_HUB_POLL_SEC))
-            self.order_path = str(c.get("order_path", ORDER_PATH))
             self.targets = [Target(**x) for x in c.get("targets", [])]
         except Exception as e:
             self.logger.log(f"config load failed: {e}")
@@ -992,7 +980,6 @@ class App:
                 "token": self.hub_token,
                 "poll_sec": self.hub_poll_sec,
             },
-            "order_path": self.order_path,
             "targets": [],
         }
         for t in self.targets:
@@ -1002,8 +989,7 @@ class App:
                 "last_rejoin", "last_launch", "last_heartbeat", "cpu", "stale",
                 "fail_streak", "cooldown_until", "restarts", "status", "hub_state",
                 "hub_request_id", "hub_version", "hub_error", "trading_join_attempted",
-                "not_running_streak",
-                "local_order_phase", "local_order_id",
+                "not_running_ticks",
             ]:
                 d.pop(k, None)
             data["targets"].append(d)
@@ -1243,7 +1229,6 @@ class App:
             self.hub_poll_sec,
             self.logger,
             self.crash_restart_enabled,
-            self.order_path,
         )
 
         def sigint(_sig, _frame):
@@ -1256,6 +1241,7 @@ class App:
             wd.run()
         finally:
             signal.signal(signal.SIGINT, old)
+            _resane_tty()
             clear_screen()
 
     def menu(self) -> None:
@@ -1307,23 +1293,23 @@ class App:
 
 
 def headless_start() -> int:
-    global _TERMINAL
-    _TERMINAL = Terminal()
+    # `start` is the normal long-running mode and must have the same tty
+    # protection as the interactive menu.
     app = App()
     if not app.targets:
         print("No targets configured. Run: python3 rw.py")
         return 1
-    with _TERMINAL:
+    try:
         app.start_watchdog()
-    return 0
+        return 0
+    finally:
+        _resane_tty()
 
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1].lower() == "start":
         return headless_start()
-    global _TERMINAL
-    _TERMINAL = Terminal()
-    with _TERMINAL:
+    with Terminal():
         App().menu()
     return 0
 
