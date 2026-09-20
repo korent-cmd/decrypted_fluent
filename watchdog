@@ -437,6 +437,13 @@ class Controller:
         versions changed this and that broke game joining on the cloned
         Roblox installs. We keep the proven resolver path, then use an
         exact-package launcher only as the final fallback.
+
+        Every attempt is now confirmed by actually waiting for the process
+        to appear (self._wait), not just trusting `am start`'s own return
+        code. `am start` can return 0 even when the intent resolved to the
+        wrong screen (e.g. Roblox's home screen instead of the specific
+        game) or didn't fully complete - a 0 return code alone was making
+        the watchdog falsely believe a launch had succeeded.
         """
         if not t.place_id:
             self.log.log(f"{t.label}: no place_id configured")
@@ -464,10 +471,23 @@ class Controller:
                 + shlex.quote(url),
                 timeout=20,
             )
-            if p.returncode == 0:
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()
+            if out:
+                self.log.log(f"{t.label}: am start stdout: {out[:400]}")
+            if err:
+                self.log.log(f"{t.label}: am start stderr: {err[:400]}")
+
+            if p.returncode != 0:
+                self.log.log(f"{t.label}: am start rc={p.returncode}, trying next format")
+                continue
+
+            if self._wait(t, seconds=12):
                 t.last_launch = time.time()
                 t.status = "launching"
+                self.log.log(f"{t.label}: confirmed running after this intent")
                 return True
+            self.log.log(f"{t.label}: am start rc=0 but process never appeared, trying next format")
 
         # Last resort: explicitly open this exact clone.
         p = self.s.root(
@@ -475,10 +495,14 @@ class Controller:
             " -c android.intent.category.LAUNCHER 1",
             timeout=20,
         )
-        if p.returncode == 0:
+        if p.returncode == 0 and self._wait(t, seconds=15):
             t.last_launch = time.time()
             t.status = "launching"
+            self.log.log(f"{t.label}: launcher fallback confirmed running "
+                        f"(NOTE: this only opens the app, it does not join "
+                        f"the game - every deep-link format failed)")
             return True
+        self.log.log(f"{t.label}: every launch attempt failed, including launcher fallback")
         return False
 
     def launch_trading(self, t: Target, share_link: str) -> bool:
@@ -504,10 +528,20 @@ class Controller:
             "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri),
             timeout=25,
         )
-        if p.returncode == 0:
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        if out:
+            self.log.log(f"{t.label}: am start stdout: {out[:400]}")
+        if err:
+            self.log.log(f"{t.label}: am start stderr: {err[:400]}")
+
+        if p.returncode == 0 and self._wait(t, seconds=15):
             t.last_launch = time.time()
             t.status = "trading_joining"
+            self.log.log(f"{t.label}: confirmed running after trading intent")
             return True
+        self.log.log(f"{t.label}: trading launch failed "
+                    f"(rc={p.returncode}, confirmed_running={self.is_running(t.package)})")
         return False
 
     def _wait(self, t: Target, seconds: int = 15) -> bool:
@@ -588,9 +622,9 @@ class Watchdog:
                     ordinal = 1
                 clone_name = f"RobloxClone{ordinal:03d}"
             target.clone_folder = clone_name
-            workspace = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+            workspace = f"/storage/emulated/0/{clone_name}/Workspace"
         else:
-            workspace = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+            workspace = "/storage/emulated/0/RobloxClone*/Workspace"
 
         # This file is the local bridge from rw.py -> LocalTrader.  rw.py
         # already receives the complete request from Hub via /poll/<account>.
@@ -630,7 +664,7 @@ class Watchdog:
             )
         else:
             cmd = (
-                "for d in /storage/emulated/0/RobloxClone*/Arceus X/Workspace; do "
+                "for d in /storage/emulated/0/RobloxClone*/Workspace; do "
                 "[ -d \"$d\" ] || continue; "
                 "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
                 "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
