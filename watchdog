@@ -588,9 +588,9 @@ class Watchdog:
                     ordinal = 1
                 clone_name = f"RobloxClone{ordinal:03d}"
             target.clone_folder = clone_name
-            workspace = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+            workspace = f"/storage/emulated/0/{clone_name}/Workspace"
         else:
-            workspace = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+            workspace = "/storage/emulated/0/RobloxClone*/Workspace"
 
         # This file is the local bridge from rw.py -> LocalTrader.  rw.py
         # already receives the complete request from Hub via /poll/<account>.
@@ -630,7 +630,7 @@ class Watchdog:
             )
         else:
             cmd = (
-                "for d in /storage/emulated/0/RobloxClone*/Arceus X/Workspace; do "
+                "for d in /storage/emulated/0/RobloxClone*/Workspace; do "
                 "[ -d \"$d\" ] || continue; "
                 "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
                 "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
