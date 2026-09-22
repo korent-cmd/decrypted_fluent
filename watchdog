@@ -1,15 +1,48 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.1 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.2 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
-#   PC:    hub.py listening on 0.0.0.0:8787
-#   PHONE: rw.py polls http://PC_LAN_IP:8787 every few seconds
+#   PC:    hub.py listening on 0.0.0.0:8787 (or exposed via a tunnel)
+#   PHONE: rw.py polls that address every few seconds
 #
 # No environment variables are required. Hub URL/token live in
 # watchdog_config.json and can be edited from the menu.
-# ============================================================================
+#
+# ----------------------------------------------------------------------------
+# CHANGELOG (newest first) - check this against what you expect to confirm
+# you actually pulled the latest version.
+#
+# v3.2
+#   - FIX: tick() could report "waiting for timer" forever and never
+#     actually launch a not-running instance when crash_restart_enabled was
+#     off (the default) - this was the "auto rejoin doesn't start Roblox"
+#     bug. crash_restart_enabled now only gates aggressive restarts of a
+#     running-but-unhealthy process; launching a genuinely not-running
+#     instance (first launch, due schedule, or a dead TRADING session)
+#     always works regardless of that toggle.
+#   - FIX: launch()/launch_trading() declared success from `am start`'s own
+#     return code alone; _wait() (which confirms the process actually
+#     started) was defined but never called. Now every attempt is confirmed
+#     before being declared successful, and full am start stdout/stderr is
+#     logged so failures are diagnosable from watchdog.log.
+#
+# v3.1
+#   - Restored has_root_access() (real `su` elevation test) after a rewrite
+#     reverted it back to is_root() (checks if Termux itself is uid 0,
+#     which is a different and mostly-always-false question).
+#   - Restored crash_restart_enabled toggle (defaults OFF) after it was
+#     dropped in a rewrite, leaving crash-based restarts always-on with no
+#     way to disable them.
+#   - Restored forced ICANON/ECHO/ISIG terminal setup at startup, and
+#     restored TimeoutExpired/FileNotFoundError handling in Shell.run() -
+#     both had been silently dropped in the same rewrite.
+#   - Removed stdin=DEVNULL from su calls: this device's root prompt reads
+#     its confirmation from stdin, so cutting stdin off made su fail
+#     silently forever. Terminal is still force-resanitized after every
+#     su call regardless of what that call did to it.
+# ----------------------------------------------------------------------------
 
 import base64
 import dataclasses
@@ -31,7 +64,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.1-hubfixed-jsonbridge"
+VERSION = "3.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -624,7 +657,7 @@ class Watchdog:
             target.clone_folder = clone_name
             workspace = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
         else:
-            workspace = "/storage/emulated/0/RobloxClone*/Arcues X/Workspace"
+            workspace = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
 
         # This file is the local bridge from rw.py -> LocalTrader.  rw.py
         # already receives the complete request from Hub via /poll/<account>.
@@ -770,7 +803,7 @@ class Watchdog:
     HANG_TICKS = 3
 
     def cpu_ticks(self, pid: str) -> Optional[int]:
-        out = self.s.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
+        out = self.shell.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
         m = re.search(r"\)\s+\S+\s+(.*)", out)
         if not m:
             return None
@@ -781,7 +814,7 @@ class Watchdog:
             return None
 
     def error_dialog(self) -> bool:
-        out = self.s.root_out(
+        out = self.shell.root_out(
             "dumpsys window 2>/dev/null | grep -m3 -iE "
             "'Application Error|aerr|anr |isn.t responding|has stopped'",
             timeout=25,
@@ -789,22 +822,22 @@ class Watchdog:
         return bool(out.strip())
 
     def dismiss_dialog(self) -> None:
-        self.s.root("input keyevent KEYCODE_ENTER", timeout=15)
+        self.shell.root("input keyevent KEYCODE_ENTER", timeout=15)
         time.sleep(0.5)
-        self.s.root("input keyevent KEYCODE_BACK", timeout=15)
+        self.shell.root("input keyevent KEYCODE_BACK", timeout=15)
 
     def wake(self) -> None:
-        out = self.s.root_out(
+        out = self.shell.root_out(
             "dumpsys power 2>/dev/null | grep -m1 -E 'mWakefulness|Display Power'",
             timeout=20,
         )
         if any(s in out for s in ("Asleep", "Dozing", "state=OFF")):
-            self.s.root("input keyevent KEYCODE_WAKEUP", timeout=15)
+            self.shell.root("input keyevent KEYCODE_WAKEUP", timeout=15)
             time.sleep(0.6)
-            self.s.root("input keyevent KEYCODE_MENU", timeout=15)
+            self.shell.root("input keyevent KEYCODE_MENU", timeout=15)
 
     def health(self, t: Target) -> str:
-        pid = self.pid(t.package)
+        pid = self.controller.pid(t.package)
         if not pid:
             return "dead"
         if self.error_dialog():
@@ -828,9 +861,9 @@ class Watchdog:
         self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
         t.status = "restarting"
         self.notify(t, t.status, "restart", {"reason": reason})
-        self.controller.wake()
+        self.wake()
         if reason == "dialog":
-            self.controller.dismiss_dialog()
+            self.dismiss_dialog()
             time.sleep(1)
         self.controller.force_stop(t)
         time.sleep(2.5)
@@ -905,7 +938,7 @@ class Watchdog:
 
         t.not_running_ticks = 0
         if self.crash_restart_enabled:
-            state = self.controller.health(t)
+            state = self.health(t)
             if state in ("hung", "dialog"):
                 t.status = state
                 self.restart(t, state)
