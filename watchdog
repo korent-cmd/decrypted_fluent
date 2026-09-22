@@ -28,6 +28,22 @@
 #     before being declared successful, and full am start stdout/stderr is
 #     logged so failures are diagnosable from watchdog.log.
 #
+# v3.2-rollback (auto-rejoin only)
+#   - tick()'s not-running / scheduled-rejoin decision logic reverted to the
+#     v3.1 behavior at the user's request, because that behavior was
+#     confirmed working and the v3.2 "due"-gated rewrite was not rejoining
+#     reliably in practice. Concretely: a not-running instance is launched
+#     immediately on its very first tick (t.last_launch <= 0), with no
+#     confirm-tick debounce and independent of crash_restart_enabled;
+#     afterwards, a not-running instance is only auto-relaunched if
+#     crash_restart_enabled is ON and stays not-running for
+#     NOT_RUNNING_CONFIRM_TICKS consecutive ticks. Scheduled rejoin (the
+#     rejoin_interval_min timer) is only evaluated while the process IS
+#     running, exactly as in v3.1. Everything else in this file (Hub
+#     polling, LocalTrader config sync, hang/dialog detection, wake,
+#     launch()/launch_trading() URL handling and confirmation, etc.) is
+#     unchanged from v3.2.
+#
 # v3.1
 #   - Restored has_root_access() (real `su` elevation test) after a rewrite
 #     reverted it back to is_root() (checks if Termux itself is uid 0,
@@ -224,9 +240,9 @@ class Shell:
             # redirected to DEVNULL. Some root-manager prompts on this class
             # of device are text-based and read the yes/no answer from
             # stdin rather than showing a graphical system dialog - cutting
-            # stdin off makes su fail silently forever, since the prompt can
-            # never be answered. We rely on _resane_tty() below to clean up
-            # any terminal-mode side effects instead of blocking input.
+            # stdin off makes su fail silently forever. We rely on
+            # _resane_tty() below to clean up any terminal-mode side effects
+            # instead of blocking input.
             p = subprocess.run(cmd, shell=True, text=True, capture_output=True,
                               timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -803,7 +819,7 @@ class Watchdog:
     HANG_TICKS = 3
 
     def cpu_ticks(self, pid: str) -> Optional[int]:
-        out = self.shell.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
+        out = self.s.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
         m = re.search(r"\)\s+\S+\s+(.*)", out)
         if not m:
             return None
@@ -814,7 +830,7 @@ class Watchdog:
             return None
 
     def error_dialog(self) -> bool:
-        out = self.shell.root_out(
+        out = self.s.root_out(
             "dumpsys window 2>/dev/null | grep -m3 -iE "
             "'Application Error|aerr|anr |isn.t responding|has stopped'",
             timeout=25,
@@ -822,22 +838,22 @@ class Watchdog:
         return bool(out.strip())
 
     def dismiss_dialog(self) -> None:
-        self.shell.root("input keyevent KEYCODE_ENTER", timeout=15)
+        self.s.root("input keyevent KEYCODE_ENTER", timeout=15)
         time.sleep(0.5)
-        self.shell.root("input keyevent KEYCODE_BACK", timeout=15)
+        self.s.root("input keyevent KEYCODE_BACK", timeout=15)
 
     def wake(self) -> None:
-        out = self.shell.root_out(
+        out = self.s.root_out(
             "dumpsys power 2>/dev/null | grep -m1 -E 'mWakefulness|Display Power'",
             timeout=20,
         )
         if any(s in out for s in ("Asleep", "Dozing", "state=OFF")):
-            self.shell.root("input keyevent KEYCODE_WAKEUP", timeout=15)
+            self.s.root("input keyevent KEYCODE_WAKEUP", timeout=15)
             time.sleep(0.6)
-            self.shell.root("input keyevent KEYCODE_MENU", timeout=15)
+            self.s.root("input keyevent KEYCODE_MENU", timeout=15)
 
     def health(self, t: Target) -> str:
-        pid = self.controller.pid(t.package)
+        pid = self.pid(t.package)
         if not pid:
             return "dead"
         if self.error_dialog():
@@ -861,9 +877,9 @@ class Watchdog:
         self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
         t.status = "restarting"
         self.notify(t, t.status, "restart", {"reason": reason})
-        self.wake()
+        self.controller.wake()
         if reason == "dialog":
-            self.dismiss_dialog()
+            self.controller.dismiss_dialog()
             time.sleep(1)
         self.controller.force_stop(t)
         time.sleep(2.5)
@@ -889,6 +905,22 @@ class Watchdog:
         return True, pid
 
     def tick(self, t: Target) -> None:
+        # --- ROLLED BACK TO v3.1 AUTO-REJOIN LOGIC (per user request) ---
+        # v3.1 behavior, unchanged except for method/field names that also
+        # exist in v3.2 (self.controller.is_running, t.not_running_ticks,
+        # t.last_cpu/t.stale_ticks resets):
+        #   - A never-yet-launched target (t.last_launch <= 0) is launched
+        #     immediately, with no confirm-tick debounce and regardless of
+        #     crash_restart_enabled.
+        #   - After that, a not-running target is only auto-relaunched if
+        #     crash_restart_enabled is ON and it has been confirmed
+        #     not-running for NOT_RUNNING_CONFIRM_TICKS consecutive ticks.
+        #     With crash_restart_enabled OFF (the default), the dashboard
+        #     just reports "waiting for timer" - v3.1 did not have a
+        #     not-running fallback to the rejoin-interval timer.
+        #   - The rejoin_interval_min scheduled-rejoin timer is only
+        #     evaluated while the process IS running (farming only, never
+        #     while TRADING), exactly as in v3.1.
         if not t.enabled:
             t.status = "disabled"
             return
@@ -897,48 +929,34 @@ class Watchdog:
             t.status = "cooldown"
             return
 
-        now = time.time()
-        due = t.rejoin_interval_min > 0 and (
-            t.last_rejoin == 0 or now - t.last_rejoin >= t.rejoin_interval_min * 60
-        )
-
         running = self.controller.is_running(t.package)
         if not running:
-            # Android can briefly report no PID while Roblox is transitioning,
-            # so debounce a few ticks before acting. But once confirmed,
-            # actually launching a not-running instance is always the
-            # watchdog's job - crash_restart_enabled only controls whether to
-            # aggressively restart something that IS running but looks
-            # unhealthy (hangs, error dialogs), not whether to ever start
-            # something that isn't running at all. TRADING accounts recover
-            # unconditionally once confirmed (an assigned trade sitting dead
-            # helps nobody and has no "scheduled interval" concept); FARMING
-            # accounts recover once confirmed AND due (or never launched).
             t.not_running_ticks += 1
             t.last_cpu = None
             t.stale_ticks = 0
 
-            confirmed = t.not_running_ticks >= self.NOT_RUNNING_CONFIRM_TICKS
-            should_launch = confirmed and (t.hub_state == "TRADING" or due)
-
-            if should_launch:
-                if t.hub_state == "TRADING":
-                    reason = "trading session not running"
-                elif t.last_rejoin == 0:
-                    reason = "initial join"
-                else:
-                    reason = "scheduled rejoin (was not running)"
+            if t.last_launch <= 0:
+                self.log.log(f"{t.label}: initial launch")
                 t.status = "launching"
-                self.restart(t, reason)
+                self.restart(t, "initial launch")
                 t.not_running_ticks = 0
-            else:
-                t.status = f"not running ({t.not_running_ticks}x, waiting for timer)"
+                self.heartbeat(t)
+                return
+
+            if self.crash_restart_enabled and t.not_running_ticks >= self.NOT_RUNNING_CONFIRM_TICKS:
+                t.status = "launching"
+                self.restart(t, "process not running")
+                t.not_running_ticks = 0
+                self.heartbeat(t)
+                return
+
+            t.status = f"not running ({t.not_running_ticks}x, waiting for timer)"
             self.heartbeat(t)
             return
 
         t.not_running_ticks = 0
         if self.crash_restart_enabled:
-            state = self.health(t)
+            state = self.controller.health(t)
             if state in ("hung", "dialog"):
                 t.status = state
                 self.restart(t, state)
@@ -948,10 +966,11 @@ class Watchdog:
         t.status = "trading" if t.hub_state == "TRADING" else "running"
         t.fail_streak = 0
 
-        # Scheduled rejoin applies only to farming. Trading accounts remain in
-        # the persistent trading server until Hub changes desired_state back to FARMING.
-        if due and t.hub_state != "TRADING":
-            self.restart(t, "scheduled rejoin")
+        # Scheduled rejoin applies only to farming, and only while the
+        # process is confirmed running (v3.1 behavior).
+        if t.hub_state != "TRADING" and t.rejoin_interval_min > 0:
+            if time.time() - t.last_rejoin >= t.rejoin_interval_min * 60:
+                self.restart(t, "scheduled rejoin")
 
         self.heartbeat(t)
 
