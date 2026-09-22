@@ -18,10 +18,18 @@
 # forever - there was no not-running timer, only a running-timer (scheduled
 # rejoin), and that check is unreachable while the process is down. Added an
 # unconditional initial-launch branch (t.last_launch <= 0) that fires
-# regardless of crash_restart_enabled, same as later versions. Nothing else
-# in this file was changed.
+# regardless of crash_restart_enabled, same as later versions.
+#
+# PATCH 2: restored the LocalTrader_Hub.json workspace-sync layer (Hub
+# credentials + per-account FARMING/TRADING mode + current trade request,
+# written into each clone's Workspace so LocalTrader can read it locally
+# instead of doing its own Hub lookup). launch()/launch_trading()/restart()
+# are untouched from this file - only poll_hub()/enter_trading()/
+# return_to_farming()/run() gained the sync calls, plus a new
+# sync_localtrader_config() method and a clone_folder field on Target.
 # ----------------------------------------------------------------------------
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -57,6 +65,11 @@ DEFAULT_TRADING_SHARE_LINK = (
     "4e51df338208544d9be433e960693f11&type=Server"
 )
 DEFAULT_HUB_POLL_SEC = 3
+
+# Workspace bridge used by the current LocalTrader. Each Roblox clone gets
+# its own config inside its Workspace. This avoids relying on a
+# shared LocalTrader_Order.json on the Termux side.
+LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
 
 
 def now_str() -> str:
@@ -332,6 +345,7 @@ class Target:
     hub_version: int = 0
     hub_error: str = ""
     trading_join_attempted: bool = False
+    clone_folder: str = ""
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -543,6 +557,78 @@ class Watchdog:
             t.hub_error = str(e)
             self.log.log(f"{t.label}: hub event failed: {e}")
 
+    def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
+        """Write Hub credentials + per-account mode into the clone Workspace."""
+        if not self.hub.enabled:
+            return
+
+        if target is not None:
+            clone_name = target.clone_folder
+            if not clone_name:
+                m = re.search(r"RobloxClone\d+", target.label or "")
+                clone_name = m.group(0) if m else ""
+            if not clone_name:
+                try:
+                    ordinal = self.targets.index(target) + 1
+                except ValueError:
+                    ordinal = 1
+                clone_name = f"RobloxClone{ordinal:03d}"
+            target.clone_folder = clone_name
+            workspace = f"/storage/emulated/0/{clone_name}/Arceus X/Workspace"
+        else:
+            workspace = "/storage/emulated/0/RobloxClone*/Arceus X/Workspace"
+
+        # This file is the local bridge from rw.py -> LocalTrader.  rw.py
+        # already receives the complete request from Hub via /poll/<account>.
+        # Keep the order data in the Workspace JSON so LocalTrader does not
+        # need to perform a second Hub lookup or map Roblox UserId -> account.
+        request = {}
+        if target is not None:
+            try:
+                request = getattr(target, "hub_request", {}) or {}
+            except Exception:
+                request = {}
+
+        payload = json.dumps({
+            "version": 3,
+            "hub_url": self.hub.base_url,
+            "hub_token": self.hub.token,
+            "hub_poll_sec": self.hub_poll_sec,
+            "mode": "TRADING" if target and target.hub_state == "TRADING" else "FARMING",
+            "account_id": target.hub_id if target else "",
+            "request_id": str(request.get("request_id", "")) if isinstance(request, dict) else "",
+            "customer": str(request.get("customer", "")) if isinstance(request, dict) else "",
+            "item": str(request.get("item", "")) if isinstance(request, dict) else "",
+            "quantity": max(1, int(request.get("quantity", 1) or 1)) if isinstance(request, dict) else 1,
+            "request_status": str(request.get("status", "")) if isinstance(request, dict) else "",
+        }, ensure_ascii=False, separators=(",", ":"))
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        if target is not None:
+            workspace_q = shlex.quote(workspace)
+            cmd = (
+                "d=" + workspace_q + "; "
+                "[ -d \"$d\" ] || { "
+                "echo " + shlex.quote(f"Workspace does not exist: {workspace}") + " >&2; exit 2; }; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\""
+            )
+        else:
+            cmd = (
+                "for d in /storage/emulated/0/RobloxClone*/Arceus X/Workspace; do "
+                "[ -d \"$d\" ] || continue; "
+                "tmp=\"$d/." + LOCALTRADER_CONFIG_NAME + ".tmp\"; "
+                "echo " + shlex.quote(encoded) + " | base64 -d > \"$tmp\" && "
+                "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; done"
+            )
+
+        result = self.shell.root(cmd, timeout=15)
+        if result.returncode != 0:
+            self.log.log(f"{target.label if target else 'all clones'}: LocalTrader config sync failed: {result.stderr.strip()[:500]}")
+        else:
+            self.log.log(f"{target.label if target else 'all clones'}: LocalTrader_Hub.json synced")
+
     def poll_hub(self) -> None:
         if not self.hub.enabled:
             return
@@ -560,7 +646,15 @@ class Watchdog:
                     desired = "FARMING"
                 version = int(data.get("version", 0) or 0)
                 req = data.get("request") or {}
-                t.hub_request_id = str(req.get("request_id", ""))
+                t.hub_request = req if isinstance(req, dict) else {}
+                t.hub_request_id = str(req.get("request_id", "")) if isinstance(req, dict) else ""
+
+                # Keep LocalTrader_Hub.json current even when only the request
+                # contents changed while desired_state/version stayed the same.
+                request_changed = (
+                    isinstance(req, dict)
+                    and str(req.get("request_id", "")) != str(getattr(t, "_synced_request_id", ""))
+                )
 
                 if version != t.hub_version or desired != t.hub_state:
                     old = t.hub_state
@@ -570,10 +664,18 @@ class Watchdog:
                         f"{t.label}: hub desired state {old} -> {desired}"
                         + (f" request={t.hub_request_id}" if t.hub_request_id else "")
                     )
+                    # LocalTrader reads this file from the clone Workspace.
+                    # Write the NEW state before launching/restarting Roblox so
+                    # LocalTrader never starts with stale FARMING/TRADING mode.
+                    self.sync_localtrader_config(t)
                     if desired == "TRADING" and old != "TRADING":
                         self.enter_trading(t)
                     elif desired == "FARMING" and old == "TRADING":
                         self.return_to_farming(t)
+                    t._synced_request_id = t.hub_request_id
+                elif request_changed:
+                    self.sync_localtrader_config(t)
+                    t._synced_request_id = t.hub_request_id
                 t.hub_error = ""
             except Exception as e:
                 t.hub_error = str(e)
@@ -582,6 +684,7 @@ class Watchdog:
     def enter_trading(self, t: Target) -> None:
         if not t.enabled:
             return
+        self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: ENTER TRADING")
         t.status = "switching_to_trading"
         self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
@@ -600,6 +703,7 @@ class Watchdog:
             self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
 
     def return_to_farming(self, t: Target) -> None:
+        self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: RETURN TO FARMING")
         t.status = "switching_to_farming"
         self.notify(t, t.status, "return_to_farming")
@@ -704,8 +808,14 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
+        # Pull the real desired state BEFORE writing LocalTrader_Hub.json or
+        # touching any Roblox process. This preserves TRADING across a watchdog
+        # restart instead of temporarily telling LocalTrader to FARM.
+        self.poll_hub()
+
         for t in self.targets:
             if t.enabled:
+                self.sync_localtrader_config(t)
                 self.heartbeat(t)
 
         try:
