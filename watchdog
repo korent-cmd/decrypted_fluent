@@ -14,6 +14,32 @@
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
 #
+# v3.3
+#   - FIX: restart() called self.controller.wake()/self.controller.dismiss_dialog(),
+#     but those methods live on Watchdog (self), not Controller - every restart
+#     (i.e. every auto-rejoin) threw AttributeError before ever reaching
+#     force_stop()/launch(), so nothing ever actually relaunched. Same class of
+#     bug also existed in tick()'s self.controller.health(t) call and in
+#     cpu_ticks()/error_dialog()/dismiss_dialog()/wake()/health() themselves,
+#     which referenced self.s (Controller's shell handle) instead of self.shell
+#     (Watchdog's). All corrected to call/reference the right object.
+#   - ADD: restart() now rewrites LocalTrader_Hub.json (sync_localtrader_config)
+#     immediately before every relaunch, not just Hub-triggered transitions, so
+#     a game that relaunches on its own (e.g. a post-trade in-game teleport,
+#     ahead of our own poll_hub() cycle) never reads a stale mode.
+#   - FIX: sync_localtrader_config() could raise on bad Hub data (e.g. a
+#     non-numeric quantity) and is now exception-safe end to end. This matters
+#     beyond restart(): poll_hub() updates t.hub_state BEFORE calling this, so
+#     an uncaught exception there used to permanently swallow a TRADING/FARMING
+#     transition - the next poll wouldn't see a "change" either, since
+#     t.hub_state already matched.
+#   - ADD: launch()/launch_trading() now try a package-scoped `-p <package>`
+#     variant of each intent first. Purely additive: if it doesn't confirm the
+#     game joined, execution falls through to the exact same unqualified
+#     attempts that already worked, unchanged. Fixes Android popping an
+#     "Open with..." chooser when multiple Roblox clones all register the same
+#     link and none is resolvable unambiguously.
+#
 # v3.2
 #   - FIX: tick() could report "waiting for timer" forever and never
 #     actually launch a not-running instance when crash_restart_enabled was
@@ -64,7 +90,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.2"
+VERSION = "3.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -498,6 +524,36 @@ class Controller:
         # first. Android resolves the deep link through the Roblox clone's
         # registered intent filter. Package qualification is NOT used here.
         for url in intents:
+            # NEW in v3.3, purely additive: try this same link scoped to just
+            # this package first. -p only narrows which package's intent
+            # filters may resolve the VIEW action - the app still handles the
+            # link exactly as it would implicitly, it just stops Android from
+            # offering a same-domain "Open with..." chooser when several
+            # Roblox clones are installed side by side and all declare the
+            # same intent filter. This is NOT the same as an explicit
+            # component (-n package/Activity), which is what broke game
+            # joining previously (see v3.1 note below) by bypassing intent
+            # filter matching entirely. If this doesn't confirm running, we
+            # fall straight through to the exact unqualified attempt that
+            # already worked, unchanged.
+            self.log.log(f"{t.label}: launching farming URL {url} (package-scoped)")
+            p_scoped = self.s.root(
+                "am start -W -a android.intent.action.VIEW -d "
+                + shlex.quote(url) + " -p " + shlex.quote(t.package),
+                timeout=20,
+            )
+            out_scoped = (p_scoped.stdout or "").strip()
+            err_scoped = (p_scoped.stderr or "").strip()
+            if out_scoped:
+                self.log.log(f"{t.label}: am start (package-scoped) stdout: {out_scoped[:400]}")
+            if err_scoped:
+                self.log.log(f"{t.label}: am start (package-scoped) stderr: {err_scoped[:400]}")
+            if p_scoped.returncode == 0 and self._wait(t, seconds=12):
+                t.last_launch = time.time()
+                t.status = "launching"
+                self.log.log(f"{t.label}: confirmed running after package-scoped intent")
+                return True
+
             self.log.log(f"{t.label}: launching farming URL {url}")
             p = self.s.root(
                 "am start -W -a android.intent.action.VIEW -d "
@@ -541,9 +597,11 @@ class Controller:
     def launch_trading(self, t: Target, share_link: str) -> bool:
         """Join the proven trading PS share-link.
 
-        Do NOT add -p <package> here. The tested working command is the plain
-        implicit share-link intent; package-qualifying it was one of the
-        regressions in the newer watchdog variants.
+        v3.3: tries a package-scoped (-p) attempt first (see the matching
+        comment in launch() for why that differs from the -n component
+        targeting that caused the original regression), then falls straight
+        through, unchanged, to the plain implicit share-link intent below -
+        that fallback is still the tested working baseline and is left as-is.
         """
         code = parse_private_link(share_link)
         if not code:
@@ -555,6 +613,24 @@ class Controller:
             + urllib.parse.quote(code)
             + "&type=Server"
         )
+
+        self.log.log(f"{t.label}: trading deep-link attempt (package-scoped)")
+        p_scoped = self.s.root(
+            "am start -W -a android.intent.action.VIEW -d " + shlex.quote(uri)
+            + " -p " + shlex.quote(t.package),
+            timeout=25,
+        )
+        out_scoped = (p_scoped.stdout or "").strip()
+        err_scoped = (p_scoped.stderr or "").strip()
+        if out_scoped:
+            self.log.log(f"{t.label}: am start (package-scoped) stdout: {out_scoped[:400]}")
+        if err_scoped:
+            self.log.log(f"{t.label}: am start (package-scoped) stderr: {err_scoped[:400]}")
+        if p_scoped.returncode == 0 and self._wait(t, seconds=15):
+            t.last_launch = time.time()
+            t.status = "trading_joining"
+            self.log.log(f"{t.label}: confirmed running after package-scoped trading intent")
+            return True
 
         self.log.log(f"{t.label}: trading deep-link attempt (implicit resolver)")
         p = self.s.root(
