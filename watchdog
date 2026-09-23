@@ -639,10 +639,27 @@ class Watchdog:
             self.log.log(f"{t.label}: hub event failed: {e}")
 
     def sync_localtrader_config(self, target: Optional[Target] = None) -> None:
-        """Write Hub credentials + per-account mode into the clone Workspace."""
+        """Write Hub credentials + per-account mode into the clone Workspace.
+
+        Best-effort by design: every caller (restart(), poll_hub()'s
+        enter_trading()/return_to_farming() dispatch, run()) depends on this
+        never raising. poll_hub() in particular updates t.hub_state BEFORE
+        calling this - if this threw there, the state-change dispatch below
+        it would be skipped, and since t.hub_state already matches the new
+        value, the next poll wouldn't detect a "change" either, silently and
+        permanently dropping the transition. So the whole body is guarded;
+        a failure here (bad Hub data, missing Workspace, a denied su prompt)
+        is logged and swallowed, never allowed to block a caller.
+        """
         if not self.hub.enabled:
             return
+        try:
+            self._sync_localtrader_config_inner(target)
+        except Exception as e:
+            label = target.label if target else "all clones"
+            self.log.log(f"{label}: LocalTrader config sync failed: {e}")
 
+    def _sync_localtrader_config_inner(self, target: Optional[Target] = None) -> None:
         if target is not None:
             clone_name = target.clone_folder
             if not clone_name:
@@ -869,6 +886,8 @@ class Watchdog:
         # our own poll_hub() cycle) while LocalTrader_Hub.json still holds a stale
         # mode from before, and the in-game startup notice reports the wrong state
         # even though t.hub_state itself is current.
+        # sync_localtrader_config() is itself exception-safe (see its docstring),
+        # so this can never block the relaunch below it.
         self.sync_localtrader_config(t)
         self.wake()
         if reason == "dialog":
