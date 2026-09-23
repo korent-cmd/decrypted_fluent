@@ -539,7 +539,7 @@ local TradeFunction = Remotes:WaitForChild("TradeFunction", 15)
 local CommF = Remotes:WaitForChild("CommF_", 15)
 assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
 
-local state = "TRADING"
+local state = "IDLE"
 local running = false
 local session = nil
 local latestTradeState = nil
