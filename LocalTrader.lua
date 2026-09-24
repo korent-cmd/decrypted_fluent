@@ -513,6 +513,47 @@ if not reportStartupConfiguration() then
 	return
 end
 
+-- FARMING mode is intentionally passive here: LocalTrader does not build the
+-- trading GUI or touch trade remotes. It only restores QuantumOnyx farming.
+-- Ported from an older version of this script: HubConfig.mode was already
+-- being loaded from LocalTrader_Hub.json by reportStartupConfiguration()
+-- above, but nothing branched on it - the trading GUI and trade-remote
+-- wiring ran unconditionally regardless of mode. This is the missing gate.
+if HubConfig.mode == "FARMING" then
+	warn("LocalTrader: mode=FARMING; skipping trading initialization")
+	local farmingRecord = readHandoff()
+	if type(farmingRecord) ~= "table" or farmingRecord.phase ~= "FARMING" then
+		farmingRecord = {
+			version = 3,
+			phase = "FARMING",
+			farmStatus = "PENDING",
+			orderId = HttpService:GenerateGUID(false),
+			tradingJobId = CONFIG.TradingJobId,
+			previousJobId = game.JobId,
+			createdAt = os.time(),
+			loadJobId = nil,
+			loadAttempt = 0,
+		}
+		local saved, saveError = writeHandoff(farmingRecord)
+		if saved then
+			warn("LocalTrader: created FARMING handoff")
+		else
+			warn("LocalTrader: could not create FARMING handoff: " .. tostring(saveError))
+		end
+	else
+		warn("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
+	end
+	task.defer(loadQuantumOnyx)
+	return
+end
+
+if HubConfig.mode ~= "TRADING" then
+	warn("LocalTrader: unknown mode=" .. tostring(HubConfig.mode) .. "; stopping safely")
+	return
+end
+
+warn("LocalTrader: mode=TRADING; initializing trading system")
+
 local startupOrder = readExternalOrder()
 if startupOrder then
 	startupNotice(
