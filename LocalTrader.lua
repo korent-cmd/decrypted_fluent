@@ -2,8 +2,6 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 
-warn("LocalTrader: script execution started")
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
@@ -12,6 +10,98 @@ local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- ============================================================================
+-- PERSISTENT DEBUG LOG
+-- Mirrors every warn() call onto an on-screen panel too, since executor
+-- console output may not always be visible. Ported from an older version of
+-- this script. Implemented as a wrapper around the global warn() rather than
+-- renaming every call site to a separate debugLog() function, so nothing
+-- else in the file needs to change - every existing warn("...") call below
+-- automatically shows up on the panel too.
+-- ============================================================================
+local debugLogBox
+local debugLines = {}
+local DEBUG_MAX_LINES = 120
+
+local function createDebugGui()
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+	if not playerGui then
+		return false
+	end
+
+	local old = playerGui:FindFirstChild("LocalTraderDebugGui")
+	if old then
+		old:Destroy()
+	end
+
+	local debugGui = Instance.new("ScreenGui")
+	debugGui.Name = "LocalTraderDebugGui"
+	debugGui.ResetOnSpawn = false
+	debugGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local frame = Instance.new("Frame")
+	frame.Name = "DebugFrame"
+	frame.Size = UDim2.fromOffset(520, 190)
+	frame.Position = UDim2.new(1, -540, 0, 20)
+	frame.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+	frame.BorderSizePixel = 0
+	frame.Parent = debugGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 7)
+	corner.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -12, 0, 25)
+	title.Position = UDim2.fromOffset(8, 3)
+	title.BackgroundTransparency = 1
+	title.Text = "LocalTrader diagnostics"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.Parent = frame
+
+	debugLogBox = Instance.new("TextBox")
+	debugLogBox.Size = UDim2.new(1, -16, 1, -34)
+	debugLogBox.Position = UDim2.fromOffset(8, 29)
+	debugLogBox.BackgroundColor3 = Color3.fromRGB(8, 10, 14)
+	debugLogBox.TextColor3 = Color3.fromRGB(215, 220, 230)
+	debugLogBox.Font = Enum.Font.Code
+	debugLogBox.TextSize = 11
+	debugLogBox.TextXAlignment = Enum.TextXAlignment.Left
+	debugLogBox.TextYAlignment = Enum.TextYAlignment.Top
+	debugLogBox.TextWrapped = false
+	debugLogBox.MultiLine = true
+	debugLogBox.TextEditable = false
+	debugLogBox.ClearTextOnFocus = false
+	debugLogBox.Text = ""
+	debugLogBox.Parent = frame
+
+	debugGui.Parent = playerGui
+	return true
+end
+
+local nativeWarn = warn
+warn = function(...)
+	local parts = {}
+	for i = 1, select("#", ...) do
+		parts[#parts + 1] = tostring(select(i, ...))
+	end
+	local line = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
+	debugLines[#debugLines + 1] = line
+	while #debugLines > DEBUG_MAX_LINES do
+		table.remove(debugLines, 1)
+	end
+	if debugLogBox and debugLogBox.Parent then
+		debugLogBox.Text = table.concat(debugLines, "\n")
+	end
+	return nativeWarn(...)
+end
+
+createDebugGui()
+warn("LocalTrader: script execution started")
 
 local function startupNotice(message, isError)
 	local playerGui = LocalPlayer and (LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -553,6 +643,93 @@ if HubConfig.mode ~= "TRADING" then
 end
 
 warn("LocalTrader: mode=TRADING; initializing trading system")
+
+-- Blox Fruits requires the player to belong to a team before the trading
+-- system can operate. Ported from an older version of this script - the
+-- currently-maintained version had no equivalent at all, so a freshly
+-- joined clone with no team selected would sit at the trade table unable
+-- to trade until someone manually picked a team.
+local function ensureTradingTeam()
+	if LocalPlayer.Team then
+		warn("LocalTrader: team already selected: " .. tostring(LocalPlayer.Team.Name))
+		return true
+	end
+
+	warn("LocalTrader: no team selected; waiting for DataLoaded")
+	local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
+	if not dataLoaded then
+		dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
+	end
+	if not dataLoaded then
+		warn("LocalTrader: DataLoaded did not appear; cannot select team")
+		return false
+	end
+
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+	if not remotes then
+		warn("LocalTrader: ReplicatedStorage.Remotes not found while selecting team")
+		return false
+	end
+
+	local commF = remotes:WaitForChild("CommF_", 15)
+	if not commF then
+		warn("LocalTrader: CommF_ not found while selecting team")
+		return false
+	end
+
+	local function trySetTeam(remoteCommand)
+		local ok, result = pcall(function()
+			return commF:InvokeServer(remoteCommand, "Pirates")
+		end)
+		warn(string.format(
+			"LocalTrader: team request %s Pirates -> ok=%s result=%s",
+			remoteCommand,
+			tostring(ok),
+			tostring(result)
+		))
+		return ok
+	end
+
+	-- Current Blox Fruits scripts commonly use SetTeam2. Keep SetTeam as a
+	-- compatibility fallback because older versions/scripts used that command.
+	if not trySetTeam("SetTeam2") then
+		warn("LocalTrader: SetTeam2 failed; trying SetTeam")
+		trySetTeam("SetTeam")
+	end
+
+	local deadline = os.clock() + 15
+	while os.clock() < deadline do
+		if LocalPlayer.Team then
+			warn("LocalTrader: team selected: " .. tostring(LocalPlayer.Team.Name))
+			if LocalPlayer.Character then
+				return true
+			end
+			break
+		end
+		task.wait(0.25)
+	end
+
+	if not LocalPlayer.Team then
+		warn("LocalTrader: team selection did not register after 15s")
+		return false
+	end
+
+	-- Selecting a team can respawn the character. Wait for the new character
+	-- before the trading code starts touching the trade table.
+	local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	if character then
+		warn("LocalTrader: character ready after team selection")
+		return true
+	end
+
+	warn("LocalTrader: team selected but character was not available")
+	return false
+end
+
+if not ensureTradingTeam() then
+	warn("LocalTrader: TRADING startup stopped: team selection failed")
+	return
+end
 
 local startupOrder = readExternalOrder()
 if startupOrder then
