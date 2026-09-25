@@ -1122,6 +1122,13 @@ class Watchdog:
                             t.status = "error"
                             self.log.log(f"{t.label}: tick exception: {e}")
                             self.log.log(traceback.format_exc()[-2000:])
+                # Redraw every pass so the screen reflects current status - it
+                # used to be printed exactly once, before this loop started,
+                # so it stayed frozen on whatever state existed at that
+                # instant (typically "stopped", before the first tick had
+                # even run) no matter what actually happened afterward.
+                clear_screen()
+                print(self.render())
                 # One-second granularity means Hub commands are seen promptly even
                 # when the normal watchdog interval is much larger.
                 time.sleep(1)
