@@ -480,7 +480,38 @@ class Controller:
             m = re.search(r"\b(\d+)\b", out)
             if m:
                 return m.group(1)
+        # Fallback for installs whose actual running process name doesn't
+        # match their package name at all - common with APK-cloned or
+        # repackaged Roblox instances, which can leave pidof and the
+        # name-grep above unable to ever find the process even while it's
+        # genuinely running. Every installed package still gets its own
+        # unique Android UID from the package manager, so resolve that and
+        # match a running process by UID instead. Purely additive: only
+        # tried if both checks above found nothing, so it can't change
+        # behavior for anything that already worked. EXPERIMENTAL: the
+        # exact `ps -o` column syntax varies by device/toolchain (toybox
+        # vs busybox) and hasn't been verified on-device - if this doesn't
+        # work, App.diagnostics() (menu option 6) now prints the raw output
+        # of every step here per target, so we can see exactly what came
+        # back instead of guessing again.
+        uid = self.resolve_uid(package)
+        if uid is not None:
+            out = self.s.root_out(
+                f"ps -Ao PID,UID,NAME 2>/dev/null | awk -v u={uid} '$2==u{{print $1; exit}}'"
+            )
+            if out.strip():
+                return out.strip().split()[0]
         return ""
+
+    def resolve_uid(self, package: str) -> Optional[int]:
+        out = self.s.root_out(f"pm list packages -U 2>/dev/null | grep -F {shlex.quote('package:' + package + ' ')}")
+        for token in out.split():
+            if token.startswith("uid:"):
+                try:
+                    return int(token[4:])
+                except ValueError:
+                    return None
+        return None
 
     def is_running(self, package: str) -> bool:
         return bool(self.pid(package))
@@ -1360,8 +1391,25 @@ class App:
         print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
         print(f"Trading link: {self.trading_share_link}")
         print()
+        controller = Controller(self.shell, self.logger)
         for t in self.targets:
-            print(f"{t.label}: package={t.package} running={self.shell.out('pidof ' + shlex.quote(t.package)) or 'no'} hub_id={t.hub_id}")
+            print(f"{t.label}: package={t.package} hub_id={t.hub_id}")
+            pidof_out = self.shell.out("pidof " + shlex.quote(t.package))
+            name_grep_out = self.shell.out(
+                "ps -A 2>/dev/null | grep -F " + shlex.quote(t.package) + " | grep -v grep"
+            )
+            resolved_uid = controller.resolve_uid(t.package)
+            uid_ps_out = ""
+            if resolved_uid is not None:
+                uid_ps_out = self.shell.out(
+                    f"ps -Ao PID,UID,NAME 2>/dev/null | awk -v u={resolved_uid} '$2==u{{print $1, $3}}'"
+                )
+            detected_pid = controller.pid(t.package)
+            print(f"    pidof {t.package} -> {pidof_out!r}")
+            print(f"    ps -A grep {t.package} -> {name_grep_out!r}")
+            print(f"    resolved uid -> {resolved_uid!r}")
+            print(f"    ps by uid {resolved_uid} -> {uid_ps_out!r}")
+            print(f"    => Controller.pid() result: {detected_pid or 'NOT FOUND'}")
         print()
         input("Press Enter...")
 
