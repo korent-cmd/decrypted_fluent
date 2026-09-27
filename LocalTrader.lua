@@ -589,6 +589,120 @@ local function handoffToFarming(sessionData)
 	return true
 end
 
+-- Fetched here, before the FARMING/TRADING mode gate below, because
+-- inventory reporting (used by both modes, for the Hub's make-order
+-- worker-matching) needs CommF for getTradeInventory, and the item catalog
+-- for turning raw ItemIds into named/tradable fruit amounts. TradeEvent and
+-- TradeFunction stay fetched further down since only actual trading needs
+-- them.
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+assert(Remotes, "ReplicatedStorage.Remotes was not found")
+local CommF = Remotes:WaitForChild("CommF_", 15)
+assert(CommF, "CommF_ remote was not found")
+
+local function normalize(value)
+	return tostring(value or ""):lower():gsub("[%s%p]+", "")
+end
+
+local function loadItemIds()
+	if type(_G.ItemIds) == "table" then
+		return _G.ItemIds
+	end
+
+	if type(loadstring) == "function" and type(game.HttpGet) == "function" then
+		local ok, result = pcall(function()
+			return loadstring(game:HttpGet(CONFIG.ItemIdsUrl))()
+		end)
+		if ok and type(result) == "table" then
+			return result
+		end
+	end
+
+	if type(readfile) == "function" and type(loadstring) == "function" then
+		local ok, result = pcall(function()
+			return loadstring(readfile("itemIds.lua"))()
+		end)
+		if ok and type(result) == "table" then
+			return result
+		end
+	end
+
+	return nil
+end
+
+local ItemIds = loadItemIds()
+
+local function readInventory()
+	local ok, result = pcall(function()
+		return CommF:InvokeServer("getTradeInventory")
+	end)
+	if not ok then
+		return nil, "getTradeInventory failed: " .. tostring(result)
+	end
+	if type(result) ~= "table" or type(result.Items) ~= "table" then
+		return nil, "getTradeInventory returned an unexpected shape"
+	end
+	return result.Items
+end
+
+local function getAvailablePhysicalFruits(items)
+	local available = {}
+	for _, item in pairs(items or {}) do
+		local id = tonumber(item.ItemId)
+		local record = id and ItemIds and ItemIds[id]
+		local tradeType = tostring(item.Type or "")
+		local isTradeableType = tradeType == "PhysicalMoveset"
+			or tradeType == "SpecialPhysicalFruit"
+		if id and record and record[1] == "PhysicalFruit" and isTradeableType
+			and (tonumber(item.Amount) or 0) > 0 then
+			available[#available + 1] = {
+				id = id,
+				name = tostring(record[2]),
+				amount = tonumber(item.Amount) or 0,
+			}
+		end
+	end
+	table.sort(available, function(a, b)
+		return a.name:lower() < b.name:lower()
+	end)
+	return available
+end
+
+-- Reports current tradable-fruit inventory to the Hub so make-order can scan
+-- across accounts and pick one that actually has the requested item. Only
+-- sends when Hub is configured; silently does nothing otherwise.
+local function reportInventoryToHub()
+	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
+		return
+	end
+	local inventory, err = readInventory()
+	if not inventory then
+		warn("LocalTrader: inventory report skipped: " .. tostring(err))
+		return
+	end
+	local available = getAvailablePhysicalFruits(inventory)
+	local data, reqErr = hubRequest("POST", "/api/v1/inventory", {
+		account_id = HubConfig.accountId,
+		items = available,
+	})
+	if not data then
+		warn("LocalTrader: inventory report failed: " .. tostring(reqErr))
+	end
+end
+
+-- Started here (before the mode gate) so it keeps running even when the mode
+-- gate below returns for FARMING - task.spawn detaches into its own thread
+-- immediately, independent of the parent script chunk reaching `return`.
+task.spawn(function()
+	while true do
+		-- Reuses the Hub's own configured poll interval so this stays in
+		-- sync with however frequently the watchdog itself is polling,
+		-- rather than a separate hardcoded constant.
+		task.wait(HubConfig.poll or CONFIG.HubPollInterval)
+		reportInventoryToHub()
+	end
+end)
+
 local function reportStartupConfiguration()
 	local configured, configError = loadHubConfig()
 	if not configured then
@@ -749,12 +863,8 @@ if startupNoticeGui then
 	startupNoticeGui:Destroy()
 end
 
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-assert(Remotes, "ReplicatedStorage.Remotes was not found")
-
 local TradeEvent = Remotes:WaitForChild("TradeEvent", 15)
 local TradeFunction = Remotes:WaitForChild("TradeFunction", 15)
-local CommF = Remotes:WaitForChild("CommF_", 15)
 assert(TradeEvent and TradeFunction and CommF, "Trade remotes were not found")
 
 local state = "IDLE"
@@ -783,37 +893,14 @@ local function connect(signal, callback)
 	return connection
 end
 
-local function normalize(value)
-	return tostring(value or ""):lower():gsub("[%s%p]+", "")
-end
-
-local function loadItemIds()
-	if type(_G.ItemIds) == "table" then
-		return _G.ItemIds
-	end
-
-	if type(loadstring) == "function" and type(game.HttpGet) == "function" then
-		local ok, result = pcall(function()
-			return loadstring(game:HttpGet(CONFIG.ItemIdsUrl))()
-		end)
-		if ok and type(result) == "table" then
-			return result
-		end
-	end
-
-	if type(readfile) == "function" and type(loadstring) == "function" then
-		local ok, result = pcall(function()
-			return loadstring(readfile("itemIds.lua"))()
-		end)
-		if ok and type(result) == "table" then
-			return result
-		end
-	end
-
-	return nil
-end
-
-local ItemIds = loadItemIds()
+-- Reuses the single ItemIds catalog already loaded before the mode gate
+-- (for inventory reporting) instead of fetching it a second time here. Two
+-- independent fetches were previously each capable of falling back
+-- differently (HttpGet succeeding for one, only the local file for the
+-- other), which could silently diverge into two different catalogs: one
+-- baked into the inventory-report closure from before the mode gate, and a
+-- second used by everything below. A single shared table can't diverge
+-- from itself.
 local itemByName = {}
 
 if ItemIds then
@@ -892,42 +979,6 @@ local function inventoryEntry(items, wantedId)
 		end
 	end
 	return nil
-end
-
-local function readInventory()
-	local ok, result = pcall(function()
-		return CommF:InvokeServer("getTradeInventory")
-	end)
-	if not ok then
-		return nil, "getTradeInventory failed: " .. tostring(result)
-	end
-	if type(result) ~= "table" or type(result.Items) ~= "table" then
-		return nil, "getTradeInventory returned an unexpected shape"
-	end
-	return result.Items
-end
-
-local function getAvailablePhysicalFruits(items)
-	local available = {}
-	for _, item in pairs(items or {}) do
-		local id = tonumber(item.ItemId)
-		local record = id and ItemIds and ItemIds[id]
-		local tradeType = tostring(item.Type or "")
-		local isTradeableType = tradeType == "PhysicalMoveset"
-			or tradeType == "SpecialPhysicalFruit"
-		if id and record and record[1] == "PhysicalFruit" and isTradeableType
-			and (tonumber(item.Amount) or 0) > 0 then
-			available[#available + 1] = {
-				id = id,
-				name = tostring(record[2]),
-				amount = tonumber(item.Amount) or 0,
-			}
-		end
-	end
-	table.sort(available, function(a, b)
-		return a.name:lower() < b.name:lower()
-	end)
-	return available
 end
 
 local function inventoryAmount(items, wantedId)
