@@ -13,11 +13,11 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
 -- ============================================================================
 -- PERSISTENT DEBUG LOG
--- Mirrors every warn() call onto an on-screen panel too, since executor
+-- Mirrors every debugLog() call onto an on-screen panel too, since executor
 -- console output may not always be visible. Ported from an older version of
--- this script. Implemented as a wrapper around the global warn() rather than
+-- this script. Implemented as a wrapper around the global debugLog() rather than
 -- renaming every call site to a separate debugLog() function, so nothing
--- else in the file needs to change - every existing warn("...") call below
+-- else in the file needs to change - every existing debugLog("...") call below
 -- automatically shows up on the panel too.
 -- ============================================================================
 local debugLogBox
@@ -83,8 +83,14 @@ local function createDebugGui()
 	return true
 end
 
-local nativeWarn = warn
-warn = function(...)
+-- IMPORTANT: never reassign the global warn (or any other standard global).
+-- QuantumOnyx's "stop skidding" refusal is almost certainly an anti-tamper
+-- check for exactly that kind of hook - a previous version of this script
+-- did override debugLog() to feed the debug panel, which is the most likely
+-- cause of QuantumOnyx failing to load. debugLog() below calls the real,
+-- untouched global debugLog() for console visibility, but is never assigned
+-- over it.
+local function debugLog(...)
 	local parts = {}
 	for i = 1, select("#", ...) do
 		parts[#parts + 1] = tostring(select(i, ...))
@@ -97,17 +103,17 @@ warn = function(...)
 	if debugLogBox and debugLogBox.Parent then
 		debugLogBox.Text = table.concat(debugLines, "\n")
 	end
-	return nativeWarn(...)
+	warn(...)
 end
 
 createDebugGui()
-warn("LocalTrader: script execution started")
+debugLog("LocalTrader: script execution started")
 
 local function startupNotice(message, isError)
 	local playerGui = LocalPlayer and (LocalPlayer:FindFirstChildOfClass("PlayerGui")
 		or LocalPlayer:WaitForChild("PlayerGui", 10))
 	if not playerGui then
-		warn("LocalTrader: " .. message)
+		debugLog("LocalTrader: " .. message)
 		return
 	end
 	local existing = playerGui:FindFirstChild("LocalTraderStartupNotice")
@@ -128,7 +134,7 @@ local function startupNotice(message, isError)
 	label.Font = Enum.Font.Gotham
 	label.Text = message
 	label.Parent = gui
-	warn("LocalTrader: " .. message)
+	debugLog("LocalTrader: " .. message)
 	return gui
 end
 
@@ -294,7 +300,7 @@ end
 local function readExternalOrder()
 	local configured, configError = loadHubConfig()
 	if not configured then
-		warn("LocalTrader: " .. tostring(configError))
+		debugLog("LocalTrader: " .. tostring(configError))
 		return nil
 	end
 	if HubConfig.mode ~= "TRADING" then
@@ -303,14 +309,14 @@ local function readExternalOrder()
 
 	local ok, contents = pcall(readfile, CONFIG.HubConfigFile)
 	if not ok or type(contents) ~= "string" or contents == "" then
-		warn("LocalTrader: Workspace Hub config disappeared while reading order")
+		debugLog("LocalTrader: Workspace Hub config disappeared while reading order")
 		return nil
 	end
 	local decodedOk, data = pcall(function()
 		return HttpService:JSONDecode(contents)
 	end)
 	if not decodedOk or type(data) ~= "table" then
-		warn("LocalTrader: Workspace Hub config contains invalid JSON")
+		debugLog("LocalTrader: Workspace Hub config contains invalid JSON")
 		return nil
 	end
 
@@ -322,7 +328,7 @@ local function readExternalOrder()
 	local accountId = tostring(data.account_id or HubConfig.accountId or "")
 
 	if requestId == "" or customer == "" or item == "" then
-		warn(
+		debugLog(
 			"LocalTrader: TRADING mode but order fields are incomplete"
 			.. " request=" .. requestId
 			.. " customer=" .. customer
@@ -332,7 +338,7 @@ local function readExternalOrder()
 		return nil
 	end
 
-	warn(
+	debugLog(
 		"LocalTrader: local order received request=" .. requestId
 		.. " customer=" .. customer
 		.. " item=" .. item
@@ -376,10 +382,10 @@ local function writeExternalOrder(order, phase, status)
 		extra = extra,
 	})
 	if not data then
-		warn("LocalTrader: failed to report trade completion: " .. tostring(err))
+		debugLog("LocalTrader: failed to report trade completion: " .. tostring(err))
 		return false
 	end
-	warn("LocalTrader: trade completion reported to Hub")
+	debugLog("LocalTrader: trade completion reported to Hub")
 	return data.ok ~= false
 end
 
@@ -409,7 +415,7 @@ local function retryTeleport(mode, record)
 		return
 	end
 	if teleportAttempt >= CONFIG.TeleportMaxAttempts then
-		warn("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
+		debugLog("LocalTrader Version 3: " .. mode .. " teleport retry limit reached")
 		return
 	end
 	teleportAttempt = teleportAttempt + 1
@@ -431,17 +437,17 @@ local function retryTeleport(mode, record)
 		end)
 		if ok then
 			teleportInFlight = true
-			warn(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
+			debugLog(string.format("LocalTrader Version 3: %s teleport requested (attempt %d)", mode, attempt))
 			task.delay(15, function()
 				if teleportInFlight and not teleportReachedDestination(mode, record) then
 					teleportInFlight = false
-					warn("LocalTrader Version 3: teleport did not complete; retrying")
+					debugLog("LocalTrader Version 3: teleport did not complete; retrying")
 					task.spawn(retryTeleport, mode, record)
 				end
 			end)
 		else
 			teleportInFlight = false
-			warn("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
+			debugLog("LocalTrader Version 3: " .. mode .. " teleport failed: " .. teleportErrorText(result))
 			task.spawn(retryTeleport, mode, record)
 		end
 	end)
@@ -463,7 +469,7 @@ TeleportService.TeleportInitFailed:Connect(function(player, result)
 		return
 	end
 	teleportInFlight = false
-	warn("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
+	debugLog("LocalTrader Version 3: " .. teleportMode .. " teleport init failed: " .. teleportErrorText(result))
 	local record = readHandoff()
 	if type(record) == "table" then
 		task.spawn(retryTeleport, teleportMode, record)
@@ -503,7 +509,7 @@ local function ensureConfiguredOrder()
 	end
 	local saved, saveError = writeHandoff(configured)
 	if not saved then
-		warn("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
+		debugLog("LocalTrader Version 3: could not save configured order: " .. tostring(saveError))
 		return nil
 	end
 	return configured
@@ -512,17 +518,17 @@ end
 local function loadQuantumOnyx()
 	local record = readHandoff()
 	if type(record) ~= "table" or record.phase ~= "FARMING" then
-		warn("LocalTrader Version 3: no FARMING handoff is pending")
+		debugLog("LocalTrader Version 3: no FARMING handoff is pending")
 		return
 	end
 	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
-		warn("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
+		debugLog("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
 		return
 	end
 
 	local attempt = (record.loadJobId == game.JobId and tonumber(record.loadAttempt)) or 0
 	if attempt >= CONFIG.FarmLoadMaxAttempts then
-		warn("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
+		debugLog("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
 		return
 	end
 	attempt = attempt + 1
@@ -548,22 +554,22 @@ local function loadQuantumOnyx()
 			latest.farmStatus = "LOAD_EXECUTED"
 			latest.farmLoadedAt = os.time()
 			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
+			debugLog("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
 		elseif attempt < CONFIG.FarmLoadMaxAttempts then
-			warn("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
+			debugLog("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
 			task.spawn(loadQuantumOnyx)
 		else
 			latest.farmStatus = "LOAD_FAILED"
 			latest.lastError = tostring(result)
 			writeHandoff(latest)
-			warn("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+			debugLog("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
 		end
 	end)
 end
 
 local function handoffToFarming(sessionData)
 	if sessionData and sessionData.externalOrder then
-		warn("LocalTrader: Hub completion acknowledged; watchdog will relaunch farming")
+		debugLog("LocalTrader: Hub completion acknowledged; watchdog will relaunch farming")
 		return true
 	end
 	local record = {
@@ -671,13 +677,26 @@ end
 -- Reports current tradable-fruit inventory to the Hub so make-order can scan
 -- across accounts and pick one that actually has the requested item. Only
 -- sends when Hub is configured; silently does nothing otherwise.
+--
+-- getTradeInventory appears to be trade-table-context-dependent (it's the
+-- same remote the trade GUI itself uses) - it likely only returns a proper
+-- shape while actually in the trading server, and something unusable
+-- otherwise (e.g. while farming in a different server). That's an expected,
+-- frequent condition here, not a real error each time, so this is throttled
+-- to avoid spamming the log on every poll (default poll interval is ~3s).
+local lastInventorySkipWarnAt = 0
+local INVENTORY_SKIP_WARN_INTERVAL = 120
 local function reportInventoryToHub()
 	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
 		return
 	end
 	local inventory, err = readInventory()
 	if not inventory then
-		warn("LocalTrader: inventory report skipped: " .. tostring(err))
+		if os.clock() - lastInventorySkipWarnAt >= INVENTORY_SKIP_WARN_INTERVAL then
+			lastInventorySkipWarnAt = os.clock()
+			debugLog("LocalTrader: inventory report skipped (repeats suppressed for "
+				.. INVENTORY_SKIP_WARN_INTERVAL .. "s): " .. tostring(err))
+		end
 		return
 	end
 	local available = getAvailablePhysicalFruits(inventory)
@@ -686,7 +705,7 @@ local function reportInventoryToHub()
 		items = available,
 	})
 	if not data then
-		warn("LocalTrader: inventory report failed: " .. tostring(reqErr))
+		debugLog("LocalTrader: inventory report failed: " .. tostring(reqErr))
 	end
 end
 
@@ -700,6 +719,109 @@ task.spawn(function()
 		-- rather than a separate hardcoded constant.
 		task.wait(HubConfig.poll or CONFIG.HubPollInterval)
 		reportInventoryToHub()
+	end
+end)
+
+-- ============================================================================
+-- TRASH-CANDIDATE SCANNER (DRY RUN ONLY - see Version 4 in the roadmap doc)
+--
+-- This only LOGS which owned fruits fall into the configured "junk" rarity
+-- tiers. It does not equip, store, discard, or otherwise touch anything.
+--
+-- Blox Fruits doesn't actually have an "Epic" rarity - the real tiers are
+-- Common, Uncommon, Rare, Legendary, Mythical. CONFIG.TrashRarities below
+-- maps the "common/rare/epic junk" request onto Common/Uncommon/Rare,
+-- leaving Legendary/Mythical alone. The tier lists themselves are the real
+-- in-game data, confirmed from a working autofarm script's own
+-- `RarityFruits` table rather than guessed.
+--
+-- Deliberately NOT included: any actual deletion action. LoadFruit/
+-- StoreFruit (also confirmed from that same source) only ever move a fruit
+-- between equipped and backpack - nothing in that ~12,000 line script, and
+-- nothing sniffed so far, shows a fruit actually being permanently
+-- destroyed. The equip-then-reset technique described isn't verified
+-- anywhere available here, and this is exactly the kind of action - real,
+-- irreversible, on a real-money-tradable item - where "probably works like
+-- similar games" isn't good enough to script against.
+-- ============================================================================
+
+local RarityFruits = {
+	Common = {"Rocket Fruit", "Spin Fruit", "Blade Fruit", "Spring Fruit", "Bomb Fruit", "Smoke Fruit", "Spike Fruit"},
+	Uncommon = {"Flame Fruit", "Falcon Fruit", "Ice Fruit", "Sand Fruit", "Diamond Fruit", "Dark Fruit"},
+	Rare = {"Light Fruit", "Rubber Fruit", "Barrier Fruit", "Ghost Fruit", "Magma Fruit"},
+	Legendary = {"Quake Fruit", "Buddha Fruit", "Love Fruit", "Spider Fruit", "Sound Fruit", "Phoenix Fruit",
+		"Portal Fruit", "Rumble Fruit", "Pain Fruit", "Blizzard Fruit"},
+	Mythical = {"Gravity Fruit", "Mammoth Fruit", "T-Rex Fruit", "Dough Fruit", "Shadow Fruit", "Venom Fruit",
+		"Control Fruit", "Gas Fruit", "Spirit Fruit", "Leopard Fruit", "Yeti Fruit", "Kitsune Fruit",
+		"Dragon Fruit"},
+}
+
+-- Which tiers count as "junk" for cleanup purposes. Legendary/Mythical are
+-- intentionally not listed here - change this if that's not what you want.
+CONFIG.TrashRarities = {"Common", "Uncommon", "Rare"}
+
+local fruitRarity = {}
+for tier, names in pairs(RarityFruits) do
+	for _, name in ipairs(names) do
+		fruitRarity[name] = tier
+	end
+end
+
+local trashTierLookup = {}
+for _, tier in ipairs(CONFIG.TrashRarities) do
+	trashTierLookup[tier] = true
+end
+
+-- Uses getInventoryFruits (confirmed from the same autofarm source as
+-- LoadFruit/StoreFruit above), not getTradeInventory - it's a different
+-- remote with a different response shape (.Name/.Price per entry, covering
+-- the full fruit inventory rather than just the tradeable subset the trade
+-- GUI uses).
+local function scanTrashCandidates()
+	local ok, fruits = pcall(function()
+		return CommF:InvokeServer("getInventoryFruits")
+	end)
+	if not ok or type(fruits) ~= "table" then
+		debugLog("LocalTrader: trash scan failed to read inventory: " .. tostring(fruits))
+		return {}
+	end
+
+	local candidates = {}
+	for _, entry in pairs(fruits) do
+		local name = tostring(entry.Name or "")
+		local tier = fruitRarity[name]
+		if tier and trashTierLookup[tier] then
+			candidates[#candidates + 1] = {
+				name = name,
+				rarity = tier,
+				price = tonumber(entry.Price) or 0,
+			}
+		end
+	end
+	return candidates
+end
+
+local function reportTrashCandidates()
+	local candidates = scanTrashCandidates()
+	if #candidates == 0 then
+		debugLog("LocalTrader: trash scan (dry run) - no junk-tier fruits found")
+		return
+	end
+	debugLog(string.format("LocalTrader: trash scan (dry run) - %d junk-tier fruit(s) found, none touched:", #candidates))
+	for _, c in ipairs(candidates) do
+		debugLog(string.format("  - %s [%s] price=%d", c.name, c.rarity, c.price))
+	end
+end
+
+task.spawn(function()
+	-- Give the game a little longer to settle than the inventory-report
+	-- loop above before the first scan, then repeat on a slower cadence -
+	-- this is diagnostic logging, not something that needs Hub-poll
+	-- frequency.
+	task.wait(15)
+	while true do
+		reportTrashCandidates()
+		task.wait(60)
 	end
 end)
 
@@ -724,7 +846,7 @@ end
 -- above, but nothing branched on it - the trading GUI and trade-remote
 -- wiring ran unconditionally regardless of mode. This is the missing gate.
 if HubConfig.mode == "FARMING" then
-	warn("LocalTrader: mode=FARMING; skipping trading initialization")
+	debugLog("LocalTrader: mode=FARMING; skipping trading initialization")
 	local farmingRecord = readHandoff()
 	if type(farmingRecord) ~= "table" or farmingRecord.phase ~= "FARMING" then
 		farmingRecord = {
@@ -740,23 +862,23 @@ if HubConfig.mode == "FARMING" then
 		}
 		local saved, saveError = writeHandoff(farmingRecord)
 		if saved then
-			warn("LocalTrader: created FARMING handoff")
+			debugLog("LocalTrader: created FARMING handoff")
 		else
-			warn("LocalTrader: could not create FARMING handoff: " .. tostring(saveError))
+			debugLog("LocalTrader: could not create FARMING handoff: " .. tostring(saveError))
 		end
 	else
-		warn("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
+		debugLog("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
 	end
 	task.defer(loadQuantumOnyx)
 	return
 end
 
 if HubConfig.mode ~= "TRADING" then
-	warn("LocalTrader: unknown mode=" .. tostring(HubConfig.mode) .. "; stopping safely")
+	debugLog("LocalTrader: unknown mode=" .. tostring(HubConfig.mode) .. "; stopping safely")
 	return
 end
 
-warn("LocalTrader: mode=TRADING; initializing trading system")
+debugLog("LocalTrader: mode=TRADING; initializing trading system")
 
 -- Blox Fruits requires the player to belong to a team before the trading
 -- system can operate. Ported from an older version of this script - the
@@ -765,29 +887,29 @@ warn("LocalTrader: mode=TRADING; initializing trading system")
 -- to trade until someone manually picked a team.
 local function ensureTradingTeam()
 	if LocalPlayer.Team then
-		warn("LocalTrader: team already selected: " .. tostring(LocalPlayer.Team.Name))
+		debugLog("LocalTrader: team already selected: " .. tostring(LocalPlayer.Team.Name))
 		return true
 	end
 
-	warn("LocalTrader: no team selected; waiting for DataLoaded")
+	debugLog("LocalTrader: no team selected; waiting for DataLoaded")
 	local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
 	if not dataLoaded then
 		dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
 	end
 	if not dataLoaded then
-		warn("LocalTrader: DataLoaded did not appear; cannot select team")
+		debugLog("LocalTrader: DataLoaded did not appear; cannot select team")
 		return false
 	end
 
 	local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 	if not remotes then
-		warn("LocalTrader: ReplicatedStorage.Remotes not found while selecting team")
+		debugLog("LocalTrader: ReplicatedStorage.Remotes not found while selecting team")
 		return false
 	end
 
 	local commF = remotes:WaitForChild("CommF_", 15)
 	if not commF then
-		warn("LocalTrader: CommF_ not found while selecting team")
+		debugLog("LocalTrader: CommF_ not found while selecting team")
 		return false
 	end
 
@@ -795,7 +917,7 @@ local function ensureTradingTeam()
 		local ok, result = pcall(function()
 			return commF:InvokeServer(remoteCommand, "Pirates")
 		end)
-		warn(string.format(
+		debugLog(string.format(
 			"LocalTrader: team request %s Pirates -> ok=%s result=%s",
 			remoteCommand,
 			tostring(ok),
@@ -807,14 +929,14 @@ local function ensureTradingTeam()
 	-- Current Blox Fruits scripts commonly use SetTeam2. Keep SetTeam as a
 	-- compatibility fallback because older versions/scripts used that command.
 	if not trySetTeam("SetTeam2") then
-		warn("LocalTrader: SetTeam2 failed; trying SetTeam")
+		debugLog("LocalTrader: SetTeam2 failed; trying SetTeam")
 		trySetTeam("SetTeam")
 	end
 
 	local deadline = os.clock() + 15
 	while os.clock() < deadline do
 		if LocalPlayer.Team then
-			warn("LocalTrader: team selected: " .. tostring(LocalPlayer.Team.Name))
+			debugLog("LocalTrader: team selected: " .. tostring(LocalPlayer.Team.Name))
 			if LocalPlayer.Character then
 				return true
 			end
@@ -824,7 +946,7 @@ local function ensureTradingTeam()
 	end
 
 	if not LocalPlayer.Team then
-		warn("LocalTrader: team selection did not register after 15s")
+		debugLog("LocalTrader: team selection did not register after 15s")
 		return false
 	end
 
@@ -832,16 +954,16 @@ local function ensureTradingTeam()
 	-- before the trading code starts touching the trade table.
 	local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 	if character then
-		warn("LocalTrader: character ready after team selection")
+		debugLog("LocalTrader: character ready after team selection")
 		return true
 	end
 
-	warn("LocalTrader: team selected but character was not available")
+	debugLog("LocalTrader: team selected but character was not available")
 	return false
 end
 
 if not ensureTradingTeam() then
-	warn("LocalTrader: TRADING startup stopped: team selection failed")
+	debugLog("LocalTrader: TRADING startup stopped: team selection failed")
 	return
 end
 
@@ -854,7 +976,7 @@ if startupOrder then
 		false
 	)
 else
-	warn("LocalTrader: no active Hub order at startup")
+	debugLog("LocalTrader: no active Hub order at startup")
 end
 
 local startupNoticeGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
