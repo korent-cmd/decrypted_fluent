@@ -777,13 +777,41 @@ end
 -- remote with a different response shape (.Name/.Price per entry, covering
 -- the full fruit inventory rather than just the tradeable subset the trade
 -- GUI uses).
+-- Blocks (with a timeout) until LocalPlayer.Character exists. Several
+-- player-state remotes on Roblox expect a spawned character server-side;
+-- getInventoryFruits may be one of them, which would explain trash scans
+-- failing specifically in FARMING mode right after a relaunch, before the
+-- character has finished loading.
+local function waitForCharacterReady(timeoutSeconds)
+	if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+		return true
+	end
+	local deadline = os.clock() + (timeoutSeconds or 20)
+	while os.clock() < deadline do
+		if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+			return true
+		end
+		task.wait(0.5)
+	end
+	return false
+end
+
+-- Returns candidates, errorMessage - errorMessage is nil on success, even if
+-- candidates is empty (that's a legitimate "nothing to flag" result and
+-- should not be reported the same way as a failed fetch).
 local function scanTrashCandidates()
+	if not waitForCharacterReady(20) then
+		return nil, "character was not ready within 20s"
+	end
+
 	local ok, fruits = pcall(function()
 		return CommF:InvokeServer("getInventoryFruits")
 	end)
-	if not ok or type(fruits) ~= "table" then
-		debugLog("LocalTrader: trash scan failed to read inventory: " .. tostring(fruits))
-		return {}
+	if not ok then
+		return nil, "getInventoryFruits call failed: " .. tostring(fruits)
+	end
+	if type(fruits) ~= "table" then
+		return nil, "getInventoryFruits returned an unexpected shape: " .. tostring(fruits)
 	end
 
 	local candidates = {}
@@ -798,11 +826,15 @@ local function scanTrashCandidates()
 			}
 		end
 	end
-	return candidates
+	return candidates, nil
 end
 
 local function reportTrashCandidates()
-	local candidates = scanTrashCandidates()
+	local candidates, err = scanTrashCandidates()
+	if err then
+		debugLog("LocalTrader: trash scan failed: " .. err)
+		return
+	end
 	if #candidates == 0 then
 		debugLog("LocalTrader: trash scan (dry run) - no junk-tier fruits found")
 		return
