@@ -734,51 +734,38 @@ end)
 -- ============================================================================
 -- TRASH-CANDIDATE SCANNER (DRY RUN ONLY - see Version 4 in the roadmap doc)
 --
--- This only LOGS which owned fruits fall into the configured "junk" rarity
--- tiers. It does not equip, store, discard, or otherwise touch anything.
+-- This only LOGS which owned fruits are on the configured junk list below.
+-- It does not equip, store, discard, or otherwise touch anything.
 --
--- Blox Fruits doesn't actually have an "Epic" rarity - the real tiers are
--- Common, Uncommon, Rare, Legendary, Mythical. CONFIG.TrashRarities below
--- maps the "common/rare/epic junk" request onto Common/Uncommon/Rare,
--- leaving Legendary/Mythical alone. The tier lists themselves are the real
--- in-game data, confirmed from a working autofarm script's own
--- `RarityFruits` table rather than guessed.
+-- Explicit name list rather than rarity tiers: rarity doesn't reliably mean
+-- "junk for trading purposes" (cosmetic/situational fruits share a tier
+-- with genuinely valuable ones), and names must match the "X-X" format
+-- getAvailablePhysicalFruits() actually reports (e.g. "Light-Light"), not
+-- the "Light Fruit" format a rarity table happened to use - which is why
+-- the earlier rarity-based version never matched anything.
 --
 -- Deliberately NOT included: any actual deletion action. LoadFruit/
--- StoreFruit (also confirmed from that same source) only ever move a fruit
--- between equipped and backpack - nothing in that ~12,000 line script, and
--- nothing sniffed so far, shows a fruit actually being permanently
--- destroyed. The equip-then-reset technique described isn't verified
--- anywhere available here, and this is exactly the kind of action - real,
--- irreversible, on a real-money-tradable item - where "probably works like
--- similar games" isn't good enough to script against.
+-- StoreFruit (confirmed from a working autofarm script's own source) only
+-- ever move a fruit between equipped and backpack - nothing in that
+-- ~12,000 line script, and nothing sniffed so far, shows a fruit actually
+-- being permanently destroyed via those calls. The equip-then-reset
+-- technique is separately confirmed to work empirically (you checked your
+-- backpack and the fruit was gone), but that's still irreversible,
+-- real-money-tradable destruction and isn't wired up to run automatically
+-- yet - see the note further down.
 -- ============================================================================
 
-local RarityFruits = {
-	Common = {"Rocket Fruit", "Spin Fruit", "Blade Fruit", "Spring Fruit", "Bomb Fruit", "Smoke Fruit", "Spike Fruit"},
-	Uncommon = {"Flame Fruit", "Falcon Fruit", "Ice Fruit", "Sand Fruit", "Diamond Fruit", "Dark Fruit"},
-	Rare = {"Light Fruit", "Rubber Fruit", "Barrier Fruit", "Ghost Fruit", "Magma Fruit"},
-	Legendary = {"Quake Fruit", "Buddha Fruit", "Love Fruit", "Spider Fruit", "Sound Fruit", "Phoenix Fruit",
-		"Portal Fruit", "Rumble Fruit", "Pain Fruit", "Blizzard Fruit"},
-	Mythical = {"Gravity Fruit", "Mammoth Fruit", "T-Rex Fruit", "Dough Fruit", "Shadow Fruit", "Venom Fruit",
-		"Control Fruit", "Gas Fruit", "Spirit Fruit", "Leopard Fruit", "Yeti Fruit", "Kitsune Fruit",
-		"Dragon Fruit"},
+CONFIG.TrashFruitNames = {
+	"Blade-Blade", "Bomb-Bomb", "Creation-Creation", "Dark-Dark", "Diamond-Diamond",
+	"Eagle-Eagle", "Flame-Flame", "Ghost-Ghost", "Ice-Ice", "Light-Light", "Love-Love",
+	"Magma-Magma", "Phoenix-Phoenix", "Quake-Quake", "Rocket-Rocket", "Rubber-Rubber",
+	"Sand-Sand", "Smoke-Smoke", "Sound-Sound", "Spider-Spider", "Spike-Spike",
+	"Spin-Spin", "Spring-Spring",
 }
 
--- Which tiers count as "junk" for cleanup purposes. Legendary/Mythical are
--- intentionally not listed here - change this if that's not what you want.
-CONFIG.TrashRarities = {"Common", "Uncommon", "Rare"}
-
-local fruitRarity = {}
-for tier, names in pairs(RarityFruits) do
-	for _, name in ipairs(names) do
-		fruitRarity[name] = tier
-	end
-end
-
-local trashTierLookup = {}
-for _, tier in ipairs(CONFIG.TrashRarities) do
-	trashTierLookup[tier] = true
+local trashFruitLookup = {}
+for _, name in ipairs(CONFIG.TrashFruitNames) do
+	trashFruitLookup[name] = true
 end
 
 -- Uses getInventoryFruits (confirmed from the same autofarm source as
@@ -826,11 +813,9 @@ local function scanTrashCandidates()
 	local available = getAvailablePhysicalFruits(inventory)
 	local candidates = {}
 	for _, entry in ipairs(available) do
-		local tier = fruitRarity[entry.name]
-		if tier and trashTierLookup[tier] then
+		if trashFruitLookup[entry.name] then
 			candidates[#candidates + 1] = {
 				name = entry.name,
-				rarity = tier,
 				amount = entry.amount,
 			}
 		end
@@ -845,12 +830,12 @@ local function reportTrashCandidates()
 		return
 	end
 	if #candidates == 0 then
-		debugLog("LocalTrader: trash scan (dry run) - no junk-tier fruits found")
+		debugLog("LocalTrader: trash scan (dry run) - no junk fruits found")
 		return
 	end
-	debugLog(string.format("LocalTrader: trash scan (dry run) - %d junk-tier fruit(s) found, none touched:", #candidates))
+	debugLog(string.format("LocalTrader: trash scan (dry run) - %d junk fruit(s) found, none touched:", #candidates))
 	for _, c in ipairs(candidates) do
-		debugLog(string.format("  - %s [%s] x%d", c.name, c.rarity, c.amount))
+		debugLog(string.format("  - %s x%d", c.name, c.amount))
 	end
 end
 
