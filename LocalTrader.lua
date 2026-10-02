@@ -262,6 +262,15 @@ local function hubRequest(method, path, body)
 		end
 		local statusCode = tonumber(response and (response.StatusCode or response.status_code)) or 0
 		local raw = response and (response.Body or response.body) or ""
+		if statusCode == 0 and raw == "" then
+			-- Some executors' request() returns a response object with
+			-- StatusCode=0 and an empty body on a connection-level failure
+			-- (Hub not reachable) instead of raising an error. That used to
+			-- fall through to the JSON-decode attempt below and get
+			-- misreported as "invalid JSON", when the real problem is that
+			-- no response was ever received at all.
+			return nil, "Hub unreachable (connection failed - is hub.py running and is the Hub URL/port correct?)"
+		end
 		if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
 			return nil, "HTTP " .. tostring(statusCode) .. ": " .. tostring(raw):sub(1, 250)
 		end
@@ -269,7 +278,7 @@ local function hubRequest(method, path, body)
 			return HttpService:JSONDecode(raw)
 		end)
 		if not decodedOk then
-			return nil, "Hub returned invalid JSON"
+			return nil, "Hub returned invalid JSON (status=" .. tostring(statusCode) .. ", body=" .. tostring(raw):sub(1, 150) .. ")"
 		end
 		return decoded
 	end
@@ -292,7 +301,7 @@ local function hubRequest(method, path, body)
 		return HttpService:JSONDecode(response.Body or "")
 	end)
 	if not decodedOk then
-		return nil, "Hub returned invalid JSON"
+		return nil, "Hub returned invalid JSON (status=" .. tostring(response.StatusCode) .. ", body=" .. tostring(response.Body or ""):sub(1, 150) .. ")"
 	end
 	return decoded
 end
@@ -799,30 +808,30 @@ end
 -- Returns candidates, errorMessage - errorMessage is nil on success, even if
 -- candidates is empty (that's a legitimate "nothing to flag" result and
 -- should not be reported the same way as a failed fetch).
+-- Reuses readInventory()/getAvailablePhysicalFruits() - the exact same
+-- getTradeInventory-based path reportInventoryToHub() uses and that the
+-- Hub's own inventory display already confirms is working - rather than
+-- the separate getInventoryFruits remote, which kept failing here for
+-- reasons that didn't matter once a working alternative was available.
 local function scanTrashCandidates()
 	if not waitForCharacterReady(20) then
 		return nil, "character was not ready within 20s"
 	end
 
-	local ok, fruits = pcall(function()
-		return CommF:InvokeServer("getInventoryFruits")
-	end)
-	if not ok then
-		return nil, "getInventoryFruits call failed: " .. tostring(fruits)
-	end
-	if type(fruits) ~= "table" then
-		return nil, "getInventoryFruits returned an unexpected shape: " .. tostring(fruits)
+	local inventory, err = readInventory()
+	if not inventory then
+		return nil, "could not read inventory: " .. tostring(err)
 	end
 
+	local available = getAvailablePhysicalFruits(inventory)
 	local candidates = {}
-	for _, entry in pairs(fruits) do
-		local name = tostring(entry.Name or "")
-		local tier = fruitRarity[name]
+	for _, entry in ipairs(available) do
+		local tier = fruitRarity[entry.name]
 		if tier and trashTierLookup[tier] then
 			candidates[#candidates + 1] = {
-				name = name,
+				name = entry.name,
 				rarity = tier,
-				price = tonumber(entry.Price) or 0,
+				amount = entry.amount,
 			}
 		end
 	end
@@ -841,7 +850,7 @@ local function reportTrashCandidates()
 	end
 	debugLog(string.format("LocalTrader: trash scan (dry run) - %d junk-tier fruit(s) found, none touched:", #candidates))
 	for _, c in ipairs(candidates) do
-		debugLog(string.format("  - %s [%s] price=%d", c.name, c.rarity, c.price))
+		debugLog(string.format("  - %s [%s] x%d", c.name, c.rarity, c.amount))
 	end
 end
 
