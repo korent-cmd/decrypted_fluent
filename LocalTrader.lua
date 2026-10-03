@@ -188,7 +188,10 @@ CONFIG.TrashFlush = {
 	EquipTimeout = 6,             -- seconds to wait for the equip to register
 	ResetDeathTimeout = 3,        -- seconds to wait to see if a reset method actually killed the character
 	RespawnTimeout = 30,          -- seconds to wait for the new character after dying
-	SettleDelay = 3,              -- seconds after respawn before re-reading the inventory
+	SettleDelay = 5,              -- seconds after respawn before the first verification check
+	VerifyTimeout = 20,           -- keep re-checking this long for the game's data to catch up
+	VerifyInterval = 2,           -- seconds between those re-checks
+	PauseBetweenFruits = 4,       -- pause after each successful flush before starting the next
 	MaxConsecutiveFailures = 3,   -- stop for this session after this many failures in a row
 	StateFile = "LocalTrader_Flush.json", -- remembers which day was already flushed
 }
@@ -1157,19 +1160,32 @@ local function flushOne(fruitName)
 	waitForCharacterReady(20)
 	task.wait(cfg.SettleDelay)
 
-	-- 3) verify it is really gone: not equipped, and not back in storage
-	if getEquippedFruitName() == fruitName then
-		return false, "fruit still equipped after reset"
+	-- 3) verify it is really gone: not equipped, and not back in storage.
+	-- Right after a respawn the game's inventory / equipped-fruit data can lag
+	-- behind for a few seconds, so keep re-checking until it catches up
+	-- instead of trusting a single immediate read.
+	local verifyDeadline = os.clock() + cfg.VerifyTimeout
+	local lastProblem = "could not verify"
+	while true do
+		local stillEquipped = (getEquippedFruitName() == fruitName)
+		local invAfter = readInventory()
+		if stillEquipped then
+			lastProblem = "fruit still equipped after reset"
+		elseif not invAfter then
+			lastProblem = "could not re-read inventory to verify"
+		else
+			local after = storedAmountOf(invAfter, fruitName)
+			if after < before then
+				return true
+			end
+			lastProblem = string.format("fruit still in storage (before=%d after=%d)", before, after)
+		end
+		if os.clock() >= verifyDeadline then
+			break
+		end
+		task.wait(cfg.VerifyInterval)
 	end
-	local invAfter = readInventory()
-	if not invAfter then
-		return false, "could not re-read inventory to verify"
-	end
-	local after = storedAmountOf(invAfter, fruitName)
-	if after >= before then
-		return false, string.format("fruit came back to storage (before=%d after=%d)", before, after)
-	end
-	return true
+	return false, lastProblem .. " even after " .. tostring(cfg.VerifyTimeout) .. "s of re-checking"
 end
 
 -- ---- the daily run -----------------------------------------------------------
@@ -1262,6 +1278,7 @@ local function runDailyFlush(boundary)
 			flushFailures = 0
 			flushed = flushed + 1
 			debugLog("LocalTrader: flushed " .. target.name .. " (verified gone)")
+			task.wait(cfg.PauseBetweenFruits)
 		else
 			flushFailures = flushFailures + 1
 			debugLog(string.format("LocalTrader: flush of %s FAILED (%d/%d): %s",
