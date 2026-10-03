@@ -175,7 +175,7 @@ local CONFIG = {
 -- ============================================================================
 CONFIG.TrashFlush = {
 	Enabled = true,               -- false = feature fully off
-	DryRun = true,                -- true = only log, never delete. Set to false to go live.
+	DryRun = false,                -- true = only log, never delete. Set to false to go live.
 	CycleInterval = 60,           -- how often (seconds) it checks whether a flush is due
 	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
 	TeamGraceSeconds = 60,        -- wait this long for the farm script to pick a team before picking one
