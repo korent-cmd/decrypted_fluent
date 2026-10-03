@@ -1,6 +1,8 @@
 -- Blox Fruits Version 1 local trader.
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
+--
+-- v1.1: daily trash-fruit flush built in (see CONFIG.TrashFlush below).
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -14,11 +16,7 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 -- ============================================================================
 -- PERSISTENT DEBUG LOG
 -- Mirrors every debugLog() call onto an on-screen panel too, since executor
--- console output may not always be visible. Ported from an older version of
--- this script. Implemented as a wrapper around the global debugLog() rather than
--- renaming every call site to a separate debugLog() function, so nothing
--- else in the file needs to change - every existing debugLog("...") call below
--- automatically shows up on the panel too.
+-- console output may not always be visible.
 -- ============================================================================
 local debugLogBox
 local debugLines = {}
@@ -85,11 +83,8 @@ end
 
 -- IMPORTANT: never reassign the global warn (or any other standard global).
 -- QuantumOnyx's "stop skidding" refusal is almost certainly an anti-tamper
--- check for exactly that kind of hook - a previous version of this script
--- did override debugLog() to feed the debug panel, which is the most likely
--- cause of QuantumOnyx failing to load. debugLog() below calls the real,
--- untouched global debugLog() for console visibility, but is never assigned
--- over it.
+-- check for exactly that kind of hook. debugLog() below calls the real,
+-- untouched global warn() for console visibility, but never assigns over it.
 local function debugLog(...)
 	local parts = {}
 	for i = 1, select("#", ...) do
@@ -163,6 +158,33 @@ local CONFIG = {
 	InventoryRefreshInterval = 2,
 	MaxLogLines = 200,
 	RetweenInterval = 4,
+}
+
+-- ============================================================================
+-- DAILY TRASH FLUSH SETTINGS  (the only thing you need to edit)
+--
+-- How it works: once per trade-day (the day rolls over at 23:59 UTC+8, the
+-- same reset as Blox Fruits' daily trade limit) this account, while in
+-- FARMING mode, equips each fruit on the trash list below and then resets its
+-- character, which destroys the fruit. If the account is trading when the new
+-- day starts, the flush simply waits until it is back to farming.
+--
+-- It ships in TEST MODE: Enabled = true, DryRun = true. In test mode it only
+-- writes "would flush X" lines to the log and deletes NOTHING.
+-- When the log looks right, change   DryRun = true   to   DryRun = false.
+-- ============================================================================
+CONFIG.TrashFlush = {
+	Enabled = true,               -- false = feature fully off
+	DryRun = true,                -- true = only log, never delete. Set to false to go live.
+	CycleInterval = 60,           -- how often (seconds) it checks whether a flush is due
+	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
+	TeamGraceSeconds = 60,        -- wait this long for the farm script to pick a team before picking one
+	EquipTimeout = 6,             -- seconds to wait for the equip to register
+	ResetDeathTimeout = 3,        -- seconds to wait to see if a reset method actually killed the character
+	RespawnTimeout = 30,          -- seconds to wait for the new character after dying
+	SettleDelay = 3,              -- seconds after respawn before re-reading the inventory
+	MaxConsecutiveFailures = 3,   -- stop for this session after this many failures in a row
+	StateFile = "LocalTrader_Flush.json", -- remembers which day was already flushed
 }
 
 local function readHandoff()
@@ -265,10 +287,7 @@ local function hubRequest(method, path, body)
 		if statusCode == 0 and raw == "" then
 			-- Some executors' request() returns a response object with
 			-- StatusCode=0 and an empty body on a connection-level failure
-			-- (Hub not reachable) instead of raising an error. That used to
-			-- fall through to the JSON-decode attempt below and get
-			-- misreported as "invalid JSON", when the real problem is that
-			-- no response was ever received at all.
+			-- (Hub not reachable) instead of raising an error.
 			return nil, "Hub unreachable (connection failed - is hub.py running and is the Hub URL/port correct?)"
 		end
 		if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
@@ -605,15 +624,110 @@ local function handoffToFarming(sessionData)
 end
 
 -- Fetched here, before the FARMING/TRADING mode gate below, because
--- inventory reporting (used by both modes, for the Hub's make-order
--- worker-matching) needs CommF for getTradeInventory, and the item catalog
--- for turning raw ItemIds into named/tradable fruit amounts. TradeEvent and
--- TradeFunction stay fetched further down since only actual trading needs
--- them.
+-- inventory reporting and the daily flush (used by both modes) need CommF.
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 assert(Remotes, "ReplicatedStorage.Remotes was not found")
 local CommF = Remotes:WaitForChild("CommF_", 15)
 assert(CommF, "CommF_ remote was not found")
+
+-- ============================================================================
+-- TEAM SELECTION
+-- Blox Fruits needs a team chosen before the inventory can be read and before
+-- a reset works. This was previously only in the TRADING path; it now lives
+-- up here so the inventory reports and the daily flush can use it too.
+--
+-- graceSeconds: how long to wait for something else (the farm script) to pick
+-- a team on its own before this picks Pirates. 0 = pick immediately.
+-- ============================================================================
+local teamSelectionInFlight = false
+
+local function ensureTeam(graceSeconds)
+	if LocalPlayer.Team then
+		return true
+	end
+
+	if teamSelectionInFlight then
+		local waitDeadline = os.clock() + 90
+		while teamSelectionInFlight and os.clock() < waitDeadline do
+			task.wait(0.5)
+		end
+		return LocalPlayer.Team ~= nil
+	end
+
+	if graceSeconds and graceSeconds > 0 then
+		debugLog("LocalTrader: no team yet; giving the farm script " .. tostring(graceSeconds) .. "s to pick one")
+		local graceDeadline = os.clock() + graceSeconds
+		while os.clock() < graceDeadline do
+			if LocalPlayer.Team then
+				debugLog("LocalTrader: team appeared on its own: " .. tostring(LocalPlayer.Team.Name))
+				return true
+			end
+			task.wait(1)
+		end
+	end
+
+	teamSelectionInFlight = true
+	local result = false
+	local ok, err = pcall(function()
+		debugLog("LocalTrader: no team selected; waiting for DataLoaded")
+		local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
+		if not dataLoaded then
+			dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
+		end
+		if not dataLoaded then
+			debugLog("LocalTrader: DataLoaded did not appear; cannot select team")
+			return
+		end
+
+		local function trySetTeam(remoteCommand)
+			local callOk, callResult = pcall(function()
+				return CommF:InvokeServer(remoteCommand, "Pirates")
+			end)
+			debugLog(string.format(
+				"LocalTrader: team request %s Pirates -> ok=%s result=%s",
+				remoteCommand,
+				tostring(callOk),
+				tostring(callResult)
+			))
+			return callOk
+		end
+
+		-- Current Blox Fruits scripts commonly use SetTeam2. Keep SetTeam as a
+		-- compatibility fallback because older versions/scripts used that command.
+		if not trySetTeam("SetTeam2") then
+			debugLog("LocalTrader: SetTeam2 failed; trying SetTeam")
+			trySetTeam("SetTeam")
+		end
+
+		local deadline = os.clock() + 15
+		while os.clock() < deadline do
+			if LocalPlayer.Team then
+				debugLog("LocalTrader: team selected: " .. tostring(LocalPlayer.Team.Name))
+				break
+			end
+			task.wait(0.25)
+		end
+
+		if not LocalPlayer.Team then
+			debugLog("LocalTrader: team selection did not register after 15s")
+			return
+		end
+
+		-- Selecting a team can respawn the character. Wait for the new
+		-- character before anything else touches the game.
+		local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+		if character then
+			debugLog("LocalTrader: character ready after team selection")
+			result = true
+		end
+	end)
+	teamSelectionInFlight = false
+	if not ok then
+		debugLog("LocalTrader: team selection error: " .. tostring(err))
+		return false
+	end
+	return result
+end
 
 local function normalize(value)
 	return tostring(value or ""):lower():gsub("[%s%p]+", "")
@@ -687,19 +801,26 @@ end
 -- across accounts and pick one that actually has the requested item. Only
 -- sends when Hub is configured; silently does nothing otherwise.
 --
--- getTradeInventory appears to be trade-table-context-dependent (it's the
--- same remote the trade GUI itself uses) - it likely only returns a proper
--- shape while actually in the trading server, and something unusable
--- otherwise (e.g. while farming in a different server). That's an expected,
--- frequent condition here, not a real error each time, so this is throttled
--- to avoid spamming the log on every poll (default poll interval is ~3s).
+-- getTradeInventory needs a chosen team, and appears to be trade-table-context
+-- dependent, so "can't read it right now" is an expected, frequent condition
+-- here. Skip messages are throttled to avoid spamming the log.
 local lastInventorySkipWarnAt = 0
 local INVENTORY_SKIP_WARN_INTERVAL = 120
 local function reportInventoryToHub()
 	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
 		return
 	end
-	hubRequest("POST", "/api/v1/game-ping", {account_id = HubConfig.accountId})
+
+	-- Tell the Hub the game itself is alive, even if the inventory below
+	-- can't be read right now.
+	hubRequest("POST", "/api/v1/game-ping", { account_id = HubConfig.accountId })
+
+	-- No team yet = the inventory can't be read. In farming the farm script
+	-- picks the team itself, so just wait for it rather than forcing one.
+	if not LocalPlayer.Team then
+		return
+	end
+
 	local inventory, err = readInventory()
 	if not inventory then
 		if os.clock() - lastInventorySkipWarnAt >= INVENTORY_SKIP_WARN_INTERVAL then
@@ -724,36 +845,17 @@ end
 -- immediately, independent of the parent script chunk reaching `return`.
 task.spawn(function()
 	while true do
-		-- Reuses the Hub's own configured poll interval so this stays in
-		-- sync with however frequently the watchdog itself is polling,
-		-- rather than a separate hardcoded constant.
 		task.wait(HubConfig.poll or CONFIG.HubPollInterval)
 		reportInventoryToHub()
 	end
 end)
 
 -- ============================================================================
--- TRASH-CANDIDATE SCANNER (DRY RUN ONLY - see Version 4 in the roadmap doc)
+-- TRASH FRUITS + DAILY FLUSH
 --
--- This only LOGS which owned fruits are on the configured junk list below.
--- It does not equip, store, discard, or otherwise touch anything.
---
--- Explicit name list rather than rarity tiers: rarity doesn't reliably mean
--- "junk for trading purposes" (cosmetic/situational fruits share a tier
--- with genuinely valuable ones), and names must match the "X-X" format
--- getAvailablePhysicalFruits() actually reports (e.g. "Light-Light"), not
--- the "Light Fruit" format a rarity table happened to use - which is why
--- the earlier rarity-based version never matched anything.
---
--- Deliberately NOT included: any actual deletion action. LoadFruit/
--- StoreFruit (confirmed from a working autofarm script's own source) only
--- ever move a fruit between equipped and backpack - nothing in that
--- ~12,000 line script, and nothing sniffed so far, shows a fruit actually
--- being permanently destroyed via those calls. The equip-then-reset
--- technique is separately confirmed to work empirically (you checked your
--- backpack and the fruit was gone), but that's still irreversible,
--- real-money-tradable destruction and isn't wired up to run automatically
--- yet - see the note further down.
+-- Explicit name list (names must match the "X-X" format
+-- getAvailablePhysicalFruits() reports, e.g. "Light-Light").
+-- Edit this list to change which fruits get flushed.
 -- ============================================================================
 
 CONFIG.TrashFruitNames = {
@@ -769,16 +871,7 @@ for _, name in ipairs(CONFIG.TrashFruitNames) do
 	trashFruitLookup[name] = true
 end
 
--- Uses getInventoryFruits (confirmed from the same autofarm source as
--- LoadFruit/StoreFruit above), not getTradeInventory - it's a different
--- remote with a different response shape (.Name/.Price per entry, covering
--- the full fruit inventory rather than just the tradeable subset the trade
--- GUI uses).
--- Blocks (with a timeout) until LocalPlayer.Character exists. Several
--- player-state remotes on Roblox expect a spawned character server-side;
--- getInventoryFruits may be one of them, which would explain trash scans
--- failing specifically in FARMING mode right after a relaunch, before the
--- character has finished loading.
+-- Blocks (with a timeout) until LocalPlayer.Character exists.
 local function waitForCharacterReady(timeoutSeconds)
 	if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
 		return true
@@ -794,16 +887,13 @@ local function waitForCharacterReady(timeoutSeconds)
 end
 
 -- Returns candidates, errorMessage - errorMessage is nil on success, even if
--- candidates is empty (that's a legitimate "nothing to flag" result and
--- should not be reported the same way as a failed fetch).
--- Reuses readInventory()/getAvailablePhysicalFruits() - the exact same
--- getTradeInventory-based path reportInventoryToHub() uses and that the
--- Hub's own inventory display already confirms is working - rather than
--- the separate getInventoryFruits remote, which kept failing here for
--- reasons that didn't matter once a working alternative was available.
+-- candidates is empty (that's a legitimate "nothing to flag" result).
 local function scanTrashCandidates()
 	if not waitForCharacterReady(20) then
 		return nil, "character was not ready within 20s"
+	end
+	if not LocalPlayer.Team then
+		return nil, "no team selected yet (inventory is unavailable)"
 	end
 
 	local inventory, err = readInventory()
@@ -840,15 +930,380 @@ local function reportTrashCandidates()
 	end
 end
 
+-- ---- trade-day clock --------------------------------------------------------
+-- The trade day rolls over at 23:59 UTC+8 = 15:59 UTC. Returns the unix time
+-- of the most recent rollover.
+local function currentTradeDayBoundary()
+	local now = os.time()
+	local dayStart = now - (now % 86400) -- today 00:00 UTC
+	local boundary = dayStart + 15 * 3600 + 59 * 60
+	if now < boundary then
+		boundary = boundary - 86400
+	end
+	return boundary
+end
+
+local function readFlushState()
+	if type(readfile) ~= "function" then
+		return { lastBoundary = 0 }
+	end
+	if type(isfile) == "function" and not isfile(CONFIG.TrashFlush.StateFile) then
+		return { lastBoundary = 0 }
+	end
+	local ok, contents = pcall(readfile, CONFIG.TrashFlush.StateFile)
+	if not ok or type(contents) ~= "string" or contents == "" then
+		return { lastBoundary = 0 }
+	end
+	local decodedOk, data = pcall(function()
+		return HttpService:JSONDecode(contents)
+	end)
+	if not decodedOk or type(data) ~= "table" then
+		return { lastBoundary = 0 }
+	end
+	data.lastBoundary = tonumber(data.lastBoundary) or 0
+	return data
+end
+
+local function writeFlushState(state)
+	if type(writefile) ~= "function" then
+		return false
+	end
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(state)
+	end)
+	if not ok then
+		return false
+	end
+	return pcall(writefile, CONFIG.TrashFlush.StateFile, encoded)
+end
+
+-- ---- fruit name / equipped detection -----------------------------------------
+local fruitNameSet = {}
+if ItemIds then
+	for _, rec in pairs(ItemIds) do
+		if type(rec) == "table" and rec[1] == "PhysicalFruit" and rec[2] then
+			fruitNameSet[tostring(rec[2])] = true
+		end
+	end
+end
+
+-- Equipping a fruit makes the game send this to the client (seen in the sniffer):
+--   CommE: "ItemRemoved", "<Fruit-Fruit>", "stored", <id>
+--   CommE: "Notify", "Fruit added to backpack."
+-- A passive listener on it is used as a second confirmation signal.
+local lastEquipEvent = { name = nil, at = 0 }
+do
+	local commE = Remotes:FindFirstChild("CommE")
+	if commE and commE:IsA("RemoteEvent") then
+		commE.OnClientEvent:Connect(function(kind, name, where)
+			if kind == "ItemRemoved" and where == "stored" then
+				lastEquipEvent = { name = tostring(name), at = os.clock() }
+			end
+		end)
+	end
+end
+
+-- Returns the name of the fruit currently equipped/held, or nil.
+local function getEquippedFruitName()
+	local data = LocalPlayer:FindFirstChild("Data")
+	local df = data and data:FindFirstChild("DevilFruit")
+	if df and df:IsA("ValueBase") then
+		local v = tostring(df.Value or "")
+		if v ~= "" then
+			return v
+		end
+	end
+	for _, container in ipairs({ LocalPlayer.Character, LocalPlayer:FindFirstChild("Backpack") }) do
+		if container then
+			for _, child in ipairs(container:GetChildren()) do
+				if child:IsA("Tool") and fruitNameSet[child.Name] then
+					return child.Name
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function storedAmountOf(items, fruitName)
+	for _, entry in ipairs(getAvailablePhysicalFruits(items)) do
+		if entry.name == fruitName then
+			return entry.amount
+		end
+	end
+	return 0
+end
+
+-- ---- character reset ---------------------------------------------------------
+-- Tries local reset methods in order of how reliably they replicate to the
+-- server, and stops at the first one that actually kills the character.
+-- Returns ok, methodNameOrReason.
+local function resetCharacter()
+	local cfg = CONFIG.TrashFlush
+	local oldChar = LocalPlayer.Character
+	local humanoid = oldChar and oldChar:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return false, "no humanoid to reset"
+	end
+
+	local methods = {
+		{ "ChangeState(Dead)", function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Dead)
+		end },
+		{ "BreakJoints", function()
+			oldChar:BreakJoints()
+		end },
+		{ "destroy Head", function()
+			local head = oldChar:FindFirstChild("Head")
+			if head then
+				head:Destroy()
+			end
+		end },
+		{ "Health=0", function()
+			humanoid.Health = 0
+		end },
+	}
+
+	for _, method in ipairs(methods) do
+		local methodName, run = method[1], method[2]
+		local ok, err = pcall(run)
+		debugLog(string.format("LocalTrader: reset via %s -> ok=%s %s", methodName, tostring(ok), ok and "" or tostring(err)))
+
+		-- did that actually kill the character?
+		local died = false
+		local deathDeadline = os.clock() + cfg.ResetDeathTimeout
+		while os.clock() < deathDeadline do
+			if LocalPlayer.Character ~= oldChar then
+				died = true
+				break
+			end
+			if not humanoid.Parent or not oldChar.Parent
+				or humanoid.Health <= 0
+				or humanoid:GetState() == Enum.HumanoidStateType.Dead then
+				died = true
+				break
+			end
+			task.wait(0.2)
+		end
+
+		if died then
+			local respawnDeadline = os.clock() + cfg.RespawnTimeout
+			while os.clock() < respawnDeadline do
+				local c = LocalPlayer.Character
+				if c and c ~= oldChar and c:FindFirstChildOfClass("Humanoid") then
+					return true, methodName
+				end
+				task.wait(0.5)
+			end
+			return false, "character died via " .. methodName .. " but did not respawn in time"
+		end
+		debugLog("LocalTrader: " .. methodName .. " did not kill the character; trying the next method")
+	end
+	return false, "no reset method worked"
+end
+
+-- ---- flush one fruit ---------------------------------------------------------
+-- Equip one trash fruit, then reset so it is destroyed. Returns ok, reason.
+local function flushOne(fruitName)
+	local cfg = CONFIG.TrashFlush
+
+	local invBefore, invErr = readInventory()
+	if not invBefore then
+		return false, "inventory unreadable: " .. tostring(invErr)
+	end
+	local before = storedAmountOf(invBefore, fruitName)
+	if before <= 0 then
+		return false, "fruit no longer in inventory"
+	end
+
+	-- 1) equip
+	lastEquipEvent = { name = nil, at = 0 }
+	local okCall, result = pcall(function()
+		return CommF:InvokeServer("LoadFruit", fruitName)
+	end)
+	debugLog(string.format("LocalTrader: flush LoadFruit %s -> ok=%s result=%s",
+		fruitName, tostring(okCall), tostring(result)))
+	if not okCall then
+		return false, "LoadFruit call errored"
+	end
+
+	local confirmed = false
+	local deadline = os.clock() + cfg.EquipTimeout
+	while os.clock() < deadline do
+		if getEquippedFruitName() == fruitName
+			or (lastEquipEvent.name == fruitName and os.clock() - lastEquipEvent.at < cfg.EquipTimeout) then
+			confirmed = true
+			break
+		end
+		task.wait(0.25)
+	end
+	if not confirmed then
+		return false, "equip was not confirmed (no Data/Tool/CommE signal)"
+	end
+	debugLog("LocalTrader: flush equip confirmed for " .. fruitName)
+
+	-- 2) reset
+	local resetOk, resetInfo = resetCharacter()
+	if not resetOk then
+		return false, "reset failed: " .. tostring(resetInfo)
+	end
+	debugLog("LocalTrader: character reset worked via " .. tostring(resetInfo))
+	waitForCharacterReady(20)
+	task.wait(cfg.SettleDelay)
+
+	-- 3) verify it is really gone: not equipped, and not back in storage
+	if getEquippedFruitName() == fruitName then
+		return false, "fruit still equipped after reset"
+	end
+	local invAfter = readInventory()
+	if not invAfter then
+		return false, "could not re-read inventory to verify"
+	end
+	local after = storedAmountOf(invAfter, fruitName)
+	if after >= before then
+		return false, string.format("fruit came back to storage (before=%d after=%d)", before, after)
+	end
+	return true
+end
+
+-- ---- the daily run -----------------------------------------------------------
+local flushRunning = false
+local flushFailures = 0
+local flushDryRunLogged = false
+local lastFlushSkipLogAt = 0
+
+local function modeIsFarming()
+	local configured = loadHubConfig()
+	if not configured then
+		return false
+	end
+	return HubConfig.mode == "FARMING"
+end
+
+local function runDailyFlush(boundary)
+	local cfg = CONFIG.TrashFlush
+
+	if not ensureTeam(cfg.TeamGraceSeconds) then
+		debugLog("LocalTrader: daily flush postponed - no team selected")
+		return
+	end
+
+	local candidates, err = scanTrashCandidates()
+	if err then
+		debugLog("LocalTrader: daily flush scan failed: " .. err)
+		return
+	end
+
+	if cfg.DryRun then
+		flushDryRunLogged = true
+		if #candidates == 0 then
+			debugLog("LocalTrader: [DRY RUN] daily flush due - no trash fruits found")
+		else
+			debugLog(string.format("LocalTrader: [DRY RUN] daily flush due - would flush %d kind(s):", #candidates))
+			for _, c in ipairs(candidates) do
+				debugLog(string.format("  [DRY RUN] would flush %s x%d", c.name, c.amount))
+			end
+			debugLog("LocalTrader: [DRY RUN] nothing was deleted. Set DryRun = false in CONFIG.TrashFlush to go live.")
+		end
+		return
+	end
+
+	if #candidates == 0 then
+		debugLog("LocalTrader: daily flush - no trash fruits found; day marked done")
+		writeFlushState({ lastBoundary = boundary, flushed = 0, at = os.time() })
+		return
+	end
+
+	-- Never displace a fruit the farm might be relying on.
+	local held = getEquippedFruitName()
+	if held and not trashFruitLookup[held] then
+		if os.clock() - lastFlushSkipLogAt > 600 then
+			lastFlushSkipLogAt = os.clock()
+			debugLog("LocalTrader: daily flush waiting - a non-trash fruit is equipped: " .. held)
+		end
+		return
+	end
+
+	debugLog("LocalTrader: DAILY FLUSH STARTING")
+	local flushed = 0
+	local finished = false
+	while flushed < cfg.MaxPerRun do
+		-- stop immediately if the Hub has assigned this account a trade
+		if not modeIsFarming() then
+			debugLog("LocalTrader: daily flush paused - account is no longer in FARMING mode")
+			break
+		end
+
+		local list, scanErr = scanTrashCandidates()
+		if scanErr then
+			debugLog("LocalTrader: daily flush scan failed mid-run: " .. scanErr)
+			break
+		end
+		if #list == 0 then
+			finished = true
+			break
+		end
+
+		local target = list[1]
+		debugLog(string.format("LocalTrader: flushing %s (%d trash kind(s) left)", target.name, #list))
+		local ok, reason = flushOne(target.name)
+		if ok then
+			flushFailures = 0
+			flushed = flushed + 1
+			debugLog("LocalTrader: flushed " .. target.name .. " (verified gone)")
+		else
+			flushFailures = flushFailures + 1
+			debugLog(string.format("LocalTrader: flush of %s FAILED (%d/%d): %s",
+				target.name, flushFailures, cfg.MaxConsecutiveFailures, tostring(reason)))
+			break
+		end
+	end
+
+	if finished then
+		writeFlushState({ lastBoundary = boundary, flushed = flushed, at = os.time() })
+		debugLog(string.format("LocalTrader: DAILY FLUSH COMPLETE - %d fruit(s) destroyed; next flush after the next day rollover", flushed))
+	elseif flushed >= cfg.MaxPerRun then
+		debugLog("LocalTrader: daily flush hit the MaxPerRun cap; will continue next cycle")
+	end
+end
+
+local function maybeRunDailyFlush()
+	local cfg = CONFIG.TrashFlush
+	if flushRunning or flushFailures >= cfg.MaxConsecutiveFailures then
+		return
+	end
+	-- Trading accounts are never touched; the flush just stays pending.
+	if not modeIsFarming() then
+		return
+	end
+
+	local boundary = currentTradeDayBoundary()
+	local state = readFlushState()
+	if state.lastBoundary >= boundary then
+		return -- already flushed this trade-day
+	end
+	if cfg.DryRun and flushDryRunLogged then
+		return -- test mode: show the preview once per session, not every minute
+	end
+
+	flushRunning = true
+	local ok, e = pcall(runDailyFlush, boundary)
+	flushRunning = false
+	if not ok then
+		debugLog("LocalTrader: daily flush error: " .. tostring(e))
+	end
+end
+
 task.spawn(function()
-	-- Give the game a little longer to settle than the inventory-report
-	-- loop above before the first scan, then repeat on a slower cadence -
-	-- this is diagnostic logging, not something that needs Hub-poll
-	-- frequency.
-	task.wait(15)
+	-- let the game and the farm script settle before the first check
+	task.wait(20)
 	while true do
-		reportTrashCandidates()
-		task.wait(60)
+		if CONFIG.TrashFlush.Enabled then
+			maybeRunDailyFlush()
+		else
+			reportTrashCandidates()
+		end
+		task.wait(CONFIG.TrashFlush.CycleInterval)
 	end
 end)
 
@@ -867,11 +1322,8 @@ if not reportStartupConfiguration() then
 end
 
 -- FARMING mode is intentionally passive here: LocalTrader does not build the
--- trading GUI or touch trade remotes. It only restores QuantumOnyx farming.
--- Ported from an older version of this script: HubConfig.mode was already
--- being loaded from LocalTrader_Hub.json by reportStartupConfiguration()
--- above, but nothing branched on it - the trading GUI and trade-remote
--- wiring ran unconditionally regardless of mode. This is the missing gate.
+-- trading GUI or touch trade remotes. It only restores QuantumOnyx farming
+-- (the daily flush loop above keeps running in the background).
 if HubConfig.mode == "FARMING" then
 	debugLog("LocalTrader: mode=FARMING; skipping trading initialization")
 	local farmingRecord = readHandoff()
@@ -908,88 +1360,8 @@ end
 debugLog("LocalTrader: mode=TRADING; initializing trading system")
 
 -- Blox Fruits requires the player to belong to a team before the trading
--- system can operate. Ported from an older version of this script - the
--- currently-maintained version had no equivalent at all, so a freshly
--- joined clone with no team selected would sit at the trade table unable
--- to trade until someone manually picked a team.
-local function ensureTradingTeam()
-	if LocalPlayer.Team then
-		debugLog("LocalTrader: team already selected: " .. tostring(LocalPlayer.Team.Name))
-		return true
-	end
-
-	debugLog("LocalTrader: no team selected; waiting for DataLoaded")
-	local dataLoaded = LocalPlayer:FindFirstChild("DataLoaded")
-	if not dataLoaded then
-		dataLoaded = LocalPlayer:WaitForChild("DataLoaded", 45)
-	end
-	if not dataLoaded then
-		debugLog("LocalTrader: DataLoaded did not appear; cannot select team")
-		return false
-	end
-
-	local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-	if not remotes then
-		debugLog("LocalTrader: ReplicatedStorage.Remotes not found while selecting team")
-		return false
-	end
-
-	local commF = remotes:WaitForChild("CommF_", 15)
-	if not commF then
-		debugLog("LocalTrader: CommF_ not found while selecting team")
-		return false
-	end
-
-	local function trySetTeam(remoteCommand)
-		local ok, result = pcall(function()
-			return commF:InvokeServer(remoteCommand, "Pirates")
-		end)
-		debugLog(string.format(
-			"LocalTrader: team request %s Pirates -> ok=%s result=%s",
-			remoteCommand,
-			tostring(ok),
-			tostring(result)
-		))
-		return ok
-	end
-
-	-- Current Blox Fruits scripts commonly use SetTeam2. Keep SetTeam as a
-	-- compatibility fallback because older versions/scripts used that command.
-	if not trySetTeam("SetTeam2") then
-		debugLog("LocalTrader: SetTeam2 failed; trying SetTeam")
-		trySetTeam("SetTeam")
-	end
-
-	local deadline = os.clock() + 15
-	while os.clock() < deadline do
-		if LocalPlayer.Team then
-			debugLog("LocalTrader: team selected: " .. tostring(LocalPlayer.Team.Name))
-			if LocalPlayer.Character then
-				return true
-			end
-			break
-		end
-		task.wait(0.25)
-	end
-
-	if not LocalPlayer.Team then
-		debugLog("LocalTrader: team selection did not register after 15s")
-		return false
-	end
-
-	-- Selecting a team can respawn the character. Wait for the new character
-	-- before the trading code starts touching the trade table.
-	local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-	if character then
-		debugLog("LocalTrader: character ready after team selection")
-		return true
-	end
-
-	debugLog("LocalTrader: team selected but character was not available")
-	return false
-end
-
-if not ensureTradingTeam() then
+-- system can operate (ensureTeam is defined near the top of this file).
+if not ensureTeam(0) then
 	debugLog("LocalTrader: TRADING startup stopped: team selection failed")
 	return
 end
@@ -1042,14 +1414,8 @@ local function connect(signal, callback)
 	return connection
 end
 
--- Reuses the single ItemIds catalog already loaded before the mode gate
--- (for inventory reporting) instead of fetching it a second time here. Two
--- independent fetches were previously each capable of falling back
--- differently (HttpGet succeeding for one, only the local file for the
--- other), which could silently diverge into two different catalogs: one
--- baked into the inventory-report closure from before the mode gate, and a
--- second used by everything below. A single shared table can't diverge
--- from itself.
+-- Reuses the single ItemIds catalog already loaded above instead of fetching
+-- it a second time. A single shared table can't diverge from itself.
 local itemByName = {}
 
 if ItemIds then
