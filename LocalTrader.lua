@@ -699,6 +699,7 @@ local function reportInventoryToHub()
 	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
 		return
 	end
+	hubRequest("POST", "/api/v1/game-ping", {account_id = HubConfig.accountId})
 	local inventory, err = readInventory()
 	if not inventory then
 		if os.clock() - lastInventorySkipWarnAt >= INVENTORY_SKIP_WARN_INTERVAL then
