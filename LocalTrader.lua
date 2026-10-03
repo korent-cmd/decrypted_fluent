@@ -166,8 +166,14 @@ local CONFIG = {
 -- How it works: once per trade-day (the day rolls over at 23:59 UTC+8, the
 -- same reset as Blox Fruits' daily trade limit) this account, while in
 -- FARMING mode, equips each fruit on the trash list below and then resets its
--- character, which destroys the fruit. If the account is trading when the new
--- day starts, the flush simply waits until it is back to farming.
+-- character, which destroys the fruit.
+--
+-- IMPORTANT: the flush NEVER runs alongside the farm script. It runs as its own
+-- step at the START of a farming session: when the game boots in FARMING mode
+-- and a flush is due, LocalTrader flushes FIRST and only then loads
+-- QuantumOnyx. The watchdog rejoins the game on its normal timer, so a flush
+-- due at the day rollover happens at the next rejoin. Trading accounts are
+-- never flushed (the flush simply waits for a farming boot).
 --
 -- It ships in TEST MODE: Enabled = true, DryRun = true. In test mode it only
 -- writes "would flush X" lines to the log and deletes NOTHING.
@@ -176,9 +182,9 @@ local CONFIG = {
 CONFIG.TrashFlush = {
 	Enabled = true,               -- false = feature fully off
 	DryRun = false,                -- true = only log, never delete. Set to false to go live.
-	CycleInterval = 60,           -- how often (seconds) it checks whether a flush is due
+	MaxRunSeconds = 900,          -- hard time cap; after this the farm script loads anyway
+	MaxAttemptsPerDay = 3,        -- failed runs allowed per trade-day before giving up until tomorrow
 	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
-	TeamGraceSeconds = 60,        -- wait this long for the farm script to pick a team before picking one
 	EquipTimeout = 6,             -- seconds to wait for the equip to register
 	ResetDeathTimeout = 3,        -- seconds to wait to see if a reset method actually killed the character
 	RespawnTimeout = 30,          -- seconds to wait for the new character after dying
@@ -1183,7 +1189,7 @@ end
 local function runDailyFlush(boundary)
 	local cfg = CONFIG.TrashFlush
 
-	if not ensureTeam(cfg.TeamGraceSeconds) then
+	if not ensureTeam(0) then
 		debugLog("LocalTrader: daily flush postponed - no team selected")
 		return
 	end
@@ -1224,10 +1230,15 @@ local function runDailyFlush(boundary)
 		return
 	end
 
-	debugLog("LocalTrader: DAILY FLUSH STARTING")
+	debugLog("LocalTrader: DAILY FLUSH STARTING (farm script has not been loaded yet)")
 	local flushed = 0
 	local finished = false
+	local runStartedAt = os.clock()
 	while flushed < cfg.MaxPerRun do
+		if os.clock() - runStartedAt > cfg.MaxRunSeconds then
+			debugLog("LocalTrader: daily flush hit the time cap; loading the farm script, will continue at the next rejoin")
+			break
+		end
 		-- stop immediately if the Hub has assigned this account a trade
 		if not modeIsFarming() then
 			debugLog("LocalTrader: daily flush paused - account is no longer in FARMING mode")
@@ -1267,12 +1278,15 @@ local function runDailyFlush(boundary)
 	end
 end
 
-local function maybeRunDailyFlush()
+-- Called ONCE per farming boot, BEFORE the farm script is loaded. Returns when
+-- the flush is done / not needed / failed, so the caller can then load
+-- QuantumOnyx. It never throws and never blocks farming forever.
+local function runFlushBeforeFarm()
 	local cfg = CONFIG.TrashFlush
-	if flushRunning or flushFailures >= cfg.MaxConsecutiveFailures then
+	if not cfg.Enabled then
 		return
 	end
-	-- Trading accounts are never touched; the flush just stays pending.
+	-- Trading accounts are never touched.
 	if not modeIsFarming() then
 		return
 	end
@@ -1282,8 +1296,22 @@ local function maybeRunDailyFlush()
 	if state.lastBoundary >= boundary then
 		return -- already flushed this trade-day
 	end
-	if cfg.DryRun and flushDryRunLogged then
-		return -- test mode: show the preview once per session, not every minute
+
+	local attempts = (state.attemptBoundary == boundary) and (tonumber(state.attempts) or 0) or 0
+	if not cfg.DryRun and attempts >= cfg.MaxAttemptsPerDay then
+		debugLog("LocalTrader: daily flush gave up for today after " .. attempts .. " attempts")
+		return
+	end
+
+	-- let the game finish loading before touching anything
+	task.wait(10)
+	if not cfg.DryRun then
+		writeFlushState({
+			lastBoundary = state.lastBoundary,
+			attemptBoundary = boundary,
+			attempts = attempts + 1,
+			at = os.time(),
+		})
 	end
 
 	flushRunning = true
@@ -1293,19 +1321,6 @@ local function maybeRunDailyFlush()
 		debugLog("LocalTrader: daily flush error: " .. tostring(e))
 	end
 end
-
-task.spawn(function()
-	-- let the game and the farm script settle before the first check
-	task.wait(20)
-	while true do
-		if CONFIG.TrashFlush.Enabled then
-			maybeRunDailyFlush()
-		else
-			reportTrashCandidates()
-		end
-		task.wait(CONFIG.TrashFlush.CycleInterval)
-	end
-end)
 
 local function reportStartupConfiguration()
 	local configured, configError = loadHubConfig()
@@ -1348,7 +1363,15 @@ if HubConfig.mode == "FARMING" then
 	else
 		debugLog("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
 	end
-	task.defer(loadQuantumOnyx)
+	-- Flush (if due) FIRST, then start the farm script, so the two can never
+	-- interfere with each other.
+	task.defer(function()
+		local ok, e = pcall(runFlushBeforeFarm)
+		if not ok then
+			debugLog("LocalTrader: pre-farm flush error: " .. tostring(e))
+		end
+		loadQuantumOnyx()
+	end)
 	return
 end
 
