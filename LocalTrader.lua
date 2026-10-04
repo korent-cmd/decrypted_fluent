@@ -150,7 +150,7 @@ local CONFIG = {
 	FarmLoadMaxAttempts = 3,
 	FarmLoadRetryDelays = {0, 10, 30},
 	AcceptInterval = 1.5,
-	CustomerWaitTimeout = 180,
+	CustomerWaitTimeout = 600,    -- 10 minutes: no customer by then = order failed (refund)
 	TradeStartTimeout = 30,
 	CompletionTimeout = 45,
 	HubReportMaxAttempts = 5,
@@ -238,6 +238,11 @@ local HubConfig = {
 	token = "",
 	poll = 3,
 }
+
+-- Orders this client has already finished with (completed, failed, timed out
+-- or stopped). Without this, the poll loop at the bottom would see the same
+-- order still sitting in the config file and immediately start it again.
+local abandonedOrders = {}
 
 local function loadHubConfig()
 	if type(readfile) ~= "function" then
@@ -363,6 +368,10 @@ local function readExternalOrder()
 	local quantity = math.max(1, tonumber(data.quantity) or 1)
 	local requestStatus = tostring(data.request_status or "ASSIGNED")
 	local accountId = tostring(data.account_id or HubConfig.accountId or "")
+
+	if requestId ~= "" and abandonedOrders[requestId] then
+		return nil
+	end
 
 	if requestId == "" or customer == "" or item == "" then
 		debugLog(
@@ -1953,8 +1962,43 @@ local function button(text, position, width, callback, color)
 	return object
 end
 
+-- Tells the Hub an order ended WITHOUT completing, so it can release this
+-- account back to farming and, when the sale needs it, queue a refund. Bounded
+-- retries; the Hub also expires stuck orders on its own, so a lost report can
+-- never strand the account forever.
+local function reportFailureToHub(sess, code, message)
+	if not sess or not sess.externalOrder or sess.completed or sess.failureReported then
+		return
+	end
+	sess.failureReported = true
+	local order = sess.externalOrder
+	task.spawn(function()
+		for attempt = 1, CONFIG.HubReportMaxAttempts do
+			local data, err = hubRequest("POST", "/api/v1/event", {
+				account_id = tostring(order.account_id or HubConfig.accountId or ""),
+				status = "failed",
+				event = "trade_failed",
+				extra = {
+					request_id = tostring(order.request_id or order.order_id or ""),
+					reason = code,
+					message = tostring(message or ""),
+				},
+			})
+			if data and data.ok ~= false then
+				debugLog("LocalTrader: order failure reported to Hub (" .. tostring(code) .. ")")
+				return
+			end
+			debugLog(string.format("LocalTrader: failure report attempt %d/%d failed: %s",
+				attempt, CONFIG.HubReportMaxAttempts, tostring(err)))
+			task.wait(CONFIG.HubReportRetryDelays[attempt] or 30)
+		end
+		debugLog("LocalTrader: could not report the failure to the Hub; it will expire the order itself")
+	end)
+end
+
 local startButton
-local function stopTrader(reason)
+local function stopTrader(reason, failureCode)
+	local stoppedSession = session
 	local stoppedSessionId = session and session.id
 	local stoppedOrderId = session and session.orderId
 	local completed = session and session.completed
@@ -1978,6 +2022,16 @@ local function stopTrader(reason)
 		end
 	end
 	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
+
+	if stoppedSession and stoppedSession.externalOrder then
+		local rid = tostring(stoppedSession.externalOrder.request_id or stoppedSession.externalOrder.order_id or "")
+		if rid ~= "" then
+			abandonedOrders[rid] = true
+		end
+		if failureCode and not stoppedSession.completed then
+			reportFailureToHub(stoppedSession, failureCode, reason)
+		end
+	end
 end
 
 -- Reports a completed trade to the Hub with a bounded number of retries.
@@ -2087,6 +2141,7 @@ local function startTrader(orderData)
 		stageStartedAt = os.clock(),
 		addRequested = false,
 		lastRetween = 0,
+		customerWaitSince = os.clock(),
 		externalOrder = type(orderData) == "table" and orderData or nil,
 	}
 	if type(orderData) == "table" then
@@ -2112,7 +2167,7 @@ local function startTrader(orderData)
 		setState("TRAVELING_TO_TABLE")
 		local moved, moveError = tweenToSeat(seat)
 		if not moved then
-			stopTrader(moveError or "could not reach trade table")
+			stopTrader(moveError or "could not reach trade table", "worker_error")
 			return
 		end
 		session.lastRetween = os.clock()
@@ -2255,10 +2310,11 @@ local function startTrader(orderData)
 					end
 				else
 					writeLog("processing ended, but inventory verification failed")
-					stopTrader("verification failed")
+					stopTrader("verification failed", "verification_failed")
 				end
 			else
 				setState("WAITING_FOR_CUSTOMER", "customer left")
+				session.customerWaitSince = os.clock()
 				latestTradeState = nil
 				session.startedAt = os.clock()
 				session.addRequested = false
@@ -2272,16 +2328,26 @@ local function startTrader(orderData)
 end
 
 local function retryTrader()
+	-- Retry must keep driving the SAME hub order (not silently drop it).
+	local retryOrder = session and session.externalOrder
 	if running then
 		stopTrader("retry requested")
 		task.wait(0.2)
 	end
-	startTrader()
+	if retryOrder then
+		local rid = tostring(retryOrder.request_id or retryOrder.order_id or "")
+		if rid ~= "" then
+			abandonedOrders[rid] = nil
+		end
+		startTrader(retryOrder)
+	else
+		startTrader()
+	end
 end
 
 startButton = button("Start", UDim2.fromOffset(12, 270), 195, startTrader)
 button("Stop", UDim2.fromOffset(220, 270), 195, function()
-	stopTrader("stopped by user")
+	stopTrader("stopped by user", "stopped_manually")
 end)
 button("Retry", UDim2.fromOffset(12, 300), 128, retryTrader, Color3.fromRGB(120, 95, 50))
 button("Copy Log", UDim2.fromOffset(149, 300), 128, copyLog, Color3.fromRGB(65, 105, 145))
@@ -2326,17 +2392,18 @@ RunService.Heartbeat:Connect(function()
 	end
 	retweenToTableIfNeeded()
 	local elapsed = os.clock() - (session.stageStartedAt or session.startedAt)
-	if state == "WAITING_FOR_CUSTOMER" and elapsed > CONFIG.CustomerWaitTimeout then
+	local waitedForCustomer = os.clock() - (session.customerWaitSince or session.startedAt)
+	if state == "WAITING_FOR_CUSTOMER" and waitedForCustomer > CONFIG.CustomerWaitTimeout then
 		setState("TIMEOUT")
-		stopTrader("customer arrival timeout")
+		stopTrader("customer did not arrive within " .. tostring(CONFIG.CustomerWaitTimeout) .. "s", "customer_no_show")
 	elseif state == "TRADE_STARTED" and elapsed > CONFIG.TradeStartTimeout then
 		setState("TIMEOUT")
-		stopTrader("trade offer timeout")
+		stopTrader("trade offer timeout", "trade_timeout")
 	elseif state ~= "WAITING_FOR_CUSTOMER" and state ~= "IDLE"
 		and state ~= "PROCESSING" and state ~= "VERIFYING_INVENTORY"
 		and state ~= "TIMEOUT" and elapsed > CONFIG.CompletionTimeout then
 		setState("TIMEOUT")
-		stopTrader("stage timeout: " .. state)
+		stopTrader("stage timeout: " .. state, "stage_timeout")
 	end
 end)
 
