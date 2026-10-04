@@ -185,7 +185,7 @@ local CONFIG = {
 -- ============================================================================
 CONFIG.TrashFlush = {
 	Enabled = true,               -- false = feature fully off
-	DryRun = true,                -- true = only log, never delete. Set to false to go live.
+	DryRun = false,                -- true = only log, never delete. Set to false to go live.
 	MaxRunSeconds = 900,          -- hard time cap; after this the farm script loads anyway
 	MaxAttemptsPerDay = 3,        -- failed runs allowed per trade-day before giving up until tomorrow
 	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
