@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.4 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.5 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,21 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v3.5
+#   - FIX: starting the watchdog no longer restarts clones that are already
+#     running. A clone this process had never launched had last_rejoin == 0,
+#     which counted as "due", so EVERY running clone was force-stopped within
+#     seconds of startup (logged as "scheduled rejoin"). Running clones are now
+#     "adopted": their rejoin timer starts from the moment the watchdog starts.
+#   - ADD: staggered rejoin deadlines. Clones used to share the same start time
+#     and so all came due together every interval, force-stopping the whole
+#     fleet back to back. Each clone's deadline is now offset by its position
+#     (clone k of N is due k/N of an interval earlier), spreading rejoins out.
+#   - ADD: single-instance lock (watchdog.lock, flock). A second `rw.py start`
+#     refuses to run and prints the PID of the one that holds the lock. The
+#     lock is released automatically if the process dies. NOTE: older versions
+#     (v3.4 and earlier) do not take the lock, so stop any old copies once.
 #
 # v3.4
 #   - ADD: log rotation. watchdog.log is rotated to watchdog.log.1 at 5 MB
@@ -99,6 +114,7 @@
 
 import base64
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -117,10 +133,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.4"
+VERSION = "3.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
+LOCK_PATH = os.path.join(BASE_DIR, "watchdog.lock")
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -147,6 +164,35 @@ def now_str() -> str:
 
 def clear_screen() -> None:
     os.system("clear")
+
+
+def acquire_instance_lock(path: str = LOCK_PATH):
+    """Take an exclusive, non-blocking lock so only one watchdog runs at a time.
+
+    Returns (file_handle, None) on success - keep the handle alive for as long
+    as the watchdog runs. Returns (None, holder_pid_text) if another instance
+    already holds the lock. The OS drops the lock automatically if the process
+    exits or is killed, so a crash can never leave a stale lock behind.
+    """
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            fh.seek(0)
+            holder = fh.read().strip() or "unknown"
+        except Exception:
+            holder = "unknown"
+        fh.close()
+        return None, holder
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()) + "\n")
+        fh.flush()
+    except Exception:
+        pass
+    return fh, None
 
 
 def parse_private_link(value: str) -> str:
@@ -780,6 +826,28 @@ class Watchdog:
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
 
+    def stagger_offset(self, t: Target) -> float:
+        """How much earlier than a full interval this clone's first rejoin falls.
+
+        Clone k (0-based, among enabled clones) of N gets k/N of an interval, so
+        deadlines are spread evenly instead of all landing at the same moment.
+        """
+        enabled = [x for x in self.targets if x.enabled]
+        if t not in enabled or t.rejoin_interval_min <= 0 or len(enabled) < 2:
+            return 0.0
+        k = enabled.index(t)
+        return (k / len(enabled)) * t.rejoin_interval_min * 60
+
+    def adopt(self, t: Target) -> None:
+        """Start a clone's rejoin timer WITHOUT restarting it."""
+        t.last_rejoin = time.time() - self.stagger_offset(t)
+
+    def adopt_running_targets(self) -> None:
+        for t in self.targets:
+            if t.enabled and t.last_rejoin == 0 and self.controller.is_running(t.package):
+                self.adopt(t)
+                self.log.log(f"{t.label}: already running at startup; adopted without restarting")
+
     def heartbeat(self, t: Target) -> None:
         if not self.hub.enabled:
             return
@@ -1056,6 +1124,7 @@ class Watchdog:
     def restart(self, t: Target, reason: str) -> None:
         if time.time() < t.cooldown_until:
             return
+        first_launch = (t.last_rejoin == 0)
         t.restarts += 1
         t.fail_streak += 1
         self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
@@ -1080,6 +1149,9 @@ class Watchdog:
         else:
             ok = self.controller.launch(t)
             t.last_rejoin = time.time()
+            if first_launch:
+                # spread the first rejoin deadline so clones don't all come due together
+                t.last_rejoin -= self.stagger_offset(t)
         self.last_launch_any = time.time()
         t.last_cpu = None
         t.stale_ticks = 0
@@ -1106,12 +1178,18 @@ class Watchdog:
             t.status = "cooldown"
             return
 
+        running = self.controller.is_running(t.package)
+
+        # A clone that is running but whose timer was never started (it appeared
+        # after startup, e.g. you opened it by hand) is adopted, not restarted.
+        if running and t.last_rejoin == 0:
+            self.adopt(t)
+            self.log.log(f"{t.label}: running with no rejoin timer; adopted without restarting")
+
         now = time.time()
         due = t.rejoin_interval_min > 0 and (
             t.last_rejoin == 0 or now - t.last_rejoin >= t.rejoin_interval_min * 60
         )
-
-        running = self.controller.is_running(t.package)
 
         # Log every appearance/disappearance so `grep PROCESS watchdog.log`
         # shows exactly when each clone died and in what order.
@@ -1193,6 +1271,9 @@ class Watchdog:
         # touching any Roblox process. This preserves TRADING across a watchdog
         # restart instead of temporarily telling LocalTrader to FARM.
         self.poll_hub()
+
+        # Do not restart clones that are already running; just start their timers.
+        self.adopt_running_targets()
 
         for t in self.targets:
             if t.enabled:
@@ -1555,6 +1636,12 @@ class App:
             print("No targets configured. Run Auto Setup first.")
             input("Press Enter...")
             return
+        lock_fh, holder = acquire_instance_lock()
+        if lock_fh is None:
+            print(f"Another watchdog is already running (PID {holder}).")
+            print("Stop it first (for example: pkill -f rw.py), then start again.")
+            input("Press Enter...")
+            return
         wd = Watchdog(
             self.targets,
             self.interval_sec,
@@ -1579,6 +1666,10 @@ class App:
             signal.signal(signal.SIGINT, old)
             _resane_tty()
             clear_screen()
+            try:
+                lock_fh.close()   # releases the single-instance lock
+            except Exception:
+                pass
 
     def menu(self) -> None:
         while True:
