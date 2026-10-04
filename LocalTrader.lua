@@ -3,6 +3,7 @@
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
 -- v1.1: daily trash-fruit flush built in (see CONFIG.TrashFlush below).
+-- v1.2: tweenToSeat is now lag-tolerant (long deadline, 3 retries, reports distance).
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1637,37 +1638,71 @@ local function isSeatedAtTradeTable()
 	return (p1 and p1.Occupant == humanoid) or (p2 and p2.Occupant == humanoid) or false
 end
 
+-- v1.2: lag-tolerant version. The old one gave the tween only duration+1s to
+-- finish, so on a busy phone (several clones running) it was judged "too far
+-- from the table" while the tween was still playing, and the order failed.
+-- Now: waits for the character, allows duration+20s per attempt, retries up
+-- to 3 times from wherever it currently is, and reports the real distance.
 local function tweenToSeat(seat)
 	if not seat then
 		return false, "trade table seat was not found"
 	end
-	local character = LocalPlayer.Character
-	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-	if not rootPart then
-		return false, "character root was not found"
+	if not waitForCharacterReady(30) then
+		return false, "character was not ready within 30s"
 	end
-	local target = seat.CFrame + Vector3.new(0, 2.5, 0)
-	local distance = (rootPart.Position - target.Position).Magnitude
-	if distance <= 5 then
-		rootPart.CFrame = target
-		return true
+
+	local TweenService = game:GetService("TweenService")
+	local lastDistance = math.huge
+
+	for attempt = 1, 3 do
+		local character = LocalPlayer.Character
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			local target = seat.CFrame + Vector3.new(0, 2.5, 0)
+			local distance = (rootPart.Position - target.Position).Magnitude
+			if distance <= 5 then
+				rootPart.CFrame = target
+				return true
+			end
+
+			local duration = math.clamp(distance / 100, 0.25, 8)
+			local tween = TweenService:Create(
+				rootPart,
+				TweenInfo.new(duration, Enum.EasingStyle.Linear),
+				{CFrame = target}
+			)
+			local completed = false
+			tween.Completed:Connect(function()
+				completed = true
+			end)
+			tween:Play()
+
+			-- generous deadline: lag on a busy phone can stretch a tween a lot
+			local deadline = os.clock() + duration + 20
+			while not completed and os.clock() < deadline and running do
+				task.wait(0.1)
+			end
+			if not completed then
+				tween:Cancel()
+			end
+			task.wait(0.5)
+
+			if LocalPlayer.Character == character and rootPart.Parent then
+				lastDistance = (rootPart.Position - target.Position).Magnitude
+				if lastDistance <= 8 then
+					return true
+				end
+			end
+		else
+			task.wait(1)
+		end
+		if not running then
+			break
+		end
+		debugLog(string.format("LocalTrader: tween attempt %d/3 ended %.1f studs away; retrying", attempt, lastDistance))
 	end
-	local duration = math.clamp(distance / 100, 0.25, 8)
-	local tween = game:GetService("TweenService"):Create(
-		rootPart,
-		TweenInfo.new(duration, Enum.EasingStyle.Linear),
-		{CFrame = target}
-	)
-	tween:Play()
-	local completed = false
-	tween.Completed:Connect(function()
-		completed = true
-	end)
-	local deadline = os.clock() + duration + 1
-	while not completed and os.clock() < deadline and running do
-		task.wait()
-	end
-	return (rootPart.Position - target.Position).Magnitude <= 8
+
+	return false, string.format("could not reach trade table (last distance %.1f studs)", lastDistance)
 end
 
 local function jumpOutOfTrade()
