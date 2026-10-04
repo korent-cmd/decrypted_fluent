@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.5 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.6 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,19 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v3.6  (diagnostic build - for the "everything hides after a trade" problem)
+#   - ADD: flight recorder -> flight_recorder.log (2 MB cap, rotates to .1).
+#     At every transition that force-stops a clone (ENTER TRADING, RETURN TO
+#     FARMING, any restart) it writes a snapshot BEFORE the stop and again
+#     ~5 s, ~20 s and ~60 s later: which activity is on top / has focus, the PID
+#     and uptime (ETIME) of system_server, com.og.launcher, Termux and every
+#     Roblox clone, free memory, and (late snapshots) recent kill/death/start
+#     events from logcat. Snapshots are scheduled, not slept on, so the watchdog
+#     loop keeps running. First line records the Android version.
+#   - ADD (experimental, OFF by default): "focus handoff". When ON, Termux is
+#     brought to the front just before a clone is force-stopped, so the clone
+#     being killed is not the focused window. Toggle with menu option 9.
 #
 # v3.5
 #   - FIX: starting the watchdog no longer restarts clones that are already
@@ -133,11 +146,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.5"
+VERSION = "3.6"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
 LOCK_PATH = os.path.join(BASE_DIR, "watchdog.lock")
+RECORDER_PATH = os.path.join(BASE_DIR, "flight_recorder.log")
+RECORDER_MAX_BYTES = 2_000_000
+SNAPSHOT_DELAYS = (5, 20, 60)   # seconds after a transition
 
 PACKAGE_MARKERS = ["roblox", "rbx"]
 CLONER_BLOCKLIST = [
@@ -806,6 +822,7 @@ class Watchdog:
         hub_poll_sec: int,
         logger: Logger,
         crash_restart_enabled: bool = False,
+        focus_handoff: bool = False,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -822,9 +839,87 @@ class Watchdog:
         self.next_hub_poll = 0.0
         self.last_crash_restart = 0.0
         self.last_launch_any = 0.0
+        self.focus_handoff = focus_handoff
+        self.pending_snapshots: List[Tuple[float, str, int]] = []
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
+
+    # ------------------------------------------------------------------
+    # Flight recorder
+    # ------------------------------------------------------------------
+    def rec_write(self, text: str) -> None:
+        try:
+            try:
+                if os.path.getsize(RECORDER_PATH) > RECORDER_MAX_BYTES:
+                    os.replace(RECORDER_PATH, RECORDER_PATH + ".1")
+            except OSError:
+                pass
+            with open(RECORDER_PATH, "a", encoding="utf-8") as f:
+                f.write(text.rstrip() + "\n")
+        except Exception:
+            pass
+
+    def _rec_shell(self, script: str, timeout: int = 40) -> str:
+        """Run a root script WITHOUT writing it (or its output) to watchdog.log."""
+        cmd = script if self.shell.is_root() else "su -c " + shlex.quote(script)
+        try:
+            p = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=timeout)
+            return (p.stdout or "").strip() + (("\nERR " + p.stderr.strip()[-300:]) if p.stderr.strip() else "")
+        except subprocess.TimeoutExpired:
+            return f"(snapshot timed out after {timeout}s)"
+        except Exception as e:
+            return f"(snapshot failed: {e})"
+        finally:
+            _resane_tty()
+
+    def snapshot(self, tag: str, stage: str, extra_events: bool = False) -> None:
+        script = (
+            'echo "-- top activity"; '
+            'dumpsys activity activities 2>/dev/null | grep -m4 -E "topResumedActivity|ResumedActivity|mFocusedApp"; '
+            'echo "-- window focus"; '
+            'dumpsys window 2>/dev/null | grep -m3 -E "mCurrentFocus|mFocusedApp"; '
+            'echo "-- processes (PID ETIME NAME)"; '
+            '(ps -A -o PID,ETIME,NAME 2>/dev/null || ps -A 2>/dev/null) | '
+            'grep -E "system_server|og\\.launcher|com\\.termux|com\\.roblox"; '
+            'echo "-- memory"; grep -E "MemTotal|MemAvailable" /proc/meminfo'
+        )
+        if extra_events:
+            script += (
+                '; echo "-- recent kills / deaths / starts (logcat events)"; '
+                'logcat -b events -d -t 800 2>/dev/null | grep -E "am_kill|am_proc_died|am_proc_start" | '
+                'grep -E "og\\.launcher|com\\.termux|com\\.roblox" | tail -30'
+            )
+        out = self._rec_shell(script)
+        states = ", ".join(f"{x.package.split('.')[-1]}={x.status}" for x in self.targets if x.enabled)
+        self.rec_write(f"===== {now_str()}  {tag}  [{stage}] =====\nwatchdog view: {states}\n{out}\n")
+
+    def schedule_snapshots(self, tag: str) -> None:
+        now = time.time()
+        for d in SNAPSHOT_DELAYS:
+            self.pending_snapshots.append((now + d, tag, d))
+        self.pending_snapshots = self.pending_snapshots[-60:]
+
+    def run_due_snapshots(self) -> None:
+        """Run at most one overdue snapshot per call, so the main loop never stalls."""
+        now = time.time()
+        for i, (due, tag, d) in enumerate(self.pending_snapshots):
+            if due <= now:
+                self.pending_snapshots.pop(i)
+                self.snapshot(tag, f"T+{d}s (ran {int(now - due)}s late)" if now - due > 2 else f"T+{d}s",
+                              extra_events=(d >= 20))
+                return
+
+    def prepare_stop(self, t: Target, tag: str) -> None:
+        """Called right before a clone is force-stopped."""
+        full_tag = f"{t.label} {tag}"
+        self.snapshot(full_tag, "T-0 (before force-stop)")
+        self.schedule_snapshots(full_tag)
+        if self.focus_handoff:
+            # Experimental: make sure the clone about to die is not the focused window.
+            self.log.log(f"{t.label}: focus handoff -> Termux before force-stop")
+            self.shell.root("am start -n com.termux/.app.TermuxActivity", timeout=10)
+            time.sleep(1.0)
 
     def stagger_offset(self, t: Target) -> float:
         """How much earlier than a full interval this clone's first rejoin falls.
@@ -1018,6 +1113,7 @@ class Watchdog:
         self.log.log(f"{t.label}: ENTER TRADING")
         t.status = "switching_to_trading"
         self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
+        self.prepare_stop(t, "ENTER_TRADING")
         self.controller.force_stop(t)
         time.sleep(1)
         ok = self.controller.launch_trading(t, self.trading_share_link)
@@ -1038,6 +1134,7 @@ class Watchdog:
         self.log.log(f"{t.label}: RETURN TO FARMING")
         t.status = "switching_to_farming"
         self.notify(t, t.status, "return_to_farming")
+        self.prepare_stop(t, "RETURN_TO_FARMING")
         self.controller.force_stop(t)
         time.sleep(1)
         ok = self.controller.launch(t)
@@ -1142,6 +1239,7 @@ class Watchdog:
         # so this can never block the relaunch below it.
         self.sync_localtrader_config(t)
         self.wake()
+        self.prepare_stop(t, f"RESTART ({reason})")
         self.controller.force_stop(t)
         time.sleep(2.5)
         if t.hub_state == "TRADING":
@@ -1267,6 +1365,12 @@ class Watchdog:
         else:
             self.log.log("Hub disabled (set Hub URL + token in Hub Settings)")
 
+        self.rec_write(
+            f"\n######## watchdog v{VERSION} started {now_str()} | android: "
+            + self._rec_shell('getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.model')
+            .replace("\n", " / ") + f" | focus_handoff={'ON' if self.focus_handoff else 'OFF'}"
+        )
+
         # Pull the real desired state BEFORE writing LocalTrader_Hub.json or
         # touching any Roblox process. This preserves TRADING across a watchdog
         # restart instead of temporarily telling LocalTrader to FARM.
@@ -1284,6 +1388,7 @@ class Watchdog:
             last_tick = 0.0
             while self.running:
                 self.poll_hub()
+                self.run_due_snapshots()
                 now = time.time()
                 if now - last_tick >= self.interval_sec:
                     last_tick = now
@@ -1344,6 +1449,7 @@ class App:
         self.interval_sec = 20
         self.hang_sec = 90
         self.crash_restart_enabled = False
+        self.focus_handoff = False
         self.trading_share_link = DEFAULT_TRADING_SHARE_LINK
         self.hub_url = ""
         self.hub_token = ""
@@ -1359,6 +1465,7 @@ class App:
             self.interval_sec = int(c.get("check_interval_sec", 20))
             self.hang_sec = int(c.get("hang_detection_sec", 90))
             self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
+            self.focus_handoff = bool(c.get("focus_handoff", False))
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
@@ -1374,6 +1481,7 @@ class App:
             "check_interval_sec": self.interval_sec,
             "hang_detection_sec": self.hang_sec,
             "crash_restart_enabled": self.crash_restart_enabled,
+            "focus_handoff": self.focus_handoff,
             "trading_share_link": self.trading_share_link,
             "hub": {
                 "url": self.hub_url,
@@ -1652,6 +1760,7 @@ class App:
             self.hub_poll_sec,
             self.logger,
             self.crash_restart_enabled,
+            self.focus_handoff,
         )
 
         def sigint(_sig, _frame):
@@ -1680,6 +1789,7 @@ class App:
             print(f"Hub: {self.hub_url or 'OFF'}")
             print(f"Trading PS: {parse_private_link(self.trading_share_link) or 'INVALID'}")
             print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
+            print(f"Focus handoff: {'ON (experimental)' if self.focus_handoff else 'OFF'}")
             print()
             print("1. Auto setup")
             print("2. Start watchdog")
@@ -1689,6 +1799,7 @@ class App:
             print("6. Diagnostics")
             print("7. Plain mode")
             print("8. Toggle crash-restart")
+            print("9. Toggle focus handoff (experimental)")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -1714,6 +1825,14 @@ class App:
                     print(f"(no checks for {Watchdog.GRACE_AFTER_LAUNCH_SEC}s after a launch; a clone must")
                     print(f" look bad {Watchdog.CONFIRM_BAD_TICKS} checks in a row, and only one clone is")
                     print(f" crash-restarted every {Watchdog.MIN_GAP_BETWEEN_CRASH_RESTARTS}s.)")
+                input("Press Enter...")
+            elif choice == "9":
+                self.focus_handoff = not self.focus_handoff
+                self.save()
+                print(f"\nFocus handoff is now {'ON' if self.focus_handoff else 'OFF'}.")
+                if self.focus_handoff:
+                    print("Termux is brought to the front just before a clone is force-stopped,")
+                    print("so the clone being killed is never the focused window.")
                 input("Press Enter...")
             elif choice == "0":
                 return
