@@ -4,6 +4,8 @@
 --
 -- v1.1: daily trash-fruit flush built in (see CONFIG.TrashFlush below).
 -- v1.2: tweenToSeat is now lag-tolerant (long deadline, 3 retries, reports distance).
+-- v1.3: travel gets its own time budget (CONFIG.TravelTimeout) and is exempt from the
+--        generic 45s stage timeout; every travel attempt is logged.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -159,6 +161,7 @@ local CONFIG = {
 	InventoryRefreshInterval = 2,
 	MaxLogLines = 200,
 	RetweenInterval = 4,
+	TravelTimeout = 90,           -- total seconds allowed to reach the trade table
 }
 
 -- ============================================================================
@@ -182,7 +185,7 @@ local CONFIG = {
 -- ============================================================================
 CONFIG.TrashFlush = {
 	Enabled = true,               -- false = feature fully off
-	DryRun = false,                -- true = only log, never delete. Set to false to go live.
+	DryRun = true,                -- true = only log, never delete. Set to false to go live.
 	MaxRunSeconds = 900,          -- hard time cap; after this the farm script loads anyway
 	MaxAttemptsPerDay = 3,        -- failed runs allowed per trade-day before giving up until tomorrow
 	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
@@ -1638,12 +1641,12 @@ local function isSeatedAtTradeTable()
 	return (p1 and p1.Occupant == humanoid) or (p2 and p2.Occupant == humanoid) or false
 end
 
--- v1.2: lag-tolerant version. The old one gave the tween only duration+1s to
--- finish, so on a busy phone (several clones running) it was judged "too far
--- from the table" while the tween was still playing, and the order failed.
--- Now: waits for the character, allows duration+20s per attempt, retries up
--- to 3 times from wherever it currently is, and reports the real distance.
-local function tweenToSeat(seat)
+-- v1.3: time-budgeted travel. The old version gave the tween only duration+1s
+-- (v1.0) or 3 attempts (v1.2), and the Heartbeat loop additionally killed any
+-- stage after 45s. Now: waits for the character, keeps retrying from wherever
+-- it currently is until `budgetSeconds` (default CONFIG.TravelTimeout) runs
+-- out, logs every attempt, and reports the real distance on failure.
+local function tweenToSeat(seat, budgetSeconds)
 	if not seat then
 		return false, "trade table seat was not found"
 	end
@@ -1652,9 +1655,13 @@ local function tweenToSeat(seat)
 	end
 
 	local TweenService = game:GetService("TweenService")
+	local startedAt = os.clock()
+	local budget = budgetSeconds or CONFIG.TravelTimeout
 	local lastDistance = math.huge
+	local attempt = 0
 
-	for attempt = 1, 3 do
+	while os.clock() - startedAt < budget and running do
+		attempt = attempt + 1
 		local character = LocalPlayer.Character
 		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
 		if rootPart then
@@ -1677,7 +1684,7 @@ local function tweenToSeat(seat)
 			end)
 			tween:Play()
 
-			-- generous deadline: lag on a busy phone can stretch a tween a lot
+			-- generous per-attempt deadline: lag on a busy phone can stretch a tween a lot
 			local deadline = os.clock() + duration + 20
 			while not completed and os.clock() < deadline and running do
 				task.wait(0.1)
@@ -1693,16 +1700,21 @@ local function tweenToSeat(seat)
 					return true
 				end
 			end
+			debugLog(string.format(
+				"LocalTrader: travel attempt %d at %.0fs: started %.0f studs out, now %.1f away (tween %s)",
+				attempt, os.clock() - startedAt, distance, lastDistance,
+				completed and "finished" or "timed out"
+			))
 		else
 			task.wait(1)
 		end
-		if not running then
-			break
-		end
-		debugLog(string.format("LocalTrader: tween attempt %d/3 ended %.1f studs away; retrying", attempt, lastDistance))
+		task.wait(2)
 	end
 
-	return false, string.format("could not reach trade table (last distance %.1f studs)", lastDistance)
+	return false, string.format(
+		"could not reach trade table after %.0fs (last distance %.1f studs, %d attempts)",
+		os.clock() - startedAt, lastDistance, attempt
+	)
 end
 
 local function jumpOutOfTrade()
@@ -2411,7 +2423,7 @@ local function retweenToTableIfNeeded()
 	end
 	session.lastRetween = os.clock()
 	setState("TRAVELING_TO_TABLE")
-	local moved, errorMessage = tweenToSeat(targetSeat)
+	local moved, errorMessage = tweenToSeat(targetSeat, 20)
 	if moved then
 		setState("WAITING_FOR_CUSTOMER", "re-tween complete")
 		writeLog("re-tweened to trade table")
@@ -2436,6 +2448,7 @@ RunService.Heartbeat:Connect(function()
 		stopTrader("trade offer timeout", "trade_timeout")
 	elseif state ~= "WAITING_FOR_CUSTOMER" and state ~= "IDLE"
 		and state ~= "PROCESSING" and state ~= "VERIFYING_INVENTORY"
+		and state ~= "TRAVELING_TO_TABLE"
 		and state ~= "TIMEOUT" and elapsed > CONFIG.CompletionTimeout then
 		setState("TIMEOUT")
 		stopTrader("stage timeout: " .. state, "stage_timeout")
