@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.2 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.4 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,33 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v3.4
+#   - ADD: log rotation. watchdog.log is rotated to watchdog.log.1 at 5 MB
+#     (one old copy kept), so it can never grow to hundreds of MB again.
+#   - FIX: the Hub token no longer ends up in watchdog.log. The Workspace
+#     config sync command contains the token (base64) and used to be logged
+#     verbatim; it is now logged as "<redacted>".
+#   - ADD: `id -u` result is cached (it never changes), removing about a third
+#     of the log noise and a su-free subprocess call per command.
+#   - FIX (crash-restart): error_dialog() used to grep ALL of `dumpsys window`
+#     and return true if ANY window matched, so one match made EVERY clone
+#     report "dialog" in the same tick and everything restarted together.
+#     It is now per-package. health() also now has: a grace period after each
+#     launch (no checks while the game is loading), a requirement that a clone
+#     looks bad on 2 consecutive checks, a 5-minute minimum before "hung", and
+#     a global minimum gap between crash restarts so clones restart one at a
+#     time instead of all at once. dismiss_dialog() was removed: it sent
+#     ENTER/BACK to whatever window was focused, possibly another clone.
+#   - CHANGE: a not-running clone is now relaunched as soon as it has been
+#     confirmed not running (3 polls), instead of waiting for its rejoin
+#     timer (which could be up to 45 minutes). Launches are staggered by at
+#     least LAUNCH_STAGGER_SEC so several cold starts never happen at once.
+#   - ADD: "PROCESS STARTED / DIED" lines in the log, so
+#     `grep PROCESS watchdog.log` shows exactly when each clone disappeared.
+#   - FIX: Controller.pid() fallback matched package names by substring
+#     (a running sibling clone could make a dead one look alive). It now
+#     matches the exact process name.
 #
 # v3.3
 #   - FIX: restart() called self.controller.wake()/self.controller.dismiss_dialog(),
@@ -90,7 +117,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.3"
+VERSION = "3.4"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -223,6 +250,8 @@ def _resane_tty() -> None:
 
 
 class Logger:
+    MAX_BYTES = 5_000_000   # rotate at 5 MB, keeping one old copy (.1)
+
     def __init__(self, path: str) -> None:
         self.path = path
         self.lines: List[str] = []
@@ -231,6 +260,11 @@ class Logger:
         line = f"[{now_str()}] {msg}"
         self.lines.append(line)
         self.lines = self.lines[-80:]
+        try:
+            if os.path.getsize(self.path) > self.MAX_BYTES:
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass  # file doesn't exist yet, or rotation failed; just keep logging
         try:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -242,9 +276,14 @@ class Shell:
     def __init__(self, logger: Logger):
         self.logger = logger
         self._cache: Dict[str, str] = {}
+        self._is_root: Optional[bool] = None
 
-    def run(self, cmd: str, timeout: int = 10, check: bool = False) -> subprocess.CompletedProcess:
-        self.logger.log("$ " + cmd)
+    def run(self, cmd: str, timeout: int = 10, check: bool = False,
+            redact: bool = False) -> subprocess.CompletedProcess:
+        # redact=True keeps the command text out of the log (used for the
+        # Workspace config sync, whose command line contains the Hub token).
+        shown = "<redacted>" if redact else cmd
+        self.logger.log("$ " + shown)
         try:
             # NOTE: stdin is intentionally left connected (inherited), not
             # redirected to DEVNULL. Some root-manager prompts on this class
@@ -263,12 +302,12 @@ class Shell:
             # whole script instead of just failing this one call. Confirmed
             # by direct test: a hung su reproduces exactly this traceback
             # without this handling.
-            self.logger.log(f"TIMEOUT after {timeout}s: {cmd}")
+            self.logger.log(f"TIMEOUT after {timeout}s: {shown}")
             _resane_tty()
             return subprocess.CompletedProcess(args=cmd, returncode=124, stdout="",
                                                stderr=f"timeout after {timeout}s")
         except FileNotFoundError as e:
-            self.logger.log(f"NOT FOUND: {cmd}: {e}")
+            self.logger.log(f"NOT FOUND: {shown}: {e}")
             return subprocess.CompletedProcess(args=cmd, returncode=127, stdout="",
                                                stderr=str(e))
         finally:
@@ -281,7 +320,7 @@ class Shell:
         if p.stderr.strip():
             self.logger.log("ERR " + p.stderr.strip()[-1000:])
         if check and p.returncode != 0:
-            raise RuntimeError(f"command failed ({p.returncode}): {cmd}")
+            raise RuntimeError(f"command failed ({p.returncode}): {shown}")
         return p
 
     def out(self, cmd: str, timeout: int = 10) -> str:
@@ -302,7 +341,10 @@ class Shell:
         return value
 
     def is_root(self) -> bool:
-        return self.out("id -u") == "0"
+        # The uid of this process never changes, so ask once and remember.
+        if self._is_root is None:
+            self._is_root = self.out("id -u") == "0"
+        return self._is_root
 
     def has_root_access(self) -> bool:
         # is_root() only tells us whether Termux itself is already UID 0.
@@ -313,10 +355,10 @@ class Shell:
         out = self.out("su -c id", timeout=15)
         return "uid=0" in out
 
-    def root(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
+    def root(self, cmd: str, timeout: int = 10, redact: bool = False) -> subprocess.CompletedProcess:
         if self.is_root():
-            return self.run(cmd, timeout=timeout)
-        return self.run("su -c " + shlex.quote(cmd), timeout=timeout)
+            return self.run(cmd, timeout=timeout, redact=redact)
+        return self.run("su -c " + shlex.quote(cmd), timeout=timeout, redact=redact)
 
     def root_out(self, cmd: str, timeout: int = 10) -> str:
         try:
@@ -475,15 +517,18 @@ class Controller:
         out = self.s.root_out(f"pidof {shlex.quote(package)} 2>/dev/null")
         if out:
             return out.split()[0]
-        out = self.s.root_out(f"ps -A 2>/dev/null | grep -F {shlex.quote(package)} | grep -v grep")
-        if out:
-            m = re.search(r"\b(\d+)\b", out)
-            if m:
-                return m.group(1)
+        # v3.4: exact process-name match. The old `grep -F <package>` was a
+        # substring match, so a running sibling clone whose name merely
+        # contained this package name could make a dead one look alive.
+        out = self.s.root_out(
+            f"ps -A 2>/dev/null | awk -v p={shlex.quote(package)} '$NF==p{{print $2; exit}}'"
+        )
+        if out.strip():
+            return out.strip().split()[0]
         # Fallback for installs whose actual running process name doesn't
         # match their package name at all - common with APK-cloned or
         # repackaged Roblox instances, which can leave pidof and the
-        # name-grep above unable to ever find the process even while it's
+        # name match above unable to ever find the process even while it's
         # genuinely running. Every installed package still gets its own
         # unique Android UID from the package manager, so resolve that and
         # match a running process by UID instead. Purely additive: only
@@ -696,6 +741,14 @@ class Controller:
 class Watchdog:
     NOT_RUNNING_CONFIRM_TICKS = 3
 
+    # --- crash-restart tuning (only used when crash-restart is ON) ----------
+    GRACE_AFTER_LAUNCH_SEC = 240          # no health checks this long after a launch
+    CONFIRM_BAD_TICKS = 2                 # must look bad this many checks in a row
+    MIN_GAP_BETWEEN_CRASH_RESTARTS = 45   # seconds between crash restarts, any clone
+    MIN_HUNG_SEC = 300                    # zero CPU change this long before "hung"
+    # --- launch spacing ------------------------------------------------------
+    LAUNCH_STAGGER_SEC = 8                # min seconds between any two cold starts
+
     def __init__(
         self,
         targets: List[Target],
@@ -721,6 +774,8 @@ class Watchdog:
         self.crash_restart_enabled = crash_restart_enabled
         self.running = False
         self.next_hub_poll = 0.0
+        self.last_crash_restart = 0.0
+        self.last_launch_any = 0.0
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
@@ -828,7 +883,9 @@ class Watchdog:
                 "mv -f \"$tmp\" \"$d/" + LOCALTRADER_CONFIG_NAME + "\"; done"
             )
 
-        result = self.shell.root(cmd, timeout=15)
+        # redact=True: the command line contains the Hub token (base64), so
+        # it must not be written to watchdog.log.
+        result = self.shell.root(cmd, timeout=15, redact=True)
         if result.returncode != 0:
             self.log.log(f"{target.label if target else 'all clones'}: LocalTrader config sync failed: {result.stderr.strip()[:500]}")
         else:
@@ -896,6 +953,7 @@ class Watchdog:
         self.controller.force_stop(t)
         time.sleep(1)
         ok = self.controller.launch_trading(t, self.trading_share_link)
+        self.last_launch_any = time.time()
         t.trading_join_attempted = True
         if ok:
             t.status = "trading_joining"
@@ -915,6 +973,7 @@ class Watchdog:
         self.controller.force_stop(t)
         time.sleep(1)
         ok = self.controller.launch(t)
+        self.last_launch_any = time.time()
         t.trading_join_attempted = False
         if ok:
             t.status = "launching"
@@ -923,8 +982,6 @@ class Watchdog:
         else:
             t.status = "error"
             t.fail_streak += 1
-
-    HANG_TICKS = 3
 
     def cpu_ticks(self, pid: str) -> Optional[int]:
         out = self.shell.root_out(f"cat /proc/{shlex.quote(pid)}/stat 2>/dev/null", timeout=15)
@@ -937,18 +994,20 @@ class Watchdog:
         except (IndexError, ValueError):
             return None
 
-    def error_dialog(self) -> bool:
+    def error_dialog(self, package: str) -> bool:
+        """True only if a crash/ANR dialog naming THIS package is on screen.
+
+        The old version grepped all of `dumpsys window` with no package
+        filter, so a match from any window made every clone look crashed.
+        """
+        pat = re.escape(package) + r"([^A-Za-z0-9_.]|$)"
         out = self.shell.root_out(
-            "dumpsys window 2>/dev/null | grep -m3 -iE "
-            "'Application Error|aerr|anr |isn.t responding|has stopped'",
+            "dumpsys window 2>/dev/null | grep -iE "
+            "'Application Error|Application Not Responding' | grep -E "
+            + shlex.quote(pat),
             timeout=25,
         )
         return bool(out.strip())
-
-    def dismiss_dialog(self) -> None:
-        self.shell.root("input keyevent KEYCODE_ENTER", timeout=15)
-        time.sleep(0.5)
-        self.shell.root("input keyevent KEYCODE_BACK", timeout=15)
 
     def wake(self) -> None:
         out = self.shell.root_out(
@@ -964,17 +1023,34 @@ class Watchdog:
         pid = self.controller.pid(t.package)
         if not pid:
             return "dead"
-        if self.error_dialog():
-            return "dialog"
-        ticks = self.cpu_ticks(pid)
-        if ticks is not None:
-            if t.last_cpu is not None and ticks <= t.last_cpu:
-                t.stale_ticks += 1
-            else:
-                t.stale_ticks = 0
-            t.last_cpu = ticks
-            if t.stale_ticks >= self.HANG_TICKS:
-                return "hung"
+        now = time.time()
+
+        # Still loading after a launch: don't judge it yet.
+        if t.last_launch and now - t.last_launch < self.GRACE_AFTER_LAUNCH_SEC:
+            t.last_cpu = None
+            t._stale_since = 0.0
+            t._bad_ticks = 0
+            return "ok"
+
+        bad = None
+        if self.error_dialog(t.package):
+            bad = "dialog"
+        else:
+            ticks = self.cpu_ticks(pid)
+            if ticks is not None:
+                if t.last_cpu is not None and ticks <= t.last_cpu:
+                    if not getattr(t, "_stale_since", 0.0):
+                        t._stale_since = now
+                    if now - t._stale_since >= max(self.hang_sec, self.MIN_HUNG_SEC):
+                        bad = "hung"
+                else:
+                    t._stale_since = 0.0
+                t.last_cpu = ticks
+
+        if bad:
+            t._bad_ticks = getattr(t, "_bad_ticks", 0) + 1
+            return bad if t._bad_ticks >= self.CONFIRM_BAD_TICKS else "ok"
+        t._bad_ticks = 0
         return "ok"
 
     def restart(self, t: Target, reason: str) -> None:
@@ -997,9 +1073,6 @@ class Watchdog:
         # so this can never block the relaunch below it.
         self.sync_localtrader_config(t)
         self.wake()
-        if reason == "dialog":
-            self.dismiss_dialog()
-            time.sleep(1)
         self.controller.force_stop(t)
         time.sleep(2.5)
         if t.hub_state == "TRADING":
@@ -1007,6 +1080,7 @@ class Watchdog:
         else:
             ok = self.controller.launch(t)
             t.last_rejoin = time.time()
+        self.last_launch_any = time.time()
         t.last_cpu = None
         t.stale_ticks = 0
         t.not_running_ticks = 0
@@ -1038,43 +1112,60 @@ class Watchdog:
         )
 
         running = self.controller.is_running(t.package)
+
+        # Log every appearance/disappearance so `grep PROCESS watchdog.log`
+        # shows exactly when each clone died and in what order.
+        prev = getattr(t, "_was_running", None)
+        if prev is not None and prev != running:
+            self.log.log(f"{t.label}: PROCESS {'STARTED' if running else 'DIED'}")
+        t._was_running = running
+
         if not running:
             # Android can briefly report no PID while Roblox is transitioning,
-            # so debounce a few ticks before acting. But once confirmed,
-            # actually launching a not-running instance is always the
-            # watchdog's job - crash_restart_enabled only controls whether to
-            # aggressively restart something that IS running but looks
-            # unhealthy (hangs, error dialogs), not whether to ever start
-            # something that isn't running at all. TRADING accounts recover
-            # unconditionally once confirmed (an assigned trade sitting dead
-            # helps nobody and has no "scheduled interval" concept); FARMING
-            # accounts recover once confirmed AND due (or never launched).
+            # so debounce a few ticks before acting. Once confirmed, launching
+            # a not-running instance is always the watchdog's job:
+            #   - TRADING accounts recover immediately.
+            #   - FARMING accounts now also recover immediately (v3.4); before,
+            #     a killed clone sat dead until its rejoin timer came due.
+            # crash_restart_enabled only controls whether to restart something
+            # that IS running but looks unhealthy.
             t.not_running_ticks += 1
             t.last_cpu = None
             t.stale_ticks = 0
 
             confirmed = t.not_running_ticks >= self.NOT_RUNNING_CONFIRM_TICKS
-            should_launch = confirmed and (t.hub_state == "TRADING" or due)
+            should_launch = confirmed
+
+            # Spread out cold starts: several at once overload the phone and
+            # make Android's low-memory killer kill the other clones.
+            if should_launch and time.time() - self.last_launch_any < self.LAUNCH_STAGGER_SEC:
+                should_launch = False
 
             if should_launch:
                 if t.hub_state == "TRADING":
                     reason = "trading session not running"
                 elif t.last_rejoin == 0:
                     reason = "initial join"
-                else:
+                elif due:
                     reason = "scheduled rejoin (was not running)"
+                else:
+                    reason = "process died; relaunching"
                 t.status = "launching"
                 self.restart(t, reason)
                 t.not_running_ticks = 0
+            elif confirmed:
+                t.status = "not running (waiting for launch slot)"
             else:
-                t.status = f"not running ({t.not_running_ticks}x, waiting for timer)"
+                t.status = f"not running ({t.not_running_ticks}x)"
             self.heartbeat(t)
             return
 
         t.not_running_ticks = 0
         if self.crash_restart_enabled:
             state = self.health(t)
-            if state in ("hung", "dialog"):
+            if (state in ("hung", "dialog")
+                    and time.time() - self.last_crash_restart >= self.MIN_GAP_BETWEEN_CRASH_RESTARTS):
+                self.last_crash_restart = time.time()
                 t.status = state
                 self.restart(t, state)
                 self.heartbeat(t)
@@ -1402,8 +1493,8 @@ class App:
         for t in self.targets:
             print(f"{t.label}: package={t.package} hub_id={t.hub_id}")
             pidof_out = self.shell.out("pidof " + shlex.quote(t.package))
-            name_grep_out = self.shell.out(
-                "ps -A 2>/dev/null | grep -F " + shlex.quote(t.package) + " | grep -v grep"
+            name_match_out = self.shell.out(
+                "ps -A 2>/dev/null | awk -v p=" + shlex.quote(t.package) + " '$NF==p{print $2; exit}'"
             )
             resolved_uid = controller.resolve_uid(t.package)
             uid_ps_out = ""
@@ -1413,7 +1504,7 @@ class App:
                 )
             detected_pid = controller.pid(t.package)
             print(f"    pidof {t.package} -> {pidof_out!r}")
-            print(f"    ps -A grep {t.package} -> {name_grep_out!r}")
+            print(f"    ps -A exact name {t.package} -> {name_match_out!r}")
             print(f"    resolved uid -> {resolved_uid!r}")
             print(f"    ps by uid {resolved_uid} -> {uid_ps_out!r}")
             print(f"    => Controller.pid() result: {detected_pid or 'NOT FOUND'}")
@@ -1529,9 +1620,9 @@ class App:
                 state = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
                 print(f"\nCrash-restart is now {state}.")
                 if self.crash_restart_enabled:
-                    print(f"(requires {Watchdog.NOT_RUNNING_CONFIRM_TICKS} consecutive")
-                    print(" 'not running' polls before it actually restarts anything,")
-                    print(" to avoid a single flaky pidof/su read triggering a restart.)")
+                    print(f"(no checks for {Watchdog.GRACE_AFTER_LAUNCH_SEC}s after a launch; a clone must")
+                    print(f" look bad {Watchdog.CONFIRM_BAD_TICKS} checks in a row, and only one clone is")
+                    print(f" crash-restarted every {Watchdog.MIN_GAP_BETWEEN_CRASH_RESTARTS}s.)")
                 input("Press Enter...")
             elif choice == "0":
                 return
