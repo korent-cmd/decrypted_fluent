@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.7 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.8 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,23 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v3.8
+#   - FIX: "everything crashes after a trade". When the Hub flipped every
+#     account TRADING -> FARMING, poll_hub() force-stopped and cold-started ALL
+#     clones back to back (the launch stagger only existed in tick()). The
+#     memory spike made Android's low-memory killer take the background clones
+#     and Termux. Hub-triggered transitions are now QUEUED and run one clone
+#     at a time, TRANSITION_GAP_SEC apart.
+#   - ADD: Termux protection. At startup and every PROTECT_EVERY_SEC the
+#     watchdog sets oom_score_adj -900 on com.termux and itself (root), and
+#     calls termux-wake-lock once, so the low-memory killer prefers anything
+#     else.
+#   - ADD (OFF by default): "soft return" (menu option 10). On RETURN TO
+#     FARMING, if the clone is already running it is NOT force-stopped; the
+#     farming deep link is sent into the running clone instead, avoiding the
+#     cold-start spike. Only enable if joining the link from inside a running
+#     Roblox works on your clones.
 #
 # v3.7
 #   - FIX: "zombie" clones. The clones are App Cloner clones, and App Cloner's
@@ -160,7 +177,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.7"
+VERSION = "3.8"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -827,6 +844,9 @@ class Watchdog:
     # --- zombie (process alive, no Activity) detection -----------------------
     ZOMBIE_CONFIRM_TICKS = 3              # consecutive checks with no Activity
     ZOMBIE_GRACE_SEC = 90                 # don't judge a clone this soon after launch
+    # --- hub transition queue / Termux protection (v3.8) ---------------------
+    TRANSITION_GAP_SEC = 20               # min seconds between queued TRADING/FARMING switches
+    PROTECT_EVERY_SEC = 60                # how often to re-apply Termux oom protection
     ACTIVITY_CACHE_SEC = 8                # share one dumpsys across clones
 
     def __init__(
@@ -841,6 +861,7 @@ class Watchdog:
         logger: Logger,
         crash_restart_enabled: bool = False,
         focus_handoff: bool = False,
+        soft_return: bool = False,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -858,6 +879,11 @@ class Watchdog:
         self.last_crash_restart = 0.0
         self.last_launch_any = 0.0
         self.focus_handoff = focus_handoff
+        self.soft_return = soft_return
+        self.pending_transitions: List[Tuple[Target, str]] = []
+        self.last_protect = 0.0
+        self._last_protect_out = ""
+        self._wakelock_done = False
         self.pending_snapshots: List[Tuple[float, str, int]] = []
         self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
 
@@ -1148,10 +1174,13 @@ class Watchdog:
                     # Write the NEW state before launching/restarting Roblox so
                     # LocalTrader never starts with stale FARMING/TRADING mode.
                     self.sync_localtrader_config(t)
+                    # v3.8: queue the transition instead of running it right
+                    # here, so clones switch one at a time instead of all
+                    # force-stopping and cold-starting together.
                     if desired == "TRADING" and old != "TRADING":
-                        self.enter_trading(t)
+                        self.queue_transition(t, "enter_trading")
                     elif desired == "FARMING" and old == "TRADING":
-                        self.return_to_farming(t)
+                        self.queue_transition(t, "return_to_farming")
                     t._synced_request_id = t.hub_request_id
                 elif request_changed:
                     self.sync_localtrader_config(t)
@@ -1160,6 +1189,55 @@ class Watchdog:
             except Exception as e:
                 t.hub_error = str(e)
                 self.log.log(f"{t.label}: hub poll failed: {e}")
+
+    # ------------------------------------------------------------------
+    # v3.8: one-at-a-time transitions + Termux protection
+    # ------------------------------------------------------------------
+    def queue_transition(self, t: Target, kind: str) -> None:
+        self.pending_transitions = [x for x in self.pending_transitions if x[0] is not t]
+        self.pending_transitions.append((t, kind))
+        self.log.log(f"{t.label}: {kind} queued (position {len(self.pending_transitions)})")
+
+    def run_pending_transition(self) -> None:
+        """Run at most one queued transition, and only if the last launch was long enough ago."""
+        if not self.pending_transitions:
+            return
+        if time.time() - self.last_launch_any < self.TRANSITION_GAP_SEC:
+            return
+        t, kind = self.pending_transitions.pop(0)
+        # Drop stale requests: the Hub may have changed its mind while we waited.
+        if kind == "enter_trading" and t.hub_state == "TRADING":
+            self.enter_trading(t)
+        elif kind == "return_to_farming" and t.hub_state == "FARMING":
+            self.return_to_farming(t)
+        else:
+            self.log.log(f"{t.label}: queued {kind} dropped (state changed)")
+
+    def protect_termux(self, force: bool = False) -> None:
+        """Make the low-memory killer prefer anything except Termux and this script."""
+        now = time.time()
+        if not force and now - self.last_protect < self.PROTECT_EVERY_SEC:
+            return
+        self.last_protect = now
+        me = os.getpid()
+        out = self._rec_shell(
+            f'for p in $(pidof com.termux) {me}; do '
+            'echo -900 > /proc/$p/oom_score_adj 2>/dev/null; '
+            'echo "pid $p oom_score_adj=$(cat /proc/$p/oom_score_adj 2>/dev/null)"; done',
+            timeout=20, with_err=False,
+        )
+        if out != self._last_protect_out:
+            self._last_protect_out = out
+            self.log.log("Termux oom protection: " + out.replace("\n", "; "))
+        if not self._wakelock_done:
+            self._wakelock_done = True
+            try:
+                subprocess.run(["termux-wake-lock"], timeout=10, capture_output=True)
+                self.log.log("termux-wake-lock requested")
+            except Exception as e:
+                self.log.log(f"termux-wake-lock unavailable: {e}")
+            finally:
+                _resane_tty()
 
     def enter_trading(self, t: Target) -> None:
         if not t.enabled:
@@ -1189,9 +1267,15 @@ class Watchdog:
         self.log.log(f"{t.label}: RETURN TO FARMING")
         t.status = "switching_to_farming"
         self.notify(t, t.status, "return_to_farming")
-        self.prepare_stop(t, "RETURN_TO_FARMING")
-        self.controller.force_stop(t)
-        time.sleep(1)
+        if self.soft_return and self.controller.is_running(t.package):
+            self.log.log(f"{t.label}: soft return (no force-stop; farming link sent into running clone)")
+            full_tag = f"{t.label} RETURN_TO_FARMING (soft)"
+            self.snapshot(full_tag, "T-0 (soft, no force-stop)")
+            self.schedule_snapshots(full_tag)
+        else:
+            self.prepare_stop(t, "RETURN_TO_FARMING")
+            self.controller.force_stop(t)
+            time.sleep(1)
         ok = self.controller.launch(t)
         self.last_launch_any = time.time()
         t.trading_join_attempted = False
@@ -1277,6 +1361,9 @@ class Watchdog:
         if time.time() < t.cooldown_until:
             return
         first_launch = (t.last_rejoin == 0)
+        # restart() relaunches in the clone's CURRENT hub mode, so it already
+        # completes any queued TRADING/FARMING transition for this clone.
+        self.pending_transitions = [x for x in self.pending_transitions if x[0] is not t]
         t.restarts += 1
         t.fail_streak += 1
         self.log.log(f"{t.label}: restart #{t.restarts}: {reason}")
@@ -1438,13 +1525,18 @@ class Watchdog:
         self.rec_write(
             f"\n######## watchdog v{VERSION} started {now_str()} | android: "
             + self._rec_shell('getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.model')
-            .replace("\n", " / ") + f" | focus_handoff={'ON' if self.focus_handoff else 'OFF'}"
+            .replace("\n", " / ")
+            + f" | focus_handoff={'ON' if self.focus_handoff else 'OFF'}"
+            + f" | soft_return={'ON' if self.soft_return else 'OFF'}"
         )
 
         # Pull the real desired state BEFORE writing LocalTrader_Hub.json or
         # touching any Roblox process. This preserves TRADING across a watchdog
         # restart instead of temporarily telling LocalTrader to FARM.
         self.poll_hub()
+
+        # v3.8: shield Termux and this script from the low-memory killer.
+        self.protect_termux(force=True)
 
         # Do not restart clones that are already running; just start their timers.
         self.adopt_running_targets()
@@ -1458,6 +1550,8 @@ class Watchdog:
             last_tick = 0.0
             while self.running:
                 self.poll_hub()
+                self.run_pending_transition()
+                self.protect_termux()
                 self.run_due_snapshots()
                 now = time.time()
                 if now - last_tick >= self.interval_sec:
@@ -1493,6 +1587,8 @@ class Watchdog:
         hubtxt = self.hub.base_url if self.hub.enabled else "OFF"
         cr = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
         lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr}")
+        if self.pending_transitions:
+            lines.append(f"Queued transitions: {len(self.pending_transitions)}")
         lines.append("-")
         for i, t in enumerate(self.targets, 1):
             pid = self.controller.pid(t.package) or "-"
@@ -1520,6 +1616,7 @@ class App:
         self.hang_sec = 90
         self.crash_restart_enabled = False
         self.focus_handoff = False
+        self.soft_return = False
         self.trading_share_link = DEFAULT_TRADING_SHARE_LINK
         self.hub_url = ""
         self.hub_token = ""
@@ -1536,6 +1633,7 @@ class App:
             self.hang_sec = int(c.get("hang_detection_sec", 90))
             self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
             self.focus_handoff = bool(c.get("focus_handoff", False))
+            self.soft_return = bool(c.get("soft_return", False))
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
@@ -1552,6 +1650,7 @@ class App:
             "hang_detection_sec": self.hang_sec,
             "crash_restart_enabled": self.crash_restart_enabled,
             "focus_handoff": self.focus_handoff,
+            "soft_return": self.soft_return,
             "trading_share_link": self.trading_share_link,
             "hub": {
                 "url": self.hub_url,
@@ -1746,6 +1845,7 @@ class App:
         print(f"Log: {LOG_PATH}")
         print(f"Hub: {self.hub_url or 'OFF'}")
         print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
+        print(f"Soft return: {'ON' if self.soft_return else 'OFF'}")
         print(f"Trading link: {self.trading_share_link}")
         print()
         controller = Controller(self.shell, self.logger)
@@ -1831,6 +1931,7 @@ class App:
             self.logger,
             self.crash_restart_enabled,
             self.focus_handoff,
+            self.soft_return,
         )
 
         def sigint(_sig, _frame):
@@ -1860,6 +1961,7 @@ class App:
             print(f"Trading PS: {parse_private_link(self.trading_share_link) or 'INVALID'}")
             print(f"Crash-restart: {'ON' if self.crash_restart_enabled else 'OFF (timer-only rejoin)'}")
             print(f"Focus handoff: {'ON (experimental)' if self.focus_handoff else 'OFF'}")
+            print(f"Soft return: {'ON (no force-stop on return to farming)' if self.soft_return else 'OFF'}")
             print()
             print("1. Auto setup")
             print("2. Start watchdog")
@@ -1870,6 +1972,7 @@ class App:
             print("7. Plain mode")
             print("8. Toggle crash-restart")
             print("9. Toggle focus handoff (experimental)")
+            print("10. Toggle soft return (no force-stop when returning to farming)")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -1903,6 +2006,15 @@ class App:
                 if self.focus_handoff:
                     print("Termux is brought to the front just before a clone is force-stopped,")
                     print("so the clone being killed is never the focused window.")
+                input("Press Enter...")
+            elif choice == "10":
+                self.soft_return = not self.soft_return
+                self.save()
+                print(f"\nSoft return is now {'ON' if self.soft_return else 'OFF'}.")
+                if self.soft_return:
+                    print("On RETURN TO FARMING a running clone is not force-stopped; the")
+                    print("farming link is sent into it instead. If clones stay in the trading")
+                    print("server after a trade, turn this back OFF.")
                 input("Press Enter...")
             elif choice == "0":
                 return
