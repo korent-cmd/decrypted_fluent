@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.6 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v3.7 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,20 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v3.7
+#   - FIX: "zombie" clones. The clones are App Cloner clones, and App Cloner's
+#     PersistentAppService restarts a clone's PROCESS (service only, no Activity)
+#     right after the real process dies - the flight recorder caught this twice
+#     (03:57 and 12:34, clone cliend). pidof then finds a PID, so the watchdog
+#     reported "running", the Hub showed ONLINE, and nothing relaunched it until
+#     its next scheduled rejoin (up to a full interval later), while no game was
+#     open. tick() now also checks that the process owns an Activity (one
+#     `dumpsys activity activities` per ~8 s, shared by all clones). A running
+#     process with no Activity for 3 checks in a row is treated as dead and
+#     relaunched; the Hub status shows "not running (no activity)" meanwhile.
+#     Fail-safe: nothing is done if the dump is unusable, or if no configured
+#     clone shows an Activity at all (nothing to validate the dump against).
 #
 # v3.6  (diagnostic build - for the "everything hides after a trade" problem)
 #   - ADD: flight recorder -> flight_recorder.log (2 MB cap, rotates to .1).
@@ -146,7 +160,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.6"
+VERSION = "3.7"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -810,6 +824,10 @@ class Watchdog:
     MIN_HUNG_SEC = 300                    # zero CPU change this long before "hung"
     # --- launch spacing ------------------------------------------------------
     LAUNCH_STAGGER_SEC = 8                # min seconds between any two cold starts
+    # --- zombie (process alive, no Activity) detection -----------------------
+    ZOMBIE_CONFIRM_TICKS = 3              # consecutive checks with no Activity
+    ZOMBIE_GRACE_SEC = 90                 # don't judge a clone this soon after launch
+    ACTIVITY_CACHE_SEC = 8                # share one dumpsys across clones
 
     def __init__(
         self,
@@ -841,6 +859,7 @@ class Watchdog:
         self.last_launch_any = 0.0
         self.focus_handoff = focus_handoff
         self.pending_snapshots: List[Tuple[float, str, int]] = []
+        self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
@@ -860,12 +879,13 @@ class Watchdog:
         except Exception:
             pass
 
-    def _rec_shell(self, script: str, timeout: int = 40) -> str:
+    def _rec_shell(self, script: str, timeout: int = 40, with_err: bool = True) -> str:
         """Run a root script WITHOUT writing it (or its output) to watchdog.log."""
         cmd = script if self.shell.is_root() else "su -c " + shlex.quote(script)
         try:
             p = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=timeout)
-            return (p.stdout or "").strip() + (("\nERR " + p.stderr.strip()[-300:]) if p.stderr.strip() else "")
+            err = (("\nERR " + p.stderr.strip()[-300:]) if (with_err and p.stderr.strip()) else "")
+            return (p.stdout or "").strip() + err
         except subprocess.TimeoutExpired:
             return f"(snapshot timed out after {timeout}s)"
         except Exception as e:
@@ -920,6 +940,41 @@ class Watchdog:
             self.log.log(f"{t.label}: focus handoff -> Termux before force-stop")
             self.shell.root("am start -n com.termux/.app.TermuxActivity", timeout=10)
             time.sleep(1.0)
+
+    def activity_packages(self) -> Optional[set]:
+        """Packages that currently own at least one Activity record, or None if unknown."""
+        ts, cached = self._act_cache
+        if time.time() - ts < self.ACTIVITY_CACHE_SEC:
+            return cached
+        out = self._rec_shell(
+            "dumpsys activity activities 2>/dev/null | "
+            "grep -oE 'ActivityRecord[{][0-9a-f]+ u[0-9]+ [A-Za-z0-9_.]+/' | sort -u",
+            timeout=30, with_err=False,
+        )
+        pkgs = set()
+        for line in out.splitlines():
+            m = re.search(r" u\d+ ([A-Za-z0-9_.]+)/", line)
+            if m:
+                pkgs.add(m.group(1))
+        result = pkgs or None
+        self._act_cache = (time.time(), result)
+        return result
+
+    def check_zombie(self, t: Target) -> bool:
+        """True once a clone has had a process but no Activity for ZOMBIE_CONFIRM_TICKS checks."""
+        if t.last_launch and time.time() - t.last_launch < self.ZOMBIE_GRACE_SEC:
+            t._zombie_ticks = 0
+            return False
+        pkgs = self.activity_packages()
+        if pkgs is None:
+            return False                      # dump unusable: unknown, never act on it
+        if not any(x.package in pkgs for x in self.targets if x.enabled):
+            return False                      # no clone shows an Activity: can't validate the dump
+        if t.package in pkgs:
+            t._zombie_ticks = 0
+            return False
+        t._zombie_ticks = getattr(t, "_zombie_ticks", 0) + 1
+        return t._zombie_ticks >= self.ZOMBIE_CONFIRM_TICKS
 
     def stagger_offset(self, t: Target) -> float:
         """How much earlier than a full interval this clone's first rejoin falls.
@@ -1337,6 +1392,21 @@ class Watchdog:
             return
 
         t.not_running_ticks = 0
+
+        # Process exists - but does it own an Activity? (App Cloner's
+        # PersistentAppService can keep a service-only process alive.)
+        if self.check_zombie(t):
+            if time.time() - self.last_launch_any >= self.LAUNCH_STAGGER_SEC:
+                self.log.log(f"{t.label}: process exists but owns no Activity (service-only); treating as dead")
+                t.status = "not running (no activity)"
+                self.restart(t, "zombie: process alive but no Activity")
+                self.heartbeat(t)
+                return
+        elif getattr(t, "_zombie_ticks", 0) > 0:
+            t.status = f"not running (no activity {t._zombie_ticks}x)"
+            self.heartbeat(t)
+            return
+
         if self.crash_restart_enabled:
             state = self.health(t)
             if (state in ("hung", "dialog")
