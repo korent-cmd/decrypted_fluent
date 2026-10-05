@@ -4,6 +4,9 @@
 --
 -- v1.1: daily trash-fruit flush built in (see CONFIG.TrashFlush below).
 -- v1.2: tweenToSeat is now lag-tolerant (long deadline, 3 retries, reports distance).
+-- v1.4: QuantumOnyx start guard no longer trusts a handoff record written by an EARLIER client
+--        process (same JobId after a relaunch used to make it skip the farm script); adds an
+--        in-process duplicate guard and logs what was fetched/returned.
 -- v1.3: travel gets its own time budget (CONFIG.TravelTimeout) and is exempt from the
 --        generic 45s stage timeout; every travel attempt is logged.
 
@@ -565,20 +568,61 @@ local function ensureConfiguredOrder()
 	return configured
 end
 
+-- v1.4: when did THIS Roblox client session start (unix seconds)? time() counts seconds
+-- since the client joined the current server, so os.time() - time() is the join moment.
+-- A handoff record written BEFORE that moment belongs to an earlier client process and
+-- must not be trusted: rw.py force-stops and relaunches the clone, and Roblox can put the
+-- new process into the SAME server (same game.JobId). The old guard keyed only on JobId,
+-- so it read "LOAD_EXECUTED for this JobId", skipped the farm script, and the freshly
+-- launched client sat idle.
+local SESSION_STARTED_AT = (function()
+	local ok, up = pcall(function()
+		return time()
+	end)
+	up = ok and tonumber(up) or 0
+	return os.time() - math.floor(up)
+end)()
+
+local function quantumOnyxEnv()
+	return (type(getgenv) == "function" and getgenv()) or _G
+end
+
+local function handoffStamp(record)
+	return math.max(tonumber(record.lastLoadAttemptAt) or 0, tonumber(record.farmLoadedAt) or 0)
+end
+
 local function loadQuantumOnyx()
+	local env = quantumOnyxEnv()
+	-- In-process duplicate guard (the script being executed twice in one client session).
+	if env.__LocalTraderQuantumOnyxJob == game.JobId then
+		debugLog("LocalTrader: QuantumOnyx was already started in this client session (JobId "
+			.. tostring(game.JobId) .. "); skipping duplicate start")
+		return
+	end
+
 	local record = readHandoff()
 	if type(record) ~= "table" or record.phase ~= "FARMING" then
 		debugLog("LocalTrader Version 3: no FARMING handoff is pending")
 		return
 	end
-	if record.loadJobId == game.JobId and record.farmStatus == "LOAD_EXECUTED" then
-		debugLog("LocalTrader Version 3: QuantumOnyx already executed for this JobId")
+
+	local sameJob = record.loadJobId == game.JobId
+	local stamp = handoffStamp(record)
+	local fromThisSession = sameJob and stamp >= SESSION_STARTED_AT - 10
+	if sameJob and not fromThisSession and record.farmStatus == "LOAD_EXECUTED" then
+		debugLog(string.format(
+			"LocalTrader: handoff says LOAD_EXECUTED for this JobId, but it was written %ds before this client session started (an earlier process); loading QuantumOnyx again",
+			SESSION_STARTED_AT - stamp
+		))
+	end
+	if fromThisSession and record.farmStatus == "LOAD_EXECUTED" then
+		debugLog("LocalTrader Version 3: QuantumOnyx already executed in this client session for this JobId")
 		return
 	end
 
-	local attempt = (record.loadJobId == game.JobId and tonumber(record.loadAttempt)) or 0
+	local attempt = (fromThisSession and tonumber(record.loadAttempt)) or 0
 	if attempt >= CONFIG.FarmLoadMaxAttempts then
-		debugLog("LocalTrader Version 3: QuantumOnyx retry limit reached for this JobId")
+		debugLog("LocalTrader Version 3: QuantumOnyx retry limit reached for this client session")
 		return
 	end
 	attempt = attempt + 1
@@ -588,31 +632,51 @@ local function loadQuantumOnyx()
 		if type(latest) ~= "table" or latest.phase ~= "FARMING" then
 			return
 		end
+		if env.__LocalTraderQuantumOnyxJob == game.JobId then
+			return -- another copy of this script started it while we waited
+		end
+		env.__LocalTraderQuantumOnyxJob = game.JobId
 		latest.loadJobId = game.JobId
 		latest.loadAttempt = attempt
 		latest.lastLoadAttemptAt = os.time()
+		latest.farmStatus = "LOADING"
 		writeHandoff(latest)
 
-		local ok, result = pcall(function()
+		local startedClock = os.clock()
+		local ok, result = xpcall(function()
 			local source = game:HttpGet(CONFIG.QuantumOnyxUrl)
-			local chunk = loadstring(source)
-			assert(type(chunk) == "function", "QuantumOnyx did not compile")
+			debugLog(string.format("LocalTrader: QuantumOnyx source fetched: %d bytes in %.1fs",
+				#tostring(source), os.clock() - startedClock))
+			assert(type(source) == "string" and #source > 200,
+				"QuantumOnyx download looks empty or truncated (" .. tostring(type(source) == "string" and #source or source) .. ")")
+			local chunk, compileError = loadstring(source)
+			assert(type(chunk) == "function", "QuantumOnyx did not compile: " .. tostring(compileError))
 			return chunk()
+		end, function(err)
+			return tostring(err)
 		end)
 		if ok then
 			latest.phase = "FARMING"
 			latest.farmStatus = "LOAD_EXECUTED"
 			latest.farmLoadedAt = os.time()
 			writeHandoff(latest)
-			debugLog("LocalTrader Version 3: QuantumOnyx load executed; farming status is assumed active")
-		elseif attempt < CONFIG.FarmLoadMaxAttempts then
-			debugLog("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
-			task.spawn(loadQuantumOnyx)
+			debugLog(string.format(
+				"LocalTrader Version 3: QuantumOnyx chunk returned after %.1fs (returned: %s). This does NOT prove the farm is running.",
+				os.clock() - startedClock, tostring(result)
+			))
 		else
-			latest.farmStatus = "LOAD_FAILED"
+			env.__LocalTraderQuantumOnyxJob = nil -- allow a retry
 			latest.lastError = tostring(result)
-			writeHandoff(latest)
-			debugLog("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+			if attempt < CONFIG.FarmLoadMaxAttempts then
+				latest.farmStatus = "LOAD_RETRYING"
+				writeHandoff(latest)
+				debugLog("LocalTrader Version 3: QuantumOnyx load failed; retrying: " .. tostring(result))
+				task.spawn(loadQuantumOnyx)
+			else
+				latest.farmStatus = "LOAD_FAILED"
+				writeHandoff(latest)
+				debugLog("LocalTrader Version 3: QuantumOnyx load failed after retries: " .. tostring(result))
+			end
 		end
 	end)
 end
@@ -1391,7 +1455,11 @@ if HubConfig.mode == "FARMING" then
 			debugLog("LocalTrader: could not create FARMING handoff: " .. tostring(saveError))
 		end
 	else
-		debugLog("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase) .. ", farmStatus=" .. tostring(farmingRecord.farmStatus))
+		debugLog("LocalTrader: existing handoff phase=" .. tostring(farmingRecord.phase)
+			.. ", farmStatus=" .. tostring(farmingRecord.farmStatus)
+			.. ", recordJobId=" .. tostring(farmingRecord.loadJobId)
+			.. ", thisJobId=" .. tostring(game.JobId)
+			.. ", recordAgeVsSessionStart=" .. tostring(handoffStamp(farmingRecord) - SESSION_STARTED_AT) .. "s")
 	end
 	-- Flush (if due) FIRST, then start the farm script, so the two can never
 	-- interfere with each other.
