@@ -2,6 +2,11 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v1.5: addItem failures are no longer silent. If TradeFunction:InvokeServer("addItem")
+--        returns false (or errors), the worker retries up to CONFIG.AddItemMaxAttempts times
+--        (CONFIG.AddItemRetryDelay apart), only adding the quantity still missing from the
+--        offer, then stops the order with reason "worker_error" instead of idling until the
+--        generic stage timeout. The raw value the server returned is now logged.
 -- v1.1: daily trash-fruit flush built in (see CONFIG.TrashFlush below).
 -- v1.2: tweenToSeat is now lag-tolerant (long deadline, 3 retries, reports distance).
 -- v1.4: QuantumOnyx start guard no longer trusts a handoff record written by an EARLIER client
@@ -165,6 +170,8 @@ local CONFIG = {
 	MaxLogLines = 200,
 	RetweenInterval = 4,
 	TravelTimeout = 90,           -- total seconds allowed to reach the trade table
+	AddItemMaxAttempts = 4,       -- v1.5: tries to put the requested fruit in the offer
+	AddItemRetryDelay = 1.5,      -- v1.5: seconds between those tries
 }
 
 -- ============================================================================
@@ -1639,6 +1646,17 @@ local function countItems(items)
 	return count
 end
 
+-- v1.5: how many copies of wantedId are currently in an offer.
+local function offerAmount(items, wantedId)
+	local amount = 0
+	for _, item in pairs(items) do
+		if tonumber(item.ItemId) == tonumber(wantedId) then
+			amount = amount + (tonumber(item.Amount) or 0)
+		end
+	end
+	return amount
+end
+
 local function offerHasItem(items, wantedId, requiredAmount)
 	local amount = 0
 	for _, item in pairs(items) do
@@ -2197,6 +2215,66 @@ local function reportCompletionWithRetry(sess)
 	end)
 end
 
+-- v1.5: put the requested fruit into the worker's offer, tolerating failures.
+-- Called from the update_state handler, and again by itself (after
+-- CONFIG.AddItemRetryDelay) whenever the server refuses the add. It only adds the
+-- quantity still MISSING from the latest offer, so a partial add followed by a
+-- retry can never overshoot. After CONFIG.AddItemMaxAttempts failed tries the
+-- order is stopped with reason "worker_error" (reported to the Hub) instead of
+-- idling until the generic stage timeout.
+local function attemptAddRequested(sess)
+	if not running or session ~= sess or sess.ignoreTrade or sess.addRequested then
+		return
+	end
+	local ts = latestTradeState
+	local side = sess.localSide
+	if not ts or not side or type(ts.State) ~= "table" or ts.State.Type ~= "NotReady" or type(ts.Offer) ~= "table" then
+		return
+	end
+	local inOffer = offerAmount(offerItems(ts.Offer[side]), sess.requestedId)
+	local missing = sess.quantity - inOffer
+	if missing <= 0 then
+		return
+	end
+
+	setState("OFFERING_ORDER_ITEM")
+	sess.addRequested = true
+	sess.addAttempts = (sess.addAttempts or 0) + 1
+	local attemptNumber = sess.addAttempts
+
+	local lastReturn = nil
+	local ok, result = pcall(function()
+		for _ = 1, missing do
+			local added = TradeFunction:InvokeServer("addItem", sess.requestedId, 1)
+			lastReturn = added
+			if added == false then
+				return false
+			end
+		end
+		return true
+	end)
+
+	if ok and result == true then
+		writeLog(string.format("requested fruit add requested (attempt %d, server returned %s)",
+			attemptNumber, tostring(lastReturn)))
+		return
+	end
+
+	-- failed: the call errored, or the server answered false
+	sess.addRequested = false
+	local why = ok and ("server returned " .. tostring(lastReturn)) or tostring(result)
+	writeLog(string.format("addItem failed (attempt %d/%d): %s",
+		attemptNumber, CONFIG.AddItemMaxAttempts, why))
+	if attemptNumber >= CONFIG.AddItemMaxAttempts then
+		stopTrader("could not add the requested fruit after " .. tostring(CONFIG.AddItemMaxAttempts)
+			.. " attempts (" .. why .. ")", "worker_error")
+		return
+	end
+	task.delay(CONFIG.AddItemRetryDelay, function()
+		attemptAddRequested(sess)
+	end)
+end
+
 local function startTrader(orderData)
 	if running then
 		return
@@ -2255,6 +2333,7 @@ local function startTrader(orderData)
 		startedAt = os.clock(),
 		stageStartedAt = os.clock(),
 		addRequested = false,
+		addAttempts = 0,
 		lastRetween = 0,
 		customerWaitSince = os.clock(),
 		externalOrder = type(orderData) == "table" and orderData or nil,
@@ -2308,6 +2387,7 @@ local function startTrader(orderData)
 				session.ignoreTrade = false
 				session.localSide = nil
 				session.addRequested = false
+				session.addAttempts = 0
 				lastOfferSignature = nil
 				lastLoggedOfferSignature = nil
 				latestTradeState = nil
@@ -2360,23 +2440,8 @@ local function startTrader(orderData)
 			end
 
 			if not localHasRequested and not session.addRequested and tradeState.State.Type == "NotReady" then
-				setState("OFFERING_ORDER_ITEM")
-				session.addRequested = true
-				local ok, result = pcall(function()
-					for _ = 1, session.quantity do
-						local added = TradeFunction:InvokeServer("addItem", session.requestedId, 1)
-						if added == false then
-							return false
-						end
-					end
-					return true
-				end)
-				if not ok then
-					session.addRequested = false
-					writeLog("addItem failed: " .. tostring(result))
-				else
-					writeLog("requested fruit add requested")
-				end
+				-- v1.5: tolerant add with retries (see attemptAddRequested above)
+				attemptAddRequested(session)
 			elseif localHasRequested and tradeState.State.Type == "NotReady" then
 				setState("WAITING_FOR_CUSTOMER_OFFER")
 				if countItems(customerItems) > 0
@@ -2433,6 +2498,7 @@ local function startTrader(orderData)
 				latestTradeState = nil
 				session.startedAt = os.clock()
 				session.addRequested = false
+				session.addAttempts = 0
 				session.localSide = nil
 				lastOfferSignature = nil
 				lastLoggedOfferSignature = nil
