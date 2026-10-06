@@ -2,6 +2,10 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v1.6: the in-game signal to the Hub (game-ping + inventory report) is only sent while the
+--        player is actually in the game: game loaded and a living character with a
+--        HumanoidRootPart in the workspace. The ping also carries the Roblox username, which the
+--        Hub dashboard shows as the account's name.
 -- v1.5: addItem failures are no longer silent. If TradeFunction:InvokeServer("addItem")
 --        returns false (or errors), the worker retries up to CONFIG.AddItemMaxAttempts times
 --        (CONFIG.AddItemRetryDelay apart), only adding the quantity still missing from the
@@ -899,14 +903,43 @@ end
 -- here. Skip messages are throttled to avoid spamming the log.
 local lastInventorySkipWarnAt = 0
 local INVENTORY_SKIP_WARN_INTERVAL = 120
+
+-- v1.6: "the player is actually playing" = the game finished loading and the
+-- player has a living character in the world. Only then does the Hub get a
+-- signal, so a Roblox client that is open but stuck on the join / loading
+-- screen no longer looks online.
+local function characterIsLoaded()
+	if not game:IsLoaded() then
+		return false
+	end
+	local character = LocalPlayer.Character
+	if not character or not character:IsDescendantOf(workspace) then
+		return false
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	return humanoid ~= nil
+		and humanoid.Health > 0
+		and character:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
 local function reportInventoryToHub()
 	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
 		return
 	end
 
-	-- Tell the Hub the game itself is alive, even if the inventory below
-	-- can't be read right now.
-	hubRequest("POST", "/api/v1/game-ping", { account_id = HubConfig.accountId })
+	-- Not in a game yet (loading screen, dead, between servers): send nothing,
+	-- so the Hub's in-game timer runs out and the account stops showing online.
+	if not characterIsLoaded() then
+		return
+	end
+
+	-- Tell the Hub the game itself is alive and playing, even if the
+	-- inventory below can't be read right now. The Roblox username lets the
+	-- dashboard show which account is in which package.
+	hubRequest("POST", "/api/v1/game-ping", {
+		account_id = HubConfig.accountId,
+		username = LocalPlayer.Name,
+	})
 
 	-- No team yet = the inventory can't be read. In farming the farm script
 	-- picks the team itself, so just wait for it rather than forcing one.
