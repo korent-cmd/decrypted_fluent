@@ -25,6 +25,8 @@
 #     watchdog sets oom_score_adj -900 on com.termux and itself (root), and
 #     calls termux-wake-lock once, so the low-memory killer prefers anything
 #     else.
+#   - NOTE: focus handoff (menu option 9) was tested on the real phone: moving focus away
+#     from the clones hides ALL of them. It stays OFF; it is kept only as a test switch.
 #   - ADD (OFF by default): "soft return" (menu option 10). On RETURN TO
 #     FARMING, if the clone is already running it is NOT force-stopped; the
 #     farming deep link is sent into the running clone instead, avoiding the
@@ -1971,7 +1973,7 @@ class App:
             print("6. Diagnostics")
             print("7. Plain mode")
             print("8. Toggle crash-restart")
-            print("9. Toggle focus handoff (experimental)")
+            print("9. Toggle focus handoff (KNOWN BAD: hides every clone - leave OFF)")
             print("10. Toggle soft return (no force-stop when returning to farming)")
             print("0. Exit")
             choice = input("\n> ").strip()
@@ -2004,8 +2006,8 @@ class App:
                 self.save()
                 print(f"\nFocus handoff is now {'ON' if self.focus_handoff else 'OFF'}.")
                 if self.focus_handoff:
-                    print("Termux is brought to the front just before a clone is force-stopped,")
-                    print("so the clone being killed is never the focused window.")
+                    print("WARNING: tested - bringing Termux to the front hides every Roblox clone")
+                    print("(they go to the background like switching apps). Turn this back OFF.")
                 input("Press Enter...")
             elif choice == "10":
                 self.soft_return = not self.soft_return
