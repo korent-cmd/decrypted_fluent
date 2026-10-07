@@ -2,6 +2,15 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v1.8: a trade can carry at most 4 items per side (the game's own trade-state rules), so an
+--        order for more than CONFIG.MaxItemsPerTrade is refused up front and reported to the Hub
+--        as worker_error instead of looping forever. Also logs any "Notify" message from the game
+--        that mentions "trade" (the trade counter may be shown that way) into the trade log.
+-- v1.7: DIAGNOSTICS ONLY (no behaviour change): to learn where the game keeps its "x/5 trades"
+--        counter, the trade log now also records (a) any extra fields getTradeInventory returns
+--        besides Items, (b) every field of the TradeEvent state when a trade starts, and (c) any
+--        on-screen text that looks like "n/5" or sits inside a trade-related GUI. Use Copy Log
+--        after a trade and send it back.
 -- v1.6: the in-game signal to the Hub (game-ping + inventory report) is only sent while the
 --        player is actually in the game: game loaded and a living character with a
 --        HumanoidRootPart in the workspace. The ping also carries the Roblox username, which the
@@ -176,6 +185,7 @@ local CONFIG = {
 	TravelTimeout = 90,           -- total seconds allowed to reach the trade table
 	AddItemMaxAttempts = 4,       -- v1.5: tries to put the requested fruit in the offer
 	AddItemRetryDelay = 1.5,      -- v1.5: seconds between those tries
+	MaxItemsPerTrade = 4,         -- v1.8: game rule: at most 4 units per side in one trade
 }
 
 -- ============================================================================
@@ -858,6 +868,9 @@ end
 
 local ItemIds = loadItemIds()
 
+-- v1.7: every top-level field of the last getTradeInventory answer except Items (diagnostics)
+local lastInventoryMeta = ""
+
 local function readInventory()
 	local ok, result = pcall(function()
 		return CommF:InvokeServer("getTradeInventory")
@@ -868,6 +881,14 @@ local function readInventory()
 	if type(result) ~= "table" or type(result.Items) ~= "table" then
 		return nil, "getTradeInventory returned an unexpected shape"
 	end
+	local meta = {}
+	for key, value in pairs(result) do
+		if key ~= "Items" then
+			meta[#meta + 1] = tostring(key) .. "=" .. (type(value) == "table" and "{...}" or tostring(value):sub(1, 40))
+		end
+	end
+	table.sort(meta)
+	lastInventoryMeta = table.concat(meta, ", ")
 	return result.Items
 end
 
@@ -1118,12 +1139,20 @@ end
 --   CommE: "Notify", "Fruit added to backpack."
 -- A passive listener on it is used as a second confirmation signal.
 local lastEquipEvent = { name = nil, at = 0 }
+local tradeNoticeSink = nil -- v1.8: set to writeLog once the trade log exists
 do
 	local commE = Remotes:FindFirstChild("CommE")
 	if commE and commE:IsA("RemoteEvent") then
 		commE.OnClientEvent:Connect(function(kind, name, where)
 			if kind == "ItemRemoved" and where == "stored" then
 				lastEquipEvent = { name = tostring(name), at = os.clock() }
+			elseif kind == "Notify" and type(name) == "string" and name:lower():find("trade") then
+				-- v1.8 diagnostics: the game may announce the trade counter / limit this way
+				if tradeNoticeSink then
+					tradeNoticeSink("game notice: " .. name)
+				else
+					debugLog("LocalTrader: game notice: " .. name)
+				end
 			end
 		end)
 	end
@@ -2086,6 +2115,8 @@ local function writeLog(message)
 	status.Text = "Status: " .. state .. "\n" .. message
 end
 
+tradeNoticeSink = writeLog
+
 local function setState(nextState, message)
 	local previous = state
 	state = nextState
@@ -2308,6 +2339,45 @@ local function attemptAddRequested(sess)
 	end)
 end
 
+-- v1.7 diagnostics: where does the game keep the "x/5 trades" counter?
+local function describeFields(tbl)
+	if type(tbl) ~= "table" then
+		return tostring(tbl)
+	end
+	local parts = {}
+	for key, value in pairs(tbl) do
+		parts[#parts + 1] = tostring(key) .. "=" .. (type(value) == "table" and "{...}" or tostring(value):sub(1, 40))
+	end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function scanTradeCounterLabels(reason)
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return
+	end
+	local hits = 0
+	for _, object in ipairs(playerGui:GetDescendants()) do
+		if hits >= 12 then
+			break
+		end
+		if object:IsA("TextLabel") or object:IsA("TextButton") then
+			local text = object.Text
+			if type(text) == "string" and #text <= 60 and text:find("%d") then
+				local path = object:GetFullName()
+				if text:find("%d+%s*/%s*5") or path:lower():find("trade") then
+					hits = hits + 1
+					writeLog(string.format("counter? [%s] %s = %q", reason, path, text))
+				end
+			end
+		end
+	end
+	if hits == 0 then
+		writeLog("counter? [" .. reason .. "] no matching text found in PlayerGui")
+	end
+end
+
 local function startTrader(orderData)
 	if running then
 		return
@@ -2327,6 +2397,18 @@ local function startTrader(orderData)
 	local quantity = math.max(1, tonumber(quantityBox.Text) or 1)
 	if targetName == "" then
 		writeLog("enter a customer username")
+		return
+	end
+	if quantity > CONFIG.MaxItemsPerTrade then
+		local why = string.format("a trade can carry at most %d items; order asks for %d", CONFIG.MaxItemsPerTrade, quantity)
+		writeLog(why)
+		if type(orderData) == "table" then
+			local rid = tostring(orderData.request_id or orderData.order_id or "")
+			if rid ~= "" then
+				abandonedOrders[rid] = true
+			end
+			reportFailureToHub({ externalOrder = orderData }, "worker_error", why)
+		end
 		return
 	end
 	if not requestedId then
@@ -2402,6 +2484,7 @@ local function startTrader(orderData)
 	end
 	writeLog(string.format("ready: %s x%d (ItemId %s, catalog=%s, inventory=%s)",
 		fruitBox.Text, quantity, tostring(requestedId), tostring(itemRecord(requestedId) and itemRecord(requestedId)[1]), tostring(requestedType)))
+	writeLog("inventory extra fields: " .. (lastInventoryMeta ~= "" and lastInventoryMeta or "(none besides Items)"))
 	if isSeatedAtTradeTable() then
 		writeLog("session " .. tostring(session.id) .. " started; worker seated")
 	else
@@ -2450,6 +2533,10 @@ local function startTrader(orderData)
 			session.localSide = localSide
 			session.startedAt = os.clock()
 			writeLog(string.format("trade started with %s (UserId %s, localSide=%d)", otherPlayer.Name, tostring(otherId), localSide))
+			writeLog("trade state fields: " .. describeFields(tradeState) .. " | State: " .. describeFields(tradeState.State))
+			task.delay(1.5, function()
+				scanTradeCounterLabels("trade start")
+			end)
 		elseif eventName == "update_state" then
 			if not session.localSide then
 				session.localSide = getLocalSide(tradeState)
