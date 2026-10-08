@@ -1402,15 +1402,7 @@ local function runDailyFlush(boundary)
 		return
 	end
 
-	-- Never displace a fruit the farm might be relying on.
-	local held = getEquippedFruitName()
-	if held and not trashFruitLookup[held] then
-		if os.clock() - lastFlushSkipLogAt > 600 then
-			lastFlushSkipLogAt = os.clock()
-			debugLog("LocalTrader: daily flush waiting - a non-trash fruit is equipped: " .. held)
-		end
-		return
-	end
+	-- v1.9: no 'equipped fruit' guard. The moveset in use lives in player data and survives resets.
 
 	debugLog("LocalTrader: DAILY FLUSH STARTING (farm script has not been loaded yet)")
 	local flushed = 0
