@@ -2,6 +2,9 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v1.9: forwards every game Notify (while TRADING) plus TradeEvent names, accept results and
+--		addItem failures to the Hub (POST /api/v1/trade-notice) so the real trade-limit rule
+--		can be worked out. No hooks. Logging only, no behaviour change.
 -- v1.8: a trade can carry at most 4 items per side (the game's own trade-state rules), so an
 --        order for more than CONFIG.MaxItemsPerTrade is refused up front and reported to the Hub
 --        as worker_error instead of looping forever. Also logs any "Notify" message from the game
@@ -1138,6 +1141,23 @@ end
 --   CommE: "ItemRemoved", "<Fruit-Fruit>", "stored", <id>
 --   CommE: "Notify", "Fruit added to backpack."
 -- A passive listener on it is used as a second confirmation signal.
+local function sendTradeNotice(text)
+	text = tostring(text)
+	-- TRADING accounts forward everything; farming accounts only notices that mention "trade"
+	if HubConfig.mode ~= "TRADING" and not text:lower():find("trade") then
+		return
+	end
+	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
+		return
+	end
+	task.spawn(function()
+		pcall(hubRequest, "POST", "/api/v1/trade-notice", {
+			account_id = HubConfig.accountId,
+			text = text:sub(1, 300),
+			client_ts = os.time(),
+		})
+	end)
+end
 local lastEquipEvent = { name = nil, at = 0 }
 local tradeNoticeSink = nil -- v1.8: set to writeLog once the trade log exists
 do
@@ -1146,7 +1166,7 @@ do
 		commE.OnClientEvent:Connect(function(kind, name, where)
 			if kind == "ItemRemoved" and where == "stored" then
 				lastEquipEvent = { name = tostring(name), at = os.clock() }
-			elseif kind == "Notify" and type(name) == "string" and name:lower():find("trade") then
+			elseif kind == "Notify" and type(name) == "string" and (sendTradeNotice(name) or true) and name:lower():find("trade") then
 				-- v1.8 diagnostics: the game may announce the trade counter / limit this way
 				if tradeNoticeSink then
 					tradeNoticeSink("game notice: " .. name)
@@ -2327,6 +2347,7 @@ local function attemptAddRequested(sess)
 	-- failed: the call errored, or the server answered false
 	sess.addRequested = false
 	local why = ok and ("server returned " .. tostring(lastReturn)) or tostring(result)
+	sendTradeNotice("[addItem] failed: " .. why)
 	writeLog(string.format("addItem failed (attempt %d/%d): %s",
 		attemptNumber, CONFIG.AddItemMaxAttempts, why))
 	if attemptNumber >= CONFIG.AddItemMaxAttempts then
@@ -2492,6 +2513,8 @@ local function startTrader(orderData)
 	end
 
 	connect(TradeEvent.OnClientEvent, function(eventName, tradeState)
+		sendTradeNotice("[TradeEvent] " .. tostring(eventName) .. " type="
+			.. tostring(type(tradeState) == "table" and type(tradeState.State) == "table" and tradeState.State.Type or "-"))
 		if not running or not session then
 			return
 		end
@@ -2574,6 +2597,7 @@ local function startTrader(orderData)
 						return TradeFunction:InvokeServer("accept")
 					end)
 					writeLog(ok and "accept requested" or ("accept failed: " .. tostring(result)))
+					sendTradeNotice("[accept] ok=" .. tostring(ok) .. " result=" .. tostring(result))
 				end
 			elseif tradeState.State.Type == "Countdown" then
 				setState("COUNTDOWN")
