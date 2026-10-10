@@ -214,7 +214,8 @@ CONFIG.TrashFlush = {
 	Enabled = true,               -- false = feature fully off
 	DryRun = false,                -- true = only log, never delete. Set to false to go live.
 	MaxRunSeconds = 900,          -- hard time cap; after this the farm script loads anyway
-	MaxAttemptsPerDay = 3,        -- failed runs allowed per trade-day before giving up until tomorrow
+	PeriodHours = 8,              -- v1.9: flush once per this many hours (24 = the old once-a-day behaviour)
+	MaxAttemptsPerDay = 3,        -- failed runs allowed per flush period before giving up until the next period
 	MaxPerRun = 40,               -- safety cap: fruits flushed in one daily run
 	EquipTimeout = 6,             -- seconds to wait for the equip to register
 	ResetDeathTimeout = 3,        -- seconds to wait to see if a reset method actually killed the character
@@ -1084,13 +1085,14 @@ end
 -- The trade day rolls over at 23:59 UTC+8 = 15:59 UTC. Returns the unix time
 -- of the most recent rollover.
 local function currentTradeDayBoundary()
+	-- v1.9: the flush period is CONFIG.TrashFlush.PeriodHours (default 8) instead of a whole day. Period
+	-- boundaries are aligned to the 23:59 UTC+8 (15:59 UTC) rollover, so with 8 hours they fall at
+	-- 15:59, 23:59 and 07:59 UTC.
 	local now = os.time()
+	local period = math.max(1, tonumber(CONFIG.TrashFlush.PeriodHours) or 24) * 3600
 	local dayStart = now - (now % 86400) -- today 00:00 UTC
-	local boundary = dayStart + 15 * 3600 + 59 * 60
-	if now < boundary then
-		boundary = boundary - 86400
-	end
-	return boundary
+	local anchor = dayStart + 15 * 3600 + 59 * 60
+	return anchor + math.floor((now - anchor) / period) * period
 end
 
 local function readFlushState()
