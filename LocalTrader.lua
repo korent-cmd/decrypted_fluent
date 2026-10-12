@@ -2,6 +2,11 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.0: Hub worker retries. When a trade fails with worker_error (e.g. "could not reach trade table") the Hub
+--        sends the SAME order again as a new attempt. This client used to ignore a request it had already
+--        abandoned, so a retry never started. Now: (a) an abandoned order is picked up again as soon as the Hub
+--        reports a higher attempt number, and (b) every extra attempt gets extra_reach_seconds more time to
+--        reach the table (+90s on attempt 2, +180s on attempt 3), read from GET /api/v1/poll/<account>.
 -- v1.9: forwards every game Notify (while TRADING) plus TradeEvent names, accept results and
 --		addItem failures to the Hub (POST /api/v1/trade-notice) so the real trade-limit rule
 --		can be worked out. No hooks. Logging only, no behaviour change.
@@ -274,6 +279,8 @@ local HubConfig = {
 -- Orders this client has already finished with (completed, failed, timed out
 -- or stopped). Without this, the poll loop at the bottom would see the same
 -- order still sitting in the config file and immediately start it again.
+-- v2.0: the value is the Hub attempt number that was abandoned (or true = attempt 1); the order is started
+-- again only when the Hub reports a HIGHER attempt (see checkHubRetry).
 local abandonedOrders = {}
 
 local function loadHubConfig()
@@ -369,6 +376,44 @@ local function hubRequest(method, path, body)
 		return nil, "Hub returned invalid JSON (status=" .. tostring(response.StatusCode) .. ", body=" .. tostring(response.Body or ""):sub(1, 150) .. ")"
 	end
 	return decoded
+end
+
+-- v2.0: what attempt is the Hub on for this account's order, and how much extra table time does it grant?
+-- Returns attempt, extraReachSeconds (1, 0 when the Hub cannot be asked).
+local function fetchHubAttempt()
+	if HubConfig.accountId == "" then
+		return 1, 0
+	end
+	local data = hubRequest("GET", "/api/v1/poll/" .. HubConfig.accountId)
+	local req = type(data) == "table" and data.request
+	if type(req) ~= "table" then
+		return 1, 0
+	end
+	return tonumber(req.attempt) or 1, math.max(0, tonumber(req.extra_reach_seconds) or 0)
+end
+
+-- v2.0: an order this client gave up on is started again once the Hub reports a HIGHER attempt number for it.
+local function checkHubRetry()
+	if next(abandonedOrders) == nil or HubConfig.accountId == "" then
+		return
+	end
+	local data = hubRequest("GET", "/api/v1/poll/" .. HubConfig.accountId)
+	local req = type(data) == "table" and data.request
+	if type(req) ~= "table" or data.desired_state ~= "TRADING" then
+		return
+	end
+	local rid = tostring(req.request_id or "")
+	local seen = abandonedOrders[rid]
+	if seen == nil then
+		return
+	end
+	local previous = type(seen) == "number" and seen or 1
+	local attempt = tonumber(req.attempt) or 1
+	if attempt > previous then
+		abandonedOrders[rid] = nil
+		debugLog(string.format("LocalTrader: Hub retries order %s (attempt %d of %s); starting it again",
+			rid, attempt, tostring(req.max_attempts or "?")))
+	end
 end
 
 local function readExternalOrder()
@@ -2237,7 +2282,7 @@ local function stopTrader(reason, failureCode)
 	if stoppedSession and stoppedSession.externalOrder then
 		local rid = tostring(stoppedSession.externalOrder.request_id or stoppedSession.externalOrder.order_id or "")
 		if rid ~= "" then
-			abandonedOrders[rid] = true
+			abandonedOrders[rid] = stoppedSession.attempt or 1   -- v2.0: remember WHICH attempt was abandoned
 		end
 		if failureCode and not stoppedSession.completed then
 			reportFailureToHub(stoppedSession, failureCode, reason)
@@ -2486,10 +2531,20 @@ local function startTrader(orderData)
 		end
 	end
 	startButton.Text = "Stop"
+
+	-- v2.0: which Hub attempt is this, and how much extra time may it take to reach the table?
+	local attemptNo, extraReach = 1, 0
+	if type(orderData) == "table" then
+		attemptNo, extraReach = fetchHubAttempt()
+		session.attempt = attemptNo
+		if attemptNo > 1 then
+			writeLog(string.format("Hub attempt %d: allowing %ds extra to reach the table", attemptNo, extraReach))
+		end
+	end
 	local seat = emptyTradeSeat()
 	if seat then
 		setState("TRAVELING_TO_TABLE")
-		local moved, moveError = tweenToSeat(seat)
+		local moved, moveError = tweenToSeat(seat, CONFIG.TravelTimeout + extraReach)
 		if not moved then
 			stopTrader(moveError or "could not reach trade table", "worker_error")
 			return
@@ -2773,6 +2828,7 @@ task.spawn(function()
 	while true do
 		task.wait(HubConfig.poll or CONFIG.HubPollInterval)
 		if not running then
+			checkHubRetry()   -- v2.0: pick an abandoned order up again when the Hub starts a new attempt
 			local order = readExternalOrder()
 			if order then
 				writeLog("Hub order received; starting automatically")
