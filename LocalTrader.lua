@@ -2,6 +2,11 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.1: (a) a worker that gets seated at the OTHER seat of the trade table while heading for the one it wanted
+--        ("could not reach trade table" although it IS at the table) now jumps out and tries again, and after
+--        CONFIG.WrongSeatMaxBounces such bounces simply stays where it sits instead of failing the order;
+--        (b) a worker_error while travelling to the table is retried by LocalTrader itself, CONFIG.WorkerErrorRetries
+--        (2) more times, each with CONFIG.RetryExtraReachSeconds more time, before the Hub is told the order failed.
 -- v2.0: Hub worker retries. When a trade fails with worker_error (e.g. "could not reach trade table") the Hub
 --        sends the SAME order again as a new attempt. This client used to ignore a request it had already
 --        abandoned, so a retry never started. Now: (a) an abandoned order is picked up again as soon as the Hub
@@ -194,6 +199,10 @@ local CONFIG = {
 	AddItemMaxAttempts = 4,       -- v1.5: tries to put the requested fruit in the offer
 	AddItemRetryDelay = 1.5,      -- v1.5: seconds between those tries
 	MaxItemsPerTrade = 4,         -- v1.8: game rule: at most 4 units per side in one trade
+	WorkerErrorRetries = 2,       -- v2.1: extra attempts after a worker_error while reaching the table, before the Hub hears of it
+	WorkerErrorRetryDelay = 5,    -- v2.1: seconds between those attempts
+	RetryExtraReachSeconds = 90,  -- v2.1: extra time to reach the table per extra attempt
+	WrongSeatMaxBounces = 2,      -- v2.1: times to jump out of the wrong table seat before accepting it
 }
 
 -- ============================================================================
@@ -282,6 +291,8 @@ local HubConfig = {
 -- v2.0: the value is the Hub attempt number that was abandoned (or true = attempt 1); the order is started
 -- again only when the Hub reports a HIGHER attempt (see checkHubRetry).
 local abandonedOrders = {}
+-- v2.1: how many attempts LocalTrader itself has made per request id (see CONFIG.WorkerErrorRetries)
+local localAttempts = {}
 
 local function loadHubConfig()
 	if type(readfile) ~= "function" then
@@ -411,6 +422,7 @@ local function checkHubRetry()
 	local attempt = tonumber(req.attempt) or 1
 	if attempt > previous then
 		abandonedOrders[rid] = nil
+		localAttempts[rid] = nil
 		debugLog(string.format("LocalTrader: Hub retries order %s (attempt %d of %s); starting it again",
 			rid, attempt, tostring(req.max_attempts or "?")))
 	end
@@ -1853,6 +1865,23 @@ end
 -- stage after 45s. Now: waits for the character, keeps retrying from wherever
 -- it currently is until `budgetSeconds` (default CONFIG.TravelTimeout) runs
 -- out, logs every attempt, and reports the real distance on failure.
+local jumpOutOfTrade -- defined below
+
+-- v2.1: which seat of the trade table is the worker sitting in right now? nil = none
+local function currentTableSeat()
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local seatPart = humanoid and humanoid.SeatPart
+	if not seatPart then
+		return nil
+	end
+	local p1, p2 = tableSeats()
+	if seatPart == p1 or seatPart == p2 then
+		return seatPart
+	end
+	return nil
+end
+
 local function tweenToSeat(seat, budgetSeconds)
 	if not seat then
 		return false, "trade table seat was not found"
@@ -1866,9 +1895,29 @@ local function tweenToSeat(seat, budgetSeconds)
 	local budget = budgetSeconds or CONFIG.TravelTimeout
 	local lastDistance = math.huge
 	local attempt = 0
+	local wrongSeatBounces = 0
 
 	while os.clock() - startedAt < budget and running do
 		attempt = attempt + 1
+
+		-- v2.1: the tween (or the game's own seat-on-touch) may already have seated us, possibly at the OTHER seat
+		local sat = currentTableSeat()
+		if sat then
+			if sat == seat then
+				return true
+			end
+			wrongSeatBounces = wrongSeatBounces + 1
+			if wrongSeatBounces > CONFIG.WrongSeatMaxBounces then
+				debugLog(string.format("LocalTrader: still seated at %s instead of %s after %d tries; staying there",
+					sat.Name, seat.Name, wrongSeatBounces - 1))
+				return true
+			end
+			debugLog(string.format("LocalTrader: seated at %s instead of %s; jumping out and trying again (%d/%d)",
+				sat.Name, seat.Name, wrongSeatBounces, CONFIG.WrongSeatMaxBounces))
+			jumpOutOfTrade()
+			task.wait(1.5)
+		end
+
 		local character = LocalPlayer.Character
 		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
 		if rootPart then
@@ -1901,30 +1950,37 @@ local function tweenToSeat(seat, budgetSeconds)
 			end
 			task.wait(0.5)
 
-			if LocalPlayer.Character == character and rootPart.Parent then
-				lastDistance = (rootPart.Position - target.Position).Magnitude
-				if lastDistance <= 8 then
-					return true
+			-- if the tween seated us anywhere at the table, the check at the top of the next round decides
+			if not currentTableSeat() then
+				if LocalPlayer.Character == character and rootPart.Parent then
+					lastDistance = (rootPart.Position - target.Position).Magnitude
+					if lastDistance <= 8 then
+						return true
+					end
 				end
+				debugLog(string.format(
+					"LocalTrader: travel attempt %d at %.0fs: started %.0f studs out, now %.1f away (tween %s)",
+					attempt, os.clock() - startedAt, distance, lastDistance,
+					completed and "finished" or "timed out"
+				))
 			end
-			debugLog(string.format(
-				"LocalTrader: travel attempt %d at %.0fs: started %.0f studs out, now %.1f away (tween %s)",
-				attempt, os.clock() - startedAt, distance, lastDistance,
-				completed and "finished" or "timed out"
-			))
 		else
 			task.wait(1)
 		end
 		task.wait(2)
 	end
 
+	-- last look: sitting at the table (even in the other seat) IS reaching the table
+	if currentTableSeat() then
+		return true
+	end
 	return false, string.format(
 		"could not reach trade table after %.0fs (last distance %.1f studs, %d attempts)",
 		os.clock() - startedAt, lastDistance, attempt
 	)
 end
 
-local function jumpOutOfTrade()
+function jumpOutOfTrade()
 	local character = LocalPlayer.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
@@ -2253,7 +2309,9 @@ local function reportFailureToHub(sess, code, message)
 end
 
 local startButton
-local function stopTrader(reason, failureCode)
+local startTrader        -- defined further down
+local retryPending = 0   -- v2.1: a local retry is waiting to start (the poll loop must not start the order meanwhile)
+local function stopTrader(reason, failureCode, localRetry)
 	local stoppedSession = session
 	local stoppedSessionId = session and session.id
 	local stoppedOrderId = session and session.orderId
@@ -2278,6 +2336,33 @@ local function stopTrader(reason, failureCode)
 		end
 	end
 	writeLog(string.format("%s%s", reason or "stopped", stoppedSessionId and (" [session " .. tostring(stoppedSessionId) .. "]") or ""))
+
+	-- v2.1: a worker_error while travelling to the table is retried HERE, CONFIG.WorkerErrorRetries more times,
+	-- before the Hub is told the order failed (and the customer refunded).
+	if localRetry and failureCode == "worker_error" and stoppedSession and stoppedSession.externalOrder
+		and not stoppedSession.completed then
+		local retryOrder = stoppedSession.externalOrder
+		local rid = tostring(retryOrder.request_id or retryOrder.order_id or "")
+		local used = localAttempts[rid] or 1
+		if rid ~= "" and used < 1 + CONFIG.WorkerErrorRetries then
+			localAttempts[rid] = used + 1
+			writeLog(string.format("worker error (%s): trying again myself, attempt %d of %d",
+				tostring(reason), used + 1, 1 + CONFIG.WorkerErrorRetries))
+			retryPending = retryPending + 1
+			task.spawn(function()
+				pcall(jumpOutOfTrade) -- stand up in case the worker sits in a seat
+				task.wait(CONFIG.WorkerErrorRetryDelay)
+				if not running then
+					local ok, err = pcall(startTrader, retryOrder)
+					if not ok then
+						writeLog("retry could not start: " .. tostring(err))
+					end
+				end
+				retryPending = math.max(0, retryPending - 1)
+			end)
+			return
+		end
+	end
 
 	if stoppedSession and stoppedSession.externalOrder then
 		local rid = tostring(stoppedSession.externalOrder.request_id or stoppedSession.externalOrder.order_id or "")
@@ -2438,7 +2523,7 @@ local function scanTradeCounterLabels(reason)
 	end
 end
 
-local function startTrader(orderData)
+function startTrader(orderData)
 	if running then
 		return
 	end
@@ -2540,13 +2625,25 @@ local function startTrader(orderData)
 		if attemptNo > 1 then
 			writeLog(string.format("Hub attempt %d: allowing %ds extra to reach the table", attemptNo, extraReach))
 		end
+		-- v2.1: attempts made by LocalTrader itself (see stopTrader) also get more time to reach the table
+		local localRid = tostring(orderData.request_id or orderData.order_id or "")
+		local localAttempt = (localRid ~= "" and localAttempts[localRid]) or 1
+		if localRid ~= "" then
+			localAttempts[localRid] = localAttempt
+		end
+		session.localAttempt = localAttempt
+		if localAttempt > 1 then
+			extraReach = extraReach + (localAttempt - 1) * CONFIG.RetryExtraReachSeconds
+			writeLog(string.format("own attempt %d of %d: allowing %ds extra to reach the table",
+				localAttempt, 1 + CONFIG.WorkerErrorRetries, (localAttempt - 1) * CONFIG.RetryExtraReachSeconds))
+		end
 	end
 	local seat = emptyTradeSeat()
 	if seat then
 		setState("TRAVELING_TO_TABLE")
 		local moved, moveError = tweenToSeat(seat, CONFIG.TravelTimeout + extraReach)
 		if not moved then
-			stopTrader(moveError or "could not reach trade table", "worker_error")
+			stopTrader(moveError or "could not reach trade table", "worker_error", true)
 			return
 		end
 		session.lastRetween = os.clock()
@@ -2827,7 +2924,7 @@ end
 task.spawn(function()
 	while true do
 		task.wait(HubConfig.poll or CONFIG.HubPollInterval)
-		if not running then
+		if not running and retryPending == 0 then
 			checkHubRetry()   -- v2.0: pick an abandoned order up again when the Hub starts a new attempt
 			local order = readExternalOrder()
 			if order then
