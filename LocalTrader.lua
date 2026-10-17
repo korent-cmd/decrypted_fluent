@@ -2,6 +2,12 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.2: FARMING mode now joins a team ITSELF. Blox Fruits does not spawn the character until a team is chosen,
+--        and this script only tells the Hub the account is in the game once the character is in the world. The farm
+--        script (QuantumOnyx) normally picks the team, so with it off, broken or still downloading nobody did: no
+--        character, no game-ping, and the Hub saw the account as offline. Before, a team was only picked in the daily
+--        flush and in TRADING. Now (CONFIG.FarmEnsureTeam) the farm script gets CONFIG.FarmTeamGraceSeconds to choose
+--        its own team; if none appears, Pirates is chosen (the same call TRADING uses), retried if it fails.
 -- v2.1: (a) a worker that gets seated at the OTHER seat of the trade table while heading for the one it wanted
 --        ("could not reach trade table" although it IS at the table) now jumps out and tries again, and after
 --        CONFIG.WrongSeatMaxBounces such bounces simply stays where it sits instead of failing the order;
@@ -203,6 +209,10 @@ local CONFIG = {
 	WorkerErrorRetryDelay = 5,    -- v2.1: seconds between those attempts
 	RetryExtraReachSeconds = 90,  -- v2.1: extra time to reach the table per extra attempt
 	WrongSeatMaxBounces = 2,      -- v2.1: times to jump out of the wrong table seat before accepting it
+	FarmEnsureTeam = true,        -- v2.2: FARMING also picks a team itself, so the Hub hears from the account even with the farm script off
+	FarmTeamGraceSeconds = 30,    -- v2.2: ...after giving the farm script this long to pick its own team first (0 = pick at once)
+	FarmTeamRetrySeconds = 30,    -- v2.2: wait between tries when joining a team fails
+	FarmTeamMaxAttempts = 10,     -- v2.2: then stop trying until the next client start
 }
 
 -- ============================================================================
@@ -1023,8 +1033,8 @@ local function reportInventoryToHub()
 		username = LocalPlayer.Name,
 	})
 
-	-- No team yet = the inventory can't be read. In farming the farm script
-	-- picks the team itself, so just wait for it rather than forcing one.
+	-- No team yet = the inventory can't be read. Waiting is right here: in FARMING a team is picked by the
+	-- farm script or, after CONFIG.FarmTeamGraceSeconds, by the FarmEnsureTeam task below (v2.2).
 	if not LocalPlayer.Team then
 		return
 	end
@@ -1600,6 +1610,34 @@ if HubConfig.mode == "FARMING" then
 			.. ", recordJobId=" .. tostring(farmingRecord.loadJobId)
 			.. ", thisJobId=" .. tostring(game.JobId)
 			.. ", recordAgeVsSessionStart=" .. tostring(handoffStamp(farmingRecord) - SESSION_STARTED_AT) .. "s")
+	end
+	-- v2.2: join a team ourselves. Without a team Blox Fruits never spawns the character, and the Hub only hears
+	-- from this account once the character is in the world (characterIsLoaded). The farm script normally picks
+	-- the team, but when it is off or broken nobody did and the account looked offline. It gets
+	-- CONFIG.FarmTeamGraceSeconds to pick its own team first. This runs beside the flush and the farm-script
+	-- load, never instead of them (the flush's own ensureTeam(0) call simply waits for / shares this one).
+	if CONFIG.FarmEnsureTeam then
+		task.spawn(function()
+			local maxAttempts = CONFIG.FarmTeamMaxAttempts or 10
+			local attempt = 0
+			while not LocalPlayer.Team and attempt < maxAttempts do
+				attempt = attempt + 1
+				local ok, err = pcall(ensureTeam, attempt == 1 and (CONFIG.FarmTeamGraceSeconds or 0) or 0)
+				if not ok then
+					debugLog("LocalTrader: FARMING team join error: " .. tostring(err))
+				end
+				if LocalPlayer.Team then
+					break
+				end
+				debugLog(string.format("LocalTrader: FARMING: still no team (attempt %d/%d)", attempt, maxAttempts))
+				task.wait(CONFIG.FarmTeamRetrySeconds or 30)
+			end
+			if LocalPlayer.Team then
+				debugLog("LocalTrader: FARMING: team ready (" .. tostring(LocalPlayer.Team.Name) .. "); the Hub signal can start")
+			else
+				debugLog("LocalTrader: FARMING: gave up joining a team")
+			end
+		end)
 	end
 	-- Flush (if due) FIRST, then start the farm script, so the two can never
 	-- interfere with each other.
