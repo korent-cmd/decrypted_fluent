@@ -6,8 +6,8 @@
 --        and this script only tells the Hub the account is in the game once the character is in the world. The farm
 --        script (QuantumOnyx) normally picks the team, so with it off, broken or still downloading nobody did: no
 --        character, no game-ping, and the Hub saw the account as offline. Before, a team was only picked in the daily
---        flush and in TRADING. Now (CONFIG.FarmEnsureTeam) the farm script gets CONFIG.FarmTeamGraceSeconds to choose
---        its own team; if none appears, Pirates is chosen (the same call TRADING uses), retried if it fails.
+--        flush and in TRADING. Now (CONFIG.FarmEnsureTeam) a team is chosen at once (Pirates, the same call TRADING uses;
+--        retried if it fails). CONFIG.FarmTeamGraceSeconds > 0 would let the farm script pick its own team first.
 -- v2.1: (a) a worker that gets seated at the OTHER seat of the trade table while heading for the one it wanted
 --        ("could not reach trade table" although it IS at the table) now jumps out and tries again, and after
 --        CONFIG.WrongSeatMaxBounces such bounces simply stays where it sits instead of failing the order;
@@ -210,7 +210,7 @@ local CONFIG = {
 	RetryExtraReachSeconds = 90,  -- v2.1: extra time to reach the table per extra attempt
 	WrongSeatMaxBounces = 2,      -- v2.1: times to jump out of the wrong table seat before accepting it
 	FarmEnsureTeam = true,        -- v2.2: FARMING also picks a team itself, so the Hub hears from the account even with the farm script off
-	FarmTeamGraceSeconds = 30,    -- v2.2: ...after giving the farm script this long to pick its own team first (0 = pick at once)
+	FarmTeamGraceSeconds = 0,     -- v2.2: seconds the farm script gets to pick its own team first (0 = pick Pirates at once; any team is fine)
 	FarmTeamRetrySeconds = 30,    -- v2.2: wait between tries when joining a team fails
 	FarmTeamMaxAttempts = 10,     -- v2.2: then stop trying until the next client start
 }
