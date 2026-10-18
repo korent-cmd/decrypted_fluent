@@ -221,7 +221,7 @@ DEFAULT_AUTOEXEC = {
     "enabled": True,
     "script_url": LOCALTRADER_URL,
     "file_name": "LocalTrader_autoexec.lua",
-    "dir_name": "",                       # "" = find the clone's autoexec folder by itself
+    "dir_name": "Arceus X/Autoexec",                  # "" = find the clone's autoexec folder by itself
     "base_dir": "/storage/emulated/0",    # where the RobloxCloneNNN folders live
 }
 
