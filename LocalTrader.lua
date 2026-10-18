@@ -1020,9 +1020,15 @@ end
 
 -- v2.3: which sea this client is in. 0 = a place this script does not know (the Hub then skips the account too).
 local SEA_BY_PLACE_ID = {
+	-- Sea 1
 	[2753915549] = 1,
+	[85211729168715] = 1,
+	-- Sea 2
 	[4442272183] = 2,
+	[79091703265657] = 2,
+	-- Sea 3
 	[7449423635] = 3,
+	[100117331123089] = 3,
 }
 local function currentSea()
 	return SEA_BY_PLACE_ID[game.PlaceId] or 0
