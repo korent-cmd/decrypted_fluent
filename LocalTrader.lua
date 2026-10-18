@@ -2,6 +2,10 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.3: every game-ping and inventory report now carries the SEA this client is in (from game.PlaceId, the same ids the old farm
+--        script used: 2753915549 = Sea 1, 4442272183 = Sea 2, 7449423635 = Sea 3). Trading only works in the Second Sea, so the
+--        Hub (v2.9.4) counts an account only while it reports Sea 2: in Sea 1 or 3 its fruits are not in stock and it gets no
+--        orders. Checked again on every script execution and every report; nothing else about this script changes.
 -- v2.2: FARMING mode now joins a team ITSELF. Blox Fruits does not spawn the character until a team is chosen,
 --        and this script only tells the Hub the account is in the game once the character is in the world. The farm
 --        script (QuantumOnyx) normally picks the team, so with it off, broken or still downloading nobody did: no
@@ -1014,6 +1018,17 @@ local function characterIsLoaded()
 		and character:FindFirstChild("HumanoidRootPart") ~= nil
 end
 
+-- v2.3: which sea this client is in. 0 = a place this script does not know (the Hub then skips the account too).
+local SEA_BY_PLACE_ID = {
+	[2753915549] = 1,
+	[4442272183] = 2,
+	[7449423635] = 3,
+}
+local function currentSea()
+	return SEA_BY_PLACE_ID[game.PlaceId] or 0
+end
+local seaLogged = false
+
 local function reportInventoryToHub()
 	if HubConfig.url == "" or HubConfig.token == "" or HubConfig.accountId == "" then
 		return
@@ -1025,12 +1040,22 @@ local function reportInventoryToHub()
 		return
 	end
 
+	-- v2.3: re-checked on every report, so a teleport between seas is seen within one poll.
+	local sea = currentSea()
+	if not seaLogged then
+		seaLogged = true
+		debugLog(string.format("LocalTrader: this client is in Sea %s (place %s)%s",
+			sea > 0 and tostring(sea) or "?", tostring(game.PlaceId),
+			sea == 2 and "" or " - the Hub does NOT count accounts outside Sea 2 (no stock, no orders)"))
+	end
+
 	-- Tell the Hub the game itself is alive and playing, even if the
 	-- inventory below can't be read right now. The Roblox username lets the
 	-- dashboard show which account is in which package.
 	hubRequest("POST", "/api/v1/game-ping", {
 		account_id = HubConfig.accountId,
 		username = LocalPlayer.Name,
+		sea = sea,
 	})
 
 	-- No team yet = the inventory can't be read. Waiting is right here: in FARMING a team is picked by the
@@ -1052,6 +1077,7 @@ local function reportInventoryToHub()
 	local data, reqErr = hubRequest("POST", "/api/v1/inventory", {
 		account_id = HubConfig.accountId,
 		items = available,
+		sea = sea,
 	})
 	if not data then
 		debugLog("LocalTrader: inventory report failed: " .. tostring(reqErr))
