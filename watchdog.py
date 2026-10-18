@@ -14,6 +14,16 @@
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
 #
+# v3.9
+#   - ADD: LocalTrader autoexec. For every clone the watchdog now writes a small file into the clone's Autoexec
+#     folder (found case-insensitively next to the Workspace; created if it does not exist) that runs
+#         loadstring(game:HttpGet("<script_url>"))()
+#     so LocalTrader starts by itself every time the game loads - no manual execution. It is checked at start-up,
+#     before every (re)launch and from menu option 11, rewritten only when its content differs, and any OTHER
+#     autoexec file that also mentions LocalTrader is reported (it would run twice). The file guards against
+#     running twice in one server. Settings live in watchdog_config.json under "autoexec"
+#     (enabled, script_url, file_name, dir_name, base_dir).
+#
 # v3.8
 #   - FIX: "everything crashes after a trade". When the Hub flipped every
 #     account TRADING -> FARMING, poll_hub() force-stopped and cold-started ALL
@@ -179,7 +189,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.8"
+VERSION = "3.9"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -204,6 +214,16 @@ DEFAULT_HUB_POLL_SEC = 3
 # its own config inside its Workspace. This avoids relying on a
 # shared LocalTrader_Order.json on the Termux side.
 LOCALTRADER_CONFIG_NAME = "LocalTrader_Hub.json"
+
+# v3.9: the autoexec file that starts LocalTrader inside the game.
+LOCALTRADER_URL = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/LocalTrader.lua"
+DEFAULT_AUTOEXEC = {
+    "enabled": True,
+    "script_url": LOCALTRADER_URL,
+    "file_name": "LocalTrader_autoexec.lua",
+    "dir_name": "",                       # "" = find the clone's autoexec folder by itself
+    "base_dir": "/storage/emulated/0",    # where the RobloxCloneNNN folders live
+}
 
 
 
@@ -833,6 +853,140 @@ class Controller:
         return False
 
 
+class AutoexecInstaller:
+    """Puts a file into each clone's autoexec folder that runs LocalTrader. Uses root shell commands only."""
+    RECHECK_SEC = 300
+
+    FIND_DIR = r'''
+c=@@BASE@@; f=@@FILE@@; hint=@@HINT@@
+[ -d "$c" ] || { echo "AUTOEXEC_ERR clone folder missing: $c" >&2; exit 2; }
+d=""
+if [ -n "$hint" ] && [ -d "$c/$hint" ]; then d="$c/$hint"; fi
+if [ -z "$d" ]; then
+  for x in "$c"/* "$c/Arceus X"/*; do
+    [ -d "$x" ] || continue
+    n=$(echo "${x##*/}" | tr 'A-Z' 'a-z')
+    case "$n" in autoexec*) d="$x"; break;; esac
+  done
+fi
+'''
+    INSTALL = FIND_DIR + r'''
+created=""
+if [ -z "$d" ]; then
+  d="$c/${hint:-Autoexec}"; created=" created"
+  mkdir -p "$d" || { echo "AUTOEXEC_ERR cannot create $d" >&2; exit 3; }
+fi
+want=$(echo @@B64@@ | base64 -d)
+if [ -f "$d/$f" ] && [ "$(cat "$d/$f")" = "$want" ]; then
+  st=same
+else
+  tmp="$d/.$f.tmp"
+  { echo @@B64@@ | base64 -d > "$tmp" && mv -f "$tmp" "$d/$f"; } || { echo "AUTOEXEC_ERR write failed in $d" >&2; exit 4; }
+  chmod 666 "$d/$f" 2>/dev/null
+  st=written
+fi
+echo "AUTOEXEC_OK $st $d$created"
+dups=$(grep -l -i 'localtrader' "$d"/* 2>/dev/null | grep -v -F "$d/$f" | tr '\n' ' ')
+[ -n "$dups" ] && echo "AUTOEXEC_DUP $dups"
+exit 0
+'''
+    REMOVE = FIND_DIR + r'''
+if [ -z "$d" ]; then echo "AUTOEXEC_OK none"; exit 0; fi
+if [ -f "$d/$f" ]; then rm -f "$d/$f" && echo "AUTOEXEC_OK removed $d"; else echo "AUTOEXEC_OK none $d"; fi
+exit 0
+'''
+
+    def __init__(self, shell: Shell, logger: Logger, cfg: Optional[dict] = None):
+        self.shell = shell
+        self.log = logger
+        self.cfg = {**DEFAULT_AUTOEXEC, **(cfg or {})}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled", True))
+
+    def lua(self) -> str:
+        url = (self.cfg.get("script_url") or LOCALTRADER_URL).strip().replace("\\", "\\\\").replace('"', '\\"')
+        return (
+            "-- Written by the Roblox watchdog: starts LocalTrader every time the game loads.\n"
+            "-- Do not edit here; the address comes from watchdog_config.json -> autoexec.script_url\n"
+            'local env = (type(getgenv) == "function" and getgenv()) or _G\n'
+            "if env.__LocalTraderAutoexec == game.JobId then return end\n"
+            "env.__LocalTraderAutoexec = game.JobId\n"
+            f'loadstring(game:HttpGet("{url}"))()\n'
+        )
+
+    def file_name(self) -> str:
+        return os.path.basename(str(self.cfg.get("file_name") or "")) or DEFAULT_AUTOEXEC["file_name"]
+
+    def clone_name_for(self, target: "Target", targets: List["Target"]) -> str:
+        name = target.clone_folder
+        if not name:
+            m = re.search(r"RobloxClone\d+", target.label or "")
+            name = m.group(0) if m else ""
+        if not name:
+            try:
+                ordinal = targets.index(target) + 1
+            except ValueError:
+                ordinal = 1
+            name = f"RobloxClone{ordinal:03d}"
+        target.clone_folder = name
+        return name
+
+    def _script(self, template: str, target: "Target", targets: List["Target"], b64: str = "") -> str:
+        base = str(self.cfg.get("base_dir") or DEFAULT_AUTOEXEC["base_dir"]).rstrip("/")
+        clone = self.clone_name_for(target, targets)
+        return (template.replace("@@BASE@@", shlex.quote(f"{base}/{clone}"))
+                        .replace("@@FILE@@", shlex.quote(self.file_name()))
+                        .replace("@@HINT@@", shlex.quote(str(self.cfg.get("dir_name") or "")))
+                        .replace("@@B64@@", shlex.quote(b64)))
+
+    def ensure(self, target: "Target", targets: List["Target"], force: bool = False) -> Tuple[bool, str]:
+        """Make sure the clone's autoexec folder holds the LocalTrader starter. Never raises."""
+        if not self.enabled:
+            return False, "autoexec is switched off"
+        now = time.time()
+        if not force and now - getattr(target, "_autoexec_at", 0.0) < self.RECHECK_SEC:
+            return True, "checked recently"
+        try:
+            b64 = base64.b64encode(self.lua().encode("utf-8")).decode("ascii")
+            res = self.shell.root(self._script(self.INSTALL, target, targets, b64), timeout=25, redact=True)
+            out = (res.stdout or "") + "\n" + (res.stderr or "")
+            m = re.search(r"AUTOEXEC_OK (written|same) (.+?)(?: (created))?$", out, re.M)
+            if res.returncode != 0 or not m:
+                err = re.search(r"AUTOEXEC_ERR (.+)", out)
+                msg = err.group(1).strip() if err else (out.strip()[-200:] or f"exit code {res.returncode}")
+                self.log.log(f"{target.label}: autoexec install FAILED: {msg}")
+                return False, msg
+            state, folder, created = m.group(1), m.group(2).strip(), bool(m.group(3))
+            target._autoexec_at = now
+            dup = re.search(r"AUTOEXEC_DUP (.+)", out)
+            if dup and not getattr(target, "_autoexec_dup_logged", False):
+                target._autoexec_dup_logged = True
+                self.log.log(f"{target.label}: WARNING another autoexec file also mentions LocalTrader and would run it twice: {dup.group(1).strip()}")
+            if state == "written" or not getattr(target, "_autoexec_logged", False):
+                target._autoexec_logged = True
+                extra = " (the folder did not exist, so I created it - if LocalTrader does not start, tell me the real autoexec folder name)" if created else ""
+                self.log.log(f"{target.label}: autoexec {'written' if state == 'written' else 'already in place'}: {folder}/{self.file_name()}{extra}")
+            return True, f"{state}: {folder}/{self.file_name()}" + (" [folder created]" if created else "") + (f" [WARNING also: {dup.group(1).strip()}]" if dup else "")
+        except Exception as e:
+            self.log.log(f"{target.label}: autoexec install error: {type(e).__name__}: {e}")
+            return False, f"{type(e).__name__}: {e}"
+
+    def remove(self, target: "Target", targets: List["Target"]) -> Tuple[bool, str]:
+        try:
+            res = self.shell.root(self._script(self.REMOVE, target, targets), timeout=25)
+            out = (res.stdout or "") + (res.stderr or "")
+            target._autoexec_at = 0.0
+            if "AUTOEXEC_OK removed" in out:
+                return True, "removed"
+            if "AUTOEXEC_OK none" in out:
+                return True, "nothing to remove"
+            return False, out.strip()[-200:] or f"exit code {res.returncode}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+
 class Watchdog:
     NOT_RUNNING_CONFIRM_TICKS = 3
 
@@ -864,6 +1018,7 @@ class Watchdog:
         crash_restart_enabled: bool = False,
         focus_handoff: bool = False,
         soft_return: bool = False,
+        autoexec: Optional[dict] = None,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -888,6 +1043,14 @@ class Watchdog:
         self._wakelock_done = False
         self.pending_snapshots: List[Tuple[float, str, int]] = []
         self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
+        self.autoexec = AutoexecInstaller(self.shell, logger, autoexec)
+
+    def ensure_autoexec(self, t: Target, force: bool = False) -> None:
+        """Best-effort and cheap (re-checks a clone at most every few minutes): never blocks a launch."""
+        try:
+            self.autoexec.ensure(t, self.targets, force=force)
+        except Exception as e:
+            self.log.log(f"{t.label}: autoexec check failed: {e}")
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
@@ -1244,6 +1407,7 @@ class Watchdog:
     def enter_trading(self, t: Target) -> None:
         if not t.enabled:
             return
+        self.ensure_autoexec(t)
         self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: ENTER TRADING")
         t.status = "switching_to_trading"
@@ -1265,6 +1429,7 @@ class Watchdog:
             self.notify(t, t.status, "trading_deep_link_failed", {"request_id": t.hub_request_id})
 
     def return_to_farming(self, t: Target) -> None:
+        self.ensure_autoexec(t)
         self.sync_localtrader_config(t)
         self.log.log(f"{t.label}: RETURN TO FARMING")
         t.status = "switching_to_farming"
@@ -1381,6 +1546,7 @@ class Watchdog:
         # even though t.hub_state itself is current.
         # sync_localtrader_config() is itself exception-safe (see its docstring),
         # so this can never block the relaunch below it.
+        self.ensure_autoexec(t)
         self.sync_localtrader_config(t)
         self.wake()
         self.prepare_stop(t, f"RESTART ({reason})")
@@ -1545,6 +1711,7 @@ class Watchdog:
 
         for t in self.targets:
             if t.enabled:
+                self.ensure_autoexec(t, force=True)
                 self.sync_localtrader_config(t)
                 self.heartbeat(t)
 
@@ -1588,7 +1755,7 @@ class Watchdog:
         lines.append("=" * 86)
         hubtxt = self.hub.base_url if self.hub.enabled else "OFF"
         cr = "ON" if self.crash_restart_enabled else "OFF (timer-only rejoin)"
-        lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr}")
+        lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr} | autoexec: {'ON' if self.autoexec.enabled else 'OFF'}")
         if self.pending_transitions:
             lines.append(f"Queued transitions: {len(self.pending_transitions)}")
         lines.append("-")
@@ -1623,6 +1790,7 @@ class App:
         self.hub_url = ""
         self.hub_token = ""
         self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
+        self.autoexec = dict(DEFAULT_AUTOEXEC)
         self.load()
 
     def load(self) -> None:
@@ -1637,6 +1805,7 @@ class App:
             self.focus_handoff = bool(c.get("focus_handoff", False))
             self.soft_return = bool(c.get("soft_return", False))
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
+            self.autoexec = {**DEFAULT_AUTOEXEC, **(c.get("autoexec") or {})}
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
             self.hub_token = str(hub.get("token", ""))
@@ -1654,6 +1823,7 @@ class App:
             "focus_handoff": self.focus_handoff,
             "soft_return": self.soft_return,
             "trading_share_link": self.trading_share_link,
+            "autoexec": self.autoexec,
             "hub": {
                 "url": self.hub_url,
                 "token": self.hub_token,
@@ -1934,6 +2104,7 @@ class App:
             self.crash_restart_enabled,
             self.focus_handoff,
             self.soft_return,
+            self.autoexec,
         )
 
         def sigint(_sig, _frame):
@@ -1952,6 +2123,46 @@ class App:
                 lock_fh.close()   # releases the single-instance lock
             except Exception:
                 pass
+
+    def autoexec_menu(self) -> None:
+        inst = AutoexecInstaller(self.shell, self.logger, self.autoexec)
+        while True:
+            inst.cfg = {**DEFAULT_AUTOEXEC, **self.autoexec}
+            clear_screen()
+            print("LOCALTRADER AUTOEXEC")
+            print("=" * 70)
+            print(f"Status : {'ON' if inst.enabled else 'OFF'}")
+            print(f"Script : {inst.cfg['script_url']}")
+            print(f"File   : {inst.file_name()}  (in each clone's Autoexec folder, found automatically)")
+            print(f"Clones : {len([t for t in self.targets if t.enabled])}")
+            print()
+            print("i = install / check now in every clone")
+            print("r = remove the file from every clone")
+            print("t = switch on/off     u = change the script URL     b = back")
+            choice = input("\n> ").strip().lower()
+            if choice == "b":
+                return
+            if choice == "t":
+                self.autoexec["enabled"] = not inst.enabled
+                self.save()
+            elif choice == "u":
+                new = self.ask("Script URL", inst.cfg["script_url"]).strip()
+                if new:
+                    self.autoexec["script_url"] = new
+                    self.save()
+                    for t in self.targets:
+                        t._autoexec_at = 0.0
+                    print("Saved. Choose 'i' to write it into the clones now (a running watchdog picks it up at its next launch check).")
+                    input("Press Enter...")
+            elif choice in ("i", "r"):
+                if choice == "i" and not inst.enabled:
+                    print("Autoexec is switched off (press t first).")
+                for t in self.targets:
+                    if not t.enabled:
+                        continue
+                    ok, msg = inst.ensure(t, self.targets, force=True) if choice == "i" else inst.remove(t, self.targets)
+                    print(f"  {'OK ' if ok else 'FAIL'} {t.label}: {msg}")
+                input("\nPress Enter...")
 
     def menu(self) -> None:
         while True:
@@ -1975,6 +2186,7 @@ class App:
             print("8. Toggle crash-restart")
             print("9. Toggle focus handoff (KNOWN BAD: hides every clone - leave OFF)")
             print("10. Toggle soft return (no force-stop when returning to farming)")
+            print("11. LocalTrader autoexec (install / check / remove / on-off / URL)")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -2018,6 +2230,8 @@ class App:
                     print("farming link is sent into it instead. If clones stay in the trading")
                     print("server after a trade, turn this back OFF.")
                 input("Press Enter...")
+            elif choice == "11":
+                self.autoexec_menu()
             elif choice == "0":
                 return
 
