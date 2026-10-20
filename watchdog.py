@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.0 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.1 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -14,8 +14,14 @@
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
 #
+# v4.1
+#   - Everything is in this one file: the proof recorder (no proof.py), the
+#     auto-restart supervisor (menu 13 or `python3 rw.py install-supervisor`,
+#     nothing to download) and the Lua helper (`python3 rw.py lua` writes
+#     rwproof.lua next to this script).
+#
 # v4.0
-#   - ADD: trade proof recorder (proof.py). LocalTrader signals "confirm stage"
+#   - ADD: trade proof recorder. LocalTrader signals "confirm stage"
 #     and "trade done" (see rwproof.lua); the watchdog raises that clone to the
 #     front, records the screen, and saves <request_id>_<clone>_<time>.mp4 in
 #     /storage/emulated/0/RWProof. Runs in its own threads. Menu option 12.
@@ -194,6 +200,7 @@ import fcntl
 import hashlib
 import json
 import os
+import queue
 import re
 import shlex
 import signal
@@ -201,24 +208,18 @@ import socket
 import subprocess
 import sys
 import termios
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:                                   # proof.py is optional: rw.py still works without it
-    from proof import ProofRecorder, DEFAULT_PROOF
-except Exception as _proof_err:        # noqa
-    ProofRecorder = None               # type: ignore
-    DEFAULT_PROOF = {}                 # type: ignore
-    _PROOF_IMPORT_ERROR = str(_proof_err)
-else:
-    _PROOF_IMPORT_ERROR = ""
 
-VERSION = "4.0"
+VERSION = "4.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -1023,6 +1024,367 @@ exit 0
             return False, f"{type(e).__name__}: {e}"
 
 
+# ============================================================================
+# Trade proof recorder (v4.x, built in).
+# LocalTrader signals "start" (confirm stage) and "done" (trade complete) over
+#   http://127.0.0.1:<port>/proof/start|done?account=<id>&id=<request_id>
+# or via <clone>/Arceus X/Workspace/LocalTrader_Signal.json. Between the two, the
+# trading clone is raised to the front and the screen is recorded.
+# Runs in its own threads, so a slow tick() never delays a recording.
+# ============================================================================
+SIGNAL_FILE = "LocalTrader_Signal.json"
+
+DEFAULT_PROOF: Dict[str, Any] = {
+    "enabled": True,
+    "port": 8799,
+    "dir": "/storage/emulated/0/RWProof",
+    "bring_to_front": True,      # raise the trading clone before recording
+    "tail_sec": 1.5,             # keep recording this long after "done"
+    "max_sec": 60,               # hard cap per recording (screenrecord max is 180)
+    "bit_rate": 2000000,
+    "keep_last_sec": 12,         # trim to the last N seconds if ffmpeg exists (0 = keep all)
+    "keep_days": 14,             # delete proof videos older than this
+    "file_poll": True,
+    "file_poll_sec": 1.0,
+    "ffmpeg": "/data/data/com.termux/files/usr/bin/ffmpeg",
+}
+
+
+def _safe(text: str, n: int = 40) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(text or ""))[:n] or "x"
+
+
+class ProofRecorder:
+    def __init__(self, shell, logger, get_targets: Callable[[], list],
+                 cfg: Optional[dict] = None,
+                 on_saved: Optional[Callable[[Any, str, str], None]] = None,
+                 is_trading: Optional[Callable[[Any], bool]] = None,
+                 resane: Optional[Callable[[], None]] = None):
+        self.shell = shell
+        self.log = logger
+        self.get_targets = get_targets
+        self.cfg = {**DEFAULT_PROOF, **(cfg or {})}
+        self.on_saved = on_saved
+        self.is_trading = is_trading or (lambda t: False)
+        self.resane = resane
+        self.q: "queue.Queue[Tuple[str, str, str]]" = queue.Queue()
+        self.session: Optional[Dict[str, Any]] = None
+        self._seq: Dict[str, str] = {}
+        self._stop = threading.Event()
+        self._httpd = None
+        self._threads: List[threading.Thread] = []
+        self._last_poll = 0.0
+        self._last_alive_check = 0.0
+        self._last_clean = 0.0
+        self.last_error = ""
+        self.saved: List[str] = []
+
+    # ------------------------------------------------------------------ life
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled", True))
+
+    def start(self, http: bool = True) -> None:
+        if not self.enabled or self._threads:
+            return
+        self._stop.clear()
+        w = threading.Thread(target=self._worker, name="proof-worker", daemon=True)
+        w.start()
+        self._threads.append(w)
+        if http:
+            try:
+                handler = _make_handler(self)
+                self._httpd = ThreadingHTTPServer(("127.0.0.1", int(self.cfg["port"])), handler)
+                self._httpd.daemon_threads = True
+                h = threading.Thread(target=self._httpd.serve_forever, name="proof-http", daemon=True)
+                h.start()
+                self._threads.append(h)
+                self.log.log(f"proof: listening on 127.0.0.1:{self.cfg['port']}, folder {self.cfg['dir']}")
+            except Exception as e:
+                self.last_error = f"HTTP listener failed: {e}"
+                self.log.log(f"proof: {self.last_error} (file-signal channel still works)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            if self._httpd:
+                self._httpd.shutdown()
+                self._httpd.server_close()
+        except Exception:
+            pass
+        for th in self._threads:
+            if th.name == "proof-worker":
+                th.join(timeout=15)
+        self._threads = []
+        if self.session:                      # never leave a screenrecord running
+            try:
+                self._finish("watchdog stopping")
+            except Exception:
+                pass
+
+    def status_text(self) -> str:
+        if not self.enabled:
+            return "OFF"
+        s = self.session
+        if s:
+            return f"RECORDING {int(time.time() - s['t0'])}s"
+        err = f" | last error: {self.last_error}" if self.last_error else ""
+        return f"ON (port {self.cfg['port']}, {len(self.saved)} saved this run){err}"
+
+    # ------------------------------------------------------------ public API
+    def test(self, target, seconds: int = 6) -> str:
+        """Used by the menu: record `seconds` of this clone, return the saved path."""
+        before = len(self.saved)
+        self.q.put(("start", target.hub_id, "TEST"))
+        time.sleep(max(2, seconds))
+        self.q.put(("done", target.hub_id, "TEST"))
+        for _ in range(60):
+            time.sleep(0.5)
+            if self.session is None and len(self.saved) > before:
+                return self.saved[-1]
+        return self.last_error or "no file produced - see watchdog.log"
+
+    # ----------------------------------------------------------------- shell
+    def _quiet(self, script: str, timeout: int = 15) -> str:
+        """Run a root script without writing it to watchdog.log (used for polling)."""
+        cmd = script if self.shell.is_root() else "su -c " + shlex.quote(script)
+        try:
+            p = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=timeout)
+            return (p.stdout or "").strip()
+        except Exception:
+            return ""
+        finally:
+            if self.resane:
+                self.resane()
+
+    def _recording_pid(self) -> str:
+        return self._quiet("pidof screenrecord", timeout=8)
+
+    # ---------------------------------------------------------------- worker
+    def _worker(self) -> None:
+        self._cleanup_old()
+        while not self._stop.is_set():
+            try:
+                try:
+                    ev = self.q.get(timeout=0.25)
+                except queue.Empty:
+                    ev = None
+                if ev:
+                    self._handle(*ev)
+                self._tick()
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.log.log(f"proof: worker error {self.last_error}")
+                time.sleep(1)
+
+    def _find(self, account: str):
+        for t in self.get_targets():
+            if account and account in (t.hub_id, t.package, t.label):
+                return t
+        return None
+
+    def _handle(self, kind: str, account: str, rid: str) -> None:
+        t = self._find(account)
+        if t is None:
+            self.log.log(f"proof: {kind} for unknown account {account!r} ignored")
+            return
+        now = time.time()
+        if kind == "start":
+            key = (t.hub_id, rid or "trade")
+            s = self.session
+            if s is None:
+                self._begin(t, key)
+            else:
+                info = s["ids"].get(key)
+                if info is not None and info["done"] is None:
+                    return                         # duplicate (HTTP + file)
+                s["ids"][key] = {"t": t, "done": None}
+                s["stop_at"] = None
+                self.log.log(f"proof: {t.label} joined running recording ({key[1]})")
+                self._raise(t)
+        elif kind == "done":
+            s = self.session
+            if not s:
+                return
+            hit = False
+            for (acc, r), info in s["ids"].items():
+                if acc == t.hub_id and (not rid or r == rid) and info["done"] is None:
+                    info["done"] = now
+                    hit = True
+            if hit and all(i["done"] is not None for i in s["ids"].values()):
+                s["stop_at"] = now + float(self.cfg["tail_sec"])
+                self.log.log(f"proof: {t.label} trade done; stopping in {self.cfg['tail_sec']}s")
+
+    def _raise(self, t) -> None:
+        if not self.cfg.get("bring_to_front", True):
+            return
+        self.shell.root(
+            "monkey -p " + shlex.quote(t.package) +
+            " -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1", timeout=15)
+        time.sleep(0.8)
+
+    def _begin(self, t, key: Tuple[str, str]) -> None:
+        d = str(self.cfg["dir"]).rstrip("/")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        tmp = f"{d}/.recording_{ts}.mp4"
+        self.log.log(f"proof: START {t.label} ({key[1]})")
+        self._raise(t)
+        cmd = (
+            f"mkdir -p {shlex.quote(d)}; rm -f {shlex.quote(tmp)}; "
+            f"nohup screenrecord --time-limit {int(self.cfg['max_sec'])} "
+            f"--bit-rate {int(self.cfg['bit_rate'])} {shlex.quote(tmp)} "
+            f"</dev/null >/dev/null 2>&1 &"
+        )
+        self.shell.root(cmd, timeout=15)
+        time.sleep(0.7)
+        if not self._recording_pid():
+            self.last_error = ("screenrecord did not start (try: su -c 'screenrecord "
+                               "--time-limit 3 /sdcard/t.mp4')")
+            self.log.log("proof: " + self.last_error)
+            return
+        self.session = {"tmp": tmp, "t0": time.time(), "ts": ts, "stop_at": None,
+                        "ids": {key: {"t": t, "done": None}}}
+
+    def _tick(self) -> None:
+        now = time.time()
+        s = self.session
+        if s:
+            if s["stop_at"] and now >= s["stop_at"]:
+                self._finish("trade completed")
+            elif now - s["t0"] > float(self.cfg["max_sec"]) + 3:
+                self._finish("max length reached")
+            elif now - self._last_alive_check > 3:
+                self._last_alive_check = now
+                if not self._recording_pid():
+                    self._finish("screenrecord ended by itself")
+        if self.cfg.get("file_poll", True):
+            active = self.session is not None or any(self.is_trading(t) for t in self.get_targets())
+            if active and now - self._last_poll >= float(self.cfg["file_poll_sec"]):
+                self._last_poll = now
+                self._poll_files()
+        if now - self._last_clean > 3600:
+            self._cleanup_old()
+
+    # -------------------------------------------------------- file channel
+    def _poll_files(self) -> None:
+        script = ('for f in "/storage/emulated/0"/RobloxClone*/"Arceus X"/Workspace/%s; do '
+                  '[ -f "$f" ] && { cat "$f"; echo; }; done' % SIGNAL_FILE)
+        out = self._quiet(script, timeout=10)
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            account = str(obj.get("account_id", ""))
+            event = str(obj.get("event", "")).lower()
+            seq = str(obj.get("seq", ""))
+            if event not in ("start", "done") or not account:
+                continue
+            try:
+                ts = float(obj.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            last = self._seq.get(account)
+            if seq == last:
+                continue
+            self._seq[account] = seq
+            if last is None and (not ts or abs(time.time() - ts) > 10):
+                continue                       # old leftover from before we started looking
+            if ts and abs(time.time() - ts) > 60:
+                continue
+            self.q.put((event, account, str(obj.get("request_id", ""))))
+
+    # --------------------------------------------------------------- finish
+    def _stop_recording(self) -> None:
+        self.shell.root("kill -2 $(pidof screenrecord) 2>/dev/null", timeout=10)   # SIGINT = finalize mp4
+        for _ in range(24):
+            if not self._recording_pid():
+                return
+            time.sleep(0.25)
+        self.log.log("proof: screenrecord ignored SIGINT, killing it (file may be unplayable)")
+        self.shell.root("kill -9 $(pidof screenrecord) 2>/dev/null", timeout=10)
+
+    def _finish(self, reason: str) -> None:
+        s = self.session
+        self.session = None
+        if not s:
+            return
+        self._stop_recording()
+        d = str(self.cfg["dir"]).rstrip("/")
+        dests: List[Tuple[str, Any, str]] = []
+        for (acc, rid), info in s["ids"].items():
+            t = info["t"]
+            dests.append((rid, t, f"{d}/{_safe(rid)}_{_safe(t.label, 24)}_{s['ts']}.mp4"))
+        keep = int(self.cfg.get("keep_last_sec", 0) or 0)
+        ff = str(self.cfg.get("ffmpeg", ""))
+        lines = [f"src={shlex.quote(s['tmp'])}",
+                 '[ -s "$src" ] || { echo PROOF_EMPTY; exit 1; }']
+        if keep > 0 and ff:
+            lines.append(
+                f'if [ -x {shlex.quote(ff)} ]; then '
+                f'LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib {shlex.quote(ff)} -y -loglevel error '
+                f'-sseof -{keep} -i "$src" -c copy "$src.trim.mp4" </dev/null >/dev/null 2>&1 '
+                f'&& [ -s "$src.trim.mp4" ] && mv -f "$src.trim.mp4" "$src"; rm -f "$src.trim.mp4"; fi')
+        first = dests[0][2]
+        lines.append(f'mv -f "$src" {shlex.quote(first)} || exit 2')
+        for _, _, p in dests[1:]:
+            lines.append(f"cp -f {shlex.quote(first)} {shlex.quote(p)}")
+        lines.append(f'chmod 644 {shlex.quote(d)}/*.mp4 2>/dev/null; echo PROOF_OK $(wc -c < {shlex.quote(first)})')
+        r = self.shell.root("; ".join(lines), timeout=90)
+        out = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r"PROOF_OK (\d+)", out)
+        if not m:
+            self.last_error = "saving the video failed: " + (out.strip()[-160:] or f"rc={r.returncode}")
+            self.log.log("proof: " + self.last_error)
+            return
+        self.log.log(f"proof: SAVED ({reason}, {int(m.group(1)) // 1024} KB): " +
+                     ", ".join(p for _, _, p in dests))
+        for rid, t, p in dests:
+            self.saved.append(p)
+            self.saved = self.saved[-50:]
+            if self.on_saved:
+                try:
+                    self.on_saved(t, rid, p)
+                except Exception as e:
+                    self.log.log(f"proof: on_saved callback failed: {e}")
+
+    def _cleanup_old(self) -> None:
+        self._last_clean = time.time()
+        d = shlex.quote(str(self.cfg["dir"]).rstrip("/"))
+        days = max(1, int(self.cfg.get("keep_days", 14) or 14))
+        self._quiet(f"[ -d {d} ] && {{ find {d} -name '*.mp4' -mtime +{days} -delete; "
+                    f"find {d} -name '.recording_*' -mmin +120 -delete; }}", timeout=30)
+
+
+def _make_handler(rec: ProofRecorder):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a):          # keep the terminal / log quiet
+            pass
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+
+            def g(k: str) -> str:
+                return (q.get(k) or [""])[0]
+
+            code, body = 200, b"ok"
+            if u.path in ("/proof/start", "/proof/done"):
+                rec.q.put((u.path.rsplit("/", 1)[1], g("account"), g("id")))
+            elif u.path != "/proof/ping":
+                code, body = 404, b"not found"
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
 class Watchdog:
     NOT_RUNNING_CONFIRM_TICKS = 3
 
@@ -1087,15 +1449,13 @@ class Watchdog:
             self.headless = True
         self.proof = None
         pc = {**DEFAULT_PROOF, **(proof or {})}
-        if ProofRecorder is not None and pc.get("enabled", True):
+        if pc.get("enabled", True):
             self.proof = ProofRecorder(
                 self.shell, logger, lambda: self.targets, pc,
                 on_saved=self._proof_saved,
                 is_trading=lambda t: t.hub_state == "TRADING",
                 resane=_resane_tty,
             )
-        elif ProofRecorder is None:
-            logger.log(f"proof recorder unavailable: {_PROOF_IMPORT_ERROR or 'proof.py missing'}")
 
     def _proof_saved(self, t: Target, rid: str, path: str) -> None:
         self.log.log(f"{t.label}: proof video saved: {path}")
@@ -1922,6 +2282,176 @@ class Watchdog:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Embedded helper files (written out by the menu / CLI, nothing to download)
+# ---------------------------------------------------------------------------
+SUP_TARGET = "/data/local/tmp/rw_supervisor.sh"
+SUP_PIDFILE = "/data/local/tmp/rw_supervisor.pid"
+BOOT_HOOK = "/data/adb/service.d/rw_supervisor.sh"
+
+SUPERVISOR_SH = r'''#!/system/bin/sh
+# rw_supervisor.sh - keeps rw.py alive even when the Termux app itself is killed.
+#
+# Runs as root, OUTSIDE the Termux app, so Android's low-memory killer does not
+# take it down together with Termux. Every CHECK seconds it looks at
+# watchdog.lock (rw.py writes its PID there); if that process is gone it starts
+#   python3 rw.py start
+# as root (headless). Running rw.py as root also removes the need for `su -c`
+# on every command, which makes it much lighter.
+#
+# Start:  sh install_supervisor.sh          (from Termux, see that file)
+# Stop:   su -c 'touch <APPDIR>/supervisor.stop'
+# Log:    <APPDIR>/supervisor.log
+# View:   python3 rw.py watch               (live screen of the headless watchdog)
+
+APPDIR="${RW_DIR:-/data/data/com.termux/files/home}"
+SCRIPT="${RW_SCRIPT:-rw.py}"
+PREFIX=/data/data/com.termux/files/usr
+LOG="$APPDIR/supervisor.log"
+PIDFILE=/data/local/tmp/rw_supervisor.pid
+STOPFILE="$APPDIR/supervisor.stop"
+CHECK="${RW_CHECK:-15}"
+SETTLE="${RW_SETTLE:-25}"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
+    sz=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+    [ "${sz:-0}" -gt 1000000 ] && mv -f "$LOG" "$LOG.1"
+}
+
+# --- only one supervisor at a time ----------------------------------------
+if [ -f "$PIDFILE" ]; then
+    old=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$old" ] && [ "$old" != "$$" ] && [ -d "/proc/$old" ] \
+       && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q rw_supervisor; then
+        echo "supervisor already running (pid $old)"
+        exit 0
+    fi
+fi
+echo $$ > "$PIDFILE"
+rm -f "$STOPFILE"
+trap 'rm -f "$PIDFILE"; log "supervisor exiting"; exit 0' TERM INT
+
+# --- is rw.py alive? (lock file holds its PID) -----------------------------
+wd_alive() {
+    pid=$(head -n1 "$APPDIR/watchdog.lock" 2>/dev/null | tr -dc '0-9')
+    [ -n "$pid" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "$SCRIPT"
+}
+
+fix_owner() {
+    # rw.py runs as root here; hand its files back so Termux (normal user) can still edit them
+    u=$(stat -c %u "$APPDIR" 2>/dev/null)
+    [ -n "$u" ] || return 0
+    for f in "$APPDIR"/watchdog_config.json "$APPDIR"/watchdog.log* "$APPDIR"/flight_recorder.log* \
+             "$APPDIR"/watchdog.lock "$APPDIR"/watchdog.alive "$APPDIR"/watchdog_screen.txt \
+             "$APPDIR"/watchdog_fault.log "$APPDIR"/watchdog_stdout.log "$APPDIR"/supervisor.log*; do
+        [ -e "$f" ] && chown "$u:$u" "$f" 2>/dev/null
+    done
+}
+
+start_wd() {
+    cd "$APPDIR" || { log "APPDIR $APPDIR missing"; return 1; }
+    export HOME=/data/data/com.termux/files/home PREFIX="$PREFIX" TMPDIR="$PREFIX/tmp" \
+           LD_LIBRARY_PATH="$PREFIX/lib" LANG=en_US.UTF-8 TERM=dumb PYTHONDONTWRITEBYTECODE=1
+    # system tools first (pidof/ps/am/pm), Termux tools last (python3)
+    export PATH="/system/bin:/system/xbin:$PATH:$PREFIX/bin"
+    nohup python3 "$APPDIR/$SCRIPT" start </dev/null >> "$APPDIR/watchdog_stdout.log" 2>&1 &
+    log "started $SCRIPT (pid $!)"
+}
+
+# keep Termux out of Doze / battery restrictions (harmless if already set)
+cmd deviceidle whitelist +com.termux >/dev/null 2>&1
+
+log "supervisor started (pid $$, appdir $APPDIR, script $SCRIPT)"
+fails=0
+last_start=0
+while :; do
+    if [ -f "$STOPFILE" ]; then
+        log "stop file found"
+        rm -f "$STOPFILE" "$PIDFILE"
+        exit 0
+    fi
+    if wd_alive; then
+        fails=0
+    else
+        now=$(date +%s)
+        backoff=$((10 * fails))
+        [ "$backoff" -gt 120 ] && backoff=120
+        if [ $((now - last_start)) -ge "$backoff" ]; then
+            log "watchdog not running -> starting (previous quick failures: $fails)"
+            fix_owner
+            start_wd
+            last_start=$now
+            sleep "$SETTLE"
+            if wd_alive; then fails=0; else fails=$((fails + 1)); fi
+        fi
+    fi
+    fix_owner
+    sleep "$CHECK"
+done
+'''
+
+LUA_HELPER = r'''-- rwproof.lua : tells the Termux watchdog to start / stop the proof video.
+-- Paste this block near the top of LocalTrader (before the trade code), then call:
+--
+--     RWProof.start(requestId)   -- when the trade reaches the CONFIRM stage
+--                                -- (both sides have put their items in, about to accept)
+--     RWProof.done(requestId)    -- the moment the trade is completed
+--
+-- requestId is optional; if nil it uses request_id from LocalTrader_Hub.json.
+-- Never yields and never throws, so it cannot break the trade logic.
+
+local RWProof = {}
+do
+    local HttpService = game:GetService("HttpService")
+    local CFG_FILE    = "LocalTrader_Hub.json"      -- written by rw.py (has account_id, proof_url)
+    local SIGNAL_FILE = "LocalTrader_Signal.json"   -- fallback channel polled by rw.py
+
+    local function readCfg()
+        local ok, res = pcall(function() return HttpService:JSONDecode(readfile(CFG_FILE)) end)
+        return (ok and type(res) == "table") and res or {}
+    end
+
+    local function send(event, requestId)
+        local cfg = readCfg()
+        if cfg.proof_enabled == false then return end
+        local account = tostring(cfg.account_id or "")
+        local rid     = tostring(requestId or cfg.request_id or "")
+        local base    = tostring(cfg.proof_url or "http://127.0.0.1:8799")
+
+        task.spawn(function()
+            -- 1) instant: local HTTP call to the watchdog
+            pcall(function()
+                game:HttpGet(base .. "/proof/" .. event
+                    .. "?account=" .. HttpService:UrlEncode(account)
+                    .. "&id=" .. HttpService:UrlEncode(rid))
+            end)
+            -- 2) fallback: signal file (the watchdog ignores the duplicate)
+            pcall(function()
+                writefile(SIGNAL_FILE, HttpService:JSONEncode({
+                    account_id = account,
+                    event      = event,
+                    request_id = rid,
+                    seq        = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
+                    ts         = os.time(),
+                }))
+            end)
+        end)
+    end
+
+    function RWProof.start(requestId) send("start", requestId) end
+    function RWProof.done(requestId)  send("done",  requestId) end
+end
+
+-- Example wiring (adapt to LocalTrader's real trade events):
+--   RWProof.start(order.request_id)   -- right before you press "Accept" on the final trade screen
+--   RWProof.done(order.request_id)    -- as soon as the trade window closes with a successful trade
+return RWProof
+'''
+
+
 class App:
     def __init__(self) -> None:
         self.logger = Logger(LOG_PATH)
@@ -2322,11 +2852,6 @@ class App:
                 input("\nPress Enter...")
 
     def proof_menu(self) -> None:
-        if ProofRecorder is None:
-            print(f"proof.py could not be loaded: {_PROOF_IMPORT_ERROR or 'file missing'}")
-            print("Put proof.py in the same folder as rw.py.")
-            input("Press Enter...")
-            return
         while True:
             cfg = {**DEFAULT_PROOF, **self.proof}
             clear_screen()
@@ -2375,6 +2900,95 @@ class App:
                 print("Open that file on the phone and check the clone is fully visible.")
                 input("\nPress Enter...")
 
+    # ------------------------------------------------------------------
+    # Supervisor (root loop outside Termux that restarts this script)
+    # ------------------------------------------------------------------
+    def _stage_and_copy(self, text: str, dest: str, mode: str = "755") -> Tuple[bool, str]:
+        """Write text to a temp file in our folder, then copy it to dest as root."""
+        stage = os.path.join(BASE_DIR, ".rw_stage.tmp")
+        try:
+            with open(stage, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            r = self.shell.root(f"cp {shlex.quote(stage)} {shlex.quote(dest)} && chmod {mode} {shlex.quote(dest)}", timeout=20)
+            if r.returncode != 0:
+                return False, (r.stderr or r.stdout or f"rc={r.returncode}").strip()[:200]
+            return True, ""
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                os.remove(stage)
+            except OSError:
+                pass
+
+    def supervisor_status(self) -> str:
+        log = shlex.quote(os.path.join(BASE_DIR, "supervisor.log"))
+        return self.shell.root_out(
+            f'pid=$(cat {SUP_PIDFILE} 2>/dev/null); '
+            f'if [ -n "$pid" ] && [ -d /proc/$pid ]; then echo "supervisor RUNNING (pid $pid)"; '
+            f'else echo "supervisor NOT running"; fi; '
+            f'[ -f /data/adb/service.d/rw_supervisor.sh ] && echo "boot hook: installed" || echo "boot hook: not installed"; '
+            f'echo "-- supervisor.log (last lines)"; tail -n 8 {log} 2>/dev/null', timeout=15) or "(no answer from su)"
+
+    def supervisor_install(self) -> str:
+        if not self.shell.has_root_access():
+            return "Root (su) is not available - cannot install the supervisor."
+        ok, err = self._stage_and_copy(SUPERVISOR_SH, SUP_TARGET)
+        if not ok:
+            return "Could not copy the supervisor to /data/local/tmp: " + err
+        name = os.path.basename(os.path.abspath(__file__))
+        env = f"RW_DIR={shlex.quote(BASE_DIR)} RW_SCRIPT={shlex.quote(name)}"
+        notes = []
+        if self.shell.root_out("[ -d /data/adb/service.d ] && echo yes", timeout=10) == "yes":
+            hook = "#!/system/bin/sh\nsleep 60\n" + f"{env} sh {SUP_TARGET} &\n"
+            ok, err = self._stage_and_copy(hook, BOOT_HOOK)
+            notes.append("Boot hook installed (starts after a reboot)." if ok else "Boot hook failed: " + err)
+        else:
+            notes.append("No /data/adb/service.d here: it will not start by itself after a reboot "
+                         "(run this install again after rebooting).")
+        self.shell.root(
+            f"export {env}; if command -v setsid >/dev/null 2>&1; then "
+            f"setsid sh {SUP_TARGET} >/dev/null 2>&1 & else nohup sh {SUP_TARGET} >/dev/null 2>&1 & fi",
+            timeout=15)
+        time.sleep(2.5)
+        return "\n".join(notes) + "\n" + self.supervisor_status()
+
+    def supervisor_stop(self) -> str:
+        self.shell.root(f"touch {shlex.quote(os.path.join(BASE_DIR, 'supervisor.stop'))}", timeout=10)
+        return "Stop requested - the supervisor exits within ~15 s (the watchdog itself keeps running)."
+
+    def write_lua_helper(self) -> str:
+        path = os.path.join(BASE_DIR, "rwproof.lua")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(LUA_HELPER)
+        return path
+
+    def supervisor_menu(self) -> None:
+        while True:
+            clear_screen()
+            print("AUTO-RESTART SUPERVISOR + LUA HELPER")
+            print("=" * 70)
+            print("The supervisor is a root loop OUTSIDE the Termux app. If this watchdog dies")
+            print("(even when Android kills Termux) it starts it again as a headless root process.")
+            print("View a headless instance with:  python3 rw.py watch")
+            print()
+            print(self.supervisor_status())
+            print()
+            print("i = install / start now   x = stop supervisor   l = write rwproof.lua   b = back")
+            choice = input("\n> ").strip().lower()
+            if choice == "b":
+                return
+            if choice == "i":
+                print("\n" + self.supervisor_install())
+                input("\nPress Enter...")
+            elif choice == "x":
+                print("\n" + self.supervisor_stop())
+                input("\nPress Enter...")
+            elif choice == "l":
+                print("\nWritten: " + self.write_lua_helper())
+                print("Paste its contents into LocalTrader (or `cat rwproof.lua` to copy it).")
+                input("\nPress Enter...")
+
     def menu(self) -> None:
         while True:
             clear_screen()
@@ -2399,6 +3013,7 @@ class App:
             print("10. Toggle soft return (no force-stop when returning to farming)")
             print("11. LocalTrader autoexec (install / check / remove / on-off / URL)")
             print("12. Trade proof recorder (video of each trade)")
+            print("13. Auto-restart supervisor / Lua helper")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -2446,6 +3061,8 @@ class App:
                 self.autoexec_menu()
             elif choice == "12":
                 self.proof_menu()
+            elif choice == "13":
+                self.supervisor_menu()
             elif choice == "0":
                 return
 
@@ -2502,8 +3119,22 @@ def watch_screen() -> int:
 
 def main() -> int:
     install_crash_logging()
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "watch":
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    if cmd == "watch":
         return watch_screen()
+    if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "lua"):
+        app = App()
+        if cmd == "install-supervisor":
+            print(app.supervisor_install())
+        elif cmd == "supervisor-status":
+            print(app.supervisor_status())
+        elif cmd == "supervisor-stop":
+            print(app.supervisor_stop())
+        else:
+            path = app.write_lua_helper()
+            print(f"Written: {path}\n")
+            print(LUA_HELPER)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1].lower() == "start":
         return headless_start()
     with Terminal():
