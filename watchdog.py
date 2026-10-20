@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.1 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.2 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,17 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.2
+#   - Proof recorder understands the trade RESULT. LocalTrader now calls
+#     RWProof.start() when the worker accepts / the countdown begins and
+#     RWProof.done(rid, "completed" | "aborted" | "unverified") when the trade
+#     ends. Aborted trades (customer left, timeout, stopped) are discarded
+#     (keep_aborted = false); the others are saved as <id>_<clone>_<time>_<result>.mp4.
+#   - screenrecord now starts BEFORE the clone is raised, so no frames of the
+#     decisive moment are lost to the ~1 s the raise takes.
+#   - max recording length 60 -> 90 s (only affects configs that never saved a
+#     'proof' section; otherwise change max_sec in watchdog_config.json).
 #
 # v4.1
 #   - Everything is in this one file: the proof recorder (no proof.py), the
@@ -219,7 +230,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.1"
+VERSION = "4.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -1040,7 +1051,8 @@ DEFAULT_PROOF: Dict[str, Any] = {
     "dir": "/storage/emulated/0/RWProof",
     "bring_to_front": True,      # raise the trading clone before recording
     "tail_sec": 1.5,             # keep recording this long after "done"
-    "max_sec": 60,               # hard cap per recording (screenrecord max is 180)
+    "max_sec": 90,               # hard cap per recording (screenrecord max is 180)
+    "keep_aborted": False,       # discard recordings of trades that did not complete
     "bit_rate": 2000000,
     "keep_last_sec": 12,         # trim to the last N seconds if ffmpeg exists (0 = keep all)
     "keep_days": 14,             # delete proof videos older than this
@@ -1067,7 +1079,7 @@ class ProofRecorder:
         self.on_saved = on_saved
         self.is_trading = is_trading or (lambda t: False)
         self.resane = resane
-        self.q: "queue.Queue[Tuple[str, str, str]]" = queue.Queue()
+        self.q: "queue.Queue[Tuple[str, str, str, str]]" = queue.Queue()
         self.session: Optional[Dict[str, Any]] = None
         self._seq: Dict[str, str] = {}
         self._stop = threading.Event()
@@ -1135,9 +1147,9 @@ class ProofRecorder:
     def test(self, target, seconds: int = 6) -> str:
         """Used by the menu: record `seconds` of this clone, return the saved path."""
         before = len(self.saved)
-        self.q.put(("start", target.hub_id, "TEST"))
+        self.q.put(("start", target.hub_id, "TEST", ""))
         time.sleep(max(2, seconds))
-        self.q.put(("done", target.hub_id, "TEST"))
+        self.q.put(("done", target.hub_id, "TEST", "completed"))
         for _ in range(60):
             time.sleep(0.5)
             if self.session is None and len(self.saved) > before:
@@ -1183,7 +1195,7 @@ class ProofRecorder:
                 return t
         return None
 
-    def _handle(self, kind: str, account: str, rid: str) -> None:
+    def _handle(self, kind: str, account: str, rid: str, result: str = "") -> None:
         t = self._find(account)
         if t is None:
             self.log.log(f"proof: {kind} for unknown account {account!r} ignored")
@@ -1210,10 +1222,11 @@ class ProofRecorder:
             for (acc, r), info in s["ids"].items():
                 if acc == t.hub_id and (not rid or r == rid) and info["done"] is None:
                     info["done"] = now
+                    info["result"] = (result or "").lower()
                     hit = True
             if hit and all(i["done"] is not None for i in s["ids"].values()):
                 s["stop_at"] = now + float(self.cfg["tail_sec"])
-                self.log.log(f"proof: {t.label} trade done; stopping in {self.cfg['tail_sec']}s")
+                self.log.log(f"proof: {t.label} trade done ({result or 'no result'}); stopping in {self.cfg['tail_sec']}s")
 
     def _raise(self, t) -> None:
         if not self.cfg.get("bring_to_front", True):
@@ -1228,7 +1241,8 @@ class ProofRecorder:
         ts = time.strftime("%Y%m%d_%H%M%S")
         tmp = f"{d}/.recording_{ts}.mp4"
         self.log.log(f"proof: START {t.label} ({key[1]})")
-        self._raise(t)
+        # Start recording FIRST (it returns at once), then raise the clone: the raise
+        # takes ~1 s and the decisive moment must not fall into that gap.
         cmd = (
             f"mkdir -p {shlex.quote(d)}; rm -f {shlex.quote(tmp)}; "
             f"nohup screenrecord --time-limit {int(self.cfg['max_sec'])} "
@@ -1236,7 +1250,7 @@ class ProofRecorder:
             f"</dev/null >/dev/null 2>&1 &"
         )
         self.shell.root(cmd, timeout=15)
-        time.sleep(0.7)
+        self._raise(t)
         if not self._recording_pid():
             self.last_error = ("screenrecord did not start (try: su -c 'screenrecord "
                                "--time-limit 3 /sdcard/t.mp4')")
@@ -1250,7 +1264,7 @@ class ProofRecorder:
         s = self.session
         if s:
             if s["stop_at"] and now >= s["stop_at"]:
-                self._finish("trade completed")
+                self._finish("trade ended")
             elif now - s["t0"] > float(self.cfg["max_sec"]) + 3:
                 self._finish("max length reached")
             elif now - self._last_alive_check > 3:
@@ -1295,7 +1309,7 @@ class ProofRecorder:
                 continue                       # old leftover from before we started looking
             if ts and abs(time.time() - ts) > 60:
                 continue
-            self.q.put((event, account, str(obj.get("request_id", ""))))
+            self.q.put((event, account, str(obj.get("request_id", "")), str(obj.get("result", ""))))
 
     # --------------------------------------------------------------- finish
     def _stop_recording(self) -> None:
@@ -1314,10 +1328,16 @@ class ProofRecorder:
             return
         self._stop_recording()
         d = str(self.cfg["dir"]).rstrip("/")
+        if (not self.cfg.get("keep_aborted", False)
+                and all(i.get("result") == "aborted" for i in s["ids"].values())):
+            self.shell.root(f"rm -f {shlex.quote(s['tmp'])}", timeout=15)
+            self.log.log("proof: recording discarded (the trade was aborted, nothing to prove)")
+            return
         dests: List[Tuple[str, Any, str]] = []
         for (acc, rid), info in s["ids"].items():
             t = info["t"]
-            dests.append((rid, t, f"{d}/{_safe(rid)}_{_safe(t.label, 24)}_{s['ts']}.mp4"))
+            res = _safe(info.get("result") or "", 12) if info.get("result") else ""
+            dests.append((rid, t, f"{d}/{_safe(rid)}_{_safe(t.label, 24)}_{s['ts']}" + (f"_{res}" if res else "") + ".mp4"))
         keep = int(self.cfg.get("keep_last_sec", 0) or 0)
         ff = str(self.cfg.get("ffmpeg", ""))
         lines = [f"src={shlex.quote(s['tmp'])}",
@@ -1373,7 +1393,7 @@ def _make_handler(rec: ProofRecorder):
 
             code, body = 200, b"ok"
             if u.path in ("/proof/start", "/proof/done"):
-                rec.q.put((u.path.rsplit("/", 1)[1], g("account"), g("id")))
+                rec.q.put((u.path.rsplit("/", 1)[1], g("account"), g("id"), g("result")))
             elif u.path != "/proof/ping":
                 code, body = 404, b"not found"
             self.send_response(code)
@@ -2393,61 +2413,120 @@ while :; do
 done
 '''
 
-LUA_HELPER = r'''-- rwproof.lua : tells the Termux watchdog to start / stop the proof video.
--- Paste this block near the top of LocalTrader (before the trade code), then call:
+LUA_HELPER = r'''-- rwproof.lua : tells the Termux watchdog (rw.py) to record a proof video of a trade.
+-- LocalTrader already contains this block (since v2.4); this file is only for other scripts.
 --
---     RWProof.start(requestId)   -- when the trade reaches the CONFIRM stage
---                                -- (both sides have put their items in, about to accept)
---     RWProof.done(requestId)    -- the moment the trade is completed
+--   RWProof.start(requestId)                 -- trade is about to complete (accept pressed / countdown)
+--   RWProof.done(requestId, result)          -- result: "completed" | "unverified" | "aborted"
+--                                            -- ("aborted" recordings are discarded by rw.py)
 --
--- requestId is optional; if nil it uses request_id from LocalTrader_Hub.json.
--- Never yields and never throws, so it cannot break the trade logic.
+-- Never yields, never throws, so it cannot break trade logic.
 
+-- >>> RWProof BEGIN
 local RWProof = {}
 do
-    local HttpService = game:GetService("HttpService")
-    local CFG_FILE    = "LocalTrader_Hub.json"      -- written by rw.py (has account_id, proof_url)
-    local SIGNAL_FILE = "LocalTrader_Signal.json"   -- fallback channel polled by rw.py
+	local HttpService = game:GetService("HttpService")
+	local CFG_FILE = (CONFIG and CONFIG.HubConfigFile) or "LocalTrader_Hub.json" -- written by rw.py
+	local SIGNAL_FILE = "LocalTrader_Signal.json"                                -- fallback channel polled by rw.py
 
-    local function readCfg()
-        local ok, res = pcall(function() return HttpService:JSONDecode(readfile(CFG_FILE)) end)
-        return (ok and type(res) == "table") and res or {}
-    end
+	local function readCfg()
+		local ok, res = pcall(function()
+			return HttpService:JSONDecode(readfile(CFG_FILE))
+		end)
+		return (ok and type(res) == "table") and res or {}
+	end
 
-    local function send(event, requestId)
-        local cfg = readCfg()
-        if cfg.proof_enabled == false then return end
-        local account = tostring(cfg.account_id or "")
-        local rid     = tostring(requestId or cfg.request_id or "")
-        local base    = tostring(cfg.proof_url or "http://127.0.0.1:8799")
+	local function send(event, requestId, result)
+		local cfg = readCfg()
+		if cfg.proof_enabled == false then
+			return
+		end
+		local account = tostring(cfg.account_id or "")
+		if account == "" then
+			return
+		end
+		local rid = tostring(requestId or cfg.request_id or "")
+		local base = tostring(cfg.proof_url or "")
+		if base == "" then
+			base = "http://127.0.0.1:8799"
+		end
+		local url = base .. "/proof/" .. event
+			.. "?account=" .. HttpService:UrlEncode(account)
+			.. "&id=" .. HttpService:UrlEncode(rid)
+			.. "&result=" .. HttpService:UrlEncode(tostring(result or ""))
 
-        task.spawn(function()
-            -- 1) instant: local HTTP call to the watchdog
-            pcall(function()
-                game:HttpGet(base .. "/proof/" .. event
-                    .. "?account=" .. HttpService:UrlEncode(account)
-                    .. "&id=" .. HttpService:UrlEncode(rid))
-            end)
-            -- 2) fallback: signal file (the watchdog ignores the duplicate)
-            pcall(function()
-                writefile(SIGNAL_FILE, HttpService:JSONEncode({
-                    account_id = account,
-                    event      = event,
-                    request_id = rid,
-                    seq        = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
-                    ts         = os.time(),
-                }))
-            end)
-        end)
-    end
+		task.spawn(function()
+			-- 1) instant: local HTTP call to the watchdog
+			local env = (type(getgenv) == "function" and getgenv()) or _G
+			local requestFn = env.request or env.http_request
+			if type(requestFn) ~= "function" and type(env.syn) == "table" then
+				requestFn = env.syn.request
+			end
+			local delivered = false
+			if type(requestFn) == "function" then
+				local ok, response = pcall(requestFn, { Url = url, Method = "GET" })
+				delivered = ok and type(response) == "table"
+					and (tonumber(response.StatusCode or response.status_code) or 0) == 200
+			end
+			if not delivered then
+				pcall(function()
+					game:HttpGet(url)
+				end)
+			end
+			-- 2) fallback: signal file (the watchdog ignores the duplicate)
+			pcall(function()
+				writefile(SIGNAL_FILE, HttpService:JSONEncode({
+					account_id = account,
+					event = event,
+					request_id = rid,
+					result = tostring(result or ""),
+					seq = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
+					ts = os.time(),
+				}))
+			end)
+		end)
+	end
 
-    function RWProof.start(requestId) send("start", requestId) end
-    function RWProof.done(requestId)  send("done",  requestId) end
+	function RWProof.start(requestId)
+		send("start", requestId, "")
+	end
+
+	function RWProof.done(requestId, result)
+		send("done", requestId, result)
+	end
+
+	-- Session helpers (a "session" is any table; they keep two fields on it).
+	local function requestIdOf(sess)
+		local order = sess and sess.externalOrder
+		return tostring((order and (order.request_id or order.order_id)) or (sess and sess.orderId) or "")
+	end
+
+	-- Safe to call as often as you like: re-sends at most every 2 s, so the watchdog also
+	-- starts a fresh recording if an earlier one hit its length cap.
+	function RWProof.begin(sess)
+		if not sess then
+			return
+		end
+		local now = os.clock()
+		if sess.proofActive and now - (sess.proofSentAt or 0) < 2 then
+			return
+		end
+		sess.proofActive = true
+		sess.proofSentAt = now
+		pcall(RWProof.start, requestIdOf(sess))
+	end
+
+	-- Only does something if begin() was called before; ends the recording once.
+	function RWProof.finish(sess, result)
+		if not sess or not sess.proofActive then
+			return
+		end
+		sess.proofActive = false
+		pcall(RWProof.done, requestIdOf(sess), result)
+	end
 end
+-- <<< RWProof END
 
--- Example wiring (adapt to LocalTrader's real trade events):
---   RWProof.start(order.request_id)   -- right before you press "Accept" on the final trade screen
---   RWProof.done(order.request_id)    -- as soon as the trade window closes with a successful trade
 return RWProof
 '''
 
