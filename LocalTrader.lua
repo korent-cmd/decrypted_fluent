@@ -2,6 +2,10 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.4: trade proof video. LocalTrader tells the Termux watchdog (rw.py v4.2+) when the trade is about to complete
+--        (worker pressed Accept / countdown / processing) and how it ended: RWProof.begin(session) ... RWProof.finish(session,
+--        "completed" | "unverified" | "aborted"). rw.py raises this clone to the front and records the screen; aborted trades
+--        are discarded. Fire-and-forget (own thread, pcall-wrapped): it cannot change or delay any trade logic.
 -- v2.3: every game-ping and inventory report now carries the SEA this client is in (from game.PlaceId, the same ids the old farm
 --        script used: 2753915549 = Sea 1, 4442272183 = Sea 2, 7449423635 = Sea 3). Trading only works in the Second Sea, so the
 --        Hub (v2.9.4) counts an account only while it reports Sea 2: in Sea 1 or 3 its fruits are not in stock and it gets no
@@ -298,6 +302,111 @@ local HubConfig = {
 	token = "",
 	poll = 3,
 }
+
+-- v2.4 trade proof video: signals the Termux watchdog (rw.py) to record the screen. Never yields, never throws.
+local RWProof = {}
+do
+	local HttpService = game:GetService("HttpService")
+	local CFG_FILE = (CONFIG and CONFIG.HubConfigFile) or "LocalTrader_Hub.json" -- written by rw.py
+	local SIGNAL_FILE = "LocalTrader_Signal.json"                                -- fallback channel polled by rw.py
+
+	local function readCfg()
+		local ok, res = pcall(function()
+			return HttpService:JSONDecode(readfile(CFG_FILE))
+		end)
+		return (ok and type(res) == "table") and res or {}
+	end
+
+	local function send(event, requestId, result)
+		local cfg = readCfg()
+		if cfg.proof_enabled == false then
+			return
+		end
+		local account = tostring(cfg.account_id or "")
+		if account == "" then
+			return
+		end
+		local rid = tostring(requestId or cfg.request_id or "")
+		local base = tostring(cfg.proof_url or "")
+		if base == "" then
+			base = "http://127.0.0.1:8799"
+		end
+		local url = base .. "/proof/" .. event
+			.. "?account=" .. HttpService:UrlEncode(account)
+			.. "&id=" .. HttpService:UrlEncode(rid)
+			.. "&result=" .. HttpService:UrlEncode(tostring(result or ""))
+
+		task.spawn(function()
+			-- 1) instant: local HTTP call to the watchdog
+			local env = (type(getgenv) == "function" and getgenv()) or _G
+			local requestFn = env.request or env.http_request
+			if type(requestFn) ~= "function" and type(env.syn) == "table" then
+				requestFn = env.syn.request
+			end
+			local delivered = false
+			if type(requestFn) == "function" then
+				local ok, response = pcall(requestFn, { Url = url, Method = "GET" })
+				delivered = ok and type(response) == "table"
+					and (tonumber(response.StatusCode or response.status_code) or 0) == 200
+			end
+			if not delivered then
+				pcall(function()
+					game:HttpGet(url)
+				end)
+			end
+			-- 2) fallback: signal file (the watchdog ignores the duplicate)
+			pcall(function()
+				writefile(SIGNAL_FILE, HttpService:JSONEncode({
+					account_id = account,
+					event = event,
+					request_id = rid,
+					result = tostring(result or ""),
+					seq = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
+					ts = os.time(),
+				}))
+			end)
+		end)
+	end
+
+	function RWProof.start(requestId)
+		send("start", requestId, "")
+	end
+
+	function RWProof.done(requestId, result)
+		send("done", requestId, result)
+	end
+
+	-- Session helpers (a "session" is any table; they keep two fields on it).
+	local function requestIdOf(sess)
+		local order = sess and sess.externalOrder
+		return tostring((order and (order.request_id or order.order_id)) or (sess and sess.orderId) or "")
+	end
+
+	-- Safe to call as often as you like: re-sends at most every 2 s, so the watchdog also
+	-- starts a fresh recording if an earlier one hit its length cap.
+	function RWProof.begin(sess)
+		if not sess then
+			return
+		end
+		local now = os.clock()
+		if sess.proofActive and now - (sess.proofSentAt or 0) < 2 then
+			return
+		end
+		sess.proofActive = true
+		sess.proofSentAt = now
+		pcall(RWProof.start, requestIdOf(sess))
+	end
+
+	-- Only does something if begin() was called before; ends the recording once.
+	function RWProof.finish(sess, result)
+		if not sess or not sess.proofActive then
+			return
+		end
+		sess.proofActive = false
+		pcall(RWProof.done, requestIdOf(sess), result)
+	end
+end
+-- end of RWProof
 
 -- Orders this client has already finished with (completed, failed, timed out
 -- or stopped). Without this, the poll loop at the bottom would see the same
@@ -2386,6 +2495,9 @@ local function stopTrader(reason, failureCode, localRetry)
 	local stoppedSessionId = session and session.id
 	local stoppedOrderId = session and session.orderId
 	local completed = session and session.completed
+	if stoppedSession and not completed then
+		RWProof.finish(stoppedSession, "aborted")   -- v2.4: no-op unless a recording was started
+	end
 	running = false
 	state = "IDLE"
 	latestTradeState = nil
@@ -2809,6 +2921,7 @@ function startTrader(orderData)
 					lastOfferSignature = signature
 					lastAccept = os.clock()
 					setState("ACCEPTING")
+					RWProof.begin(session)   -- v2.4: start the proof video just before accepting
 					local ok, result = pcall(function()
 						return TradeFunction:InvokeServer("accept")
 					end)
@@ -2817,9 +2930,11 @@ function startTrader(orderData)
 				end
 			elseif tradeState.State.Type == "Countdown" then
 				setState("COUNTDOWN")
+				RWProof.begin(session)   -- v2.4 (re-sent at most every 2 s)
 				writeLog("countdown started; leaving table is not allowed")
 			elseif tradeState.State.Type == "Processing" then
 				setState("PROCESSING")
+				RWProof.begin(session)   -- v2.4
 				writeLog("trade processing")
 			end
 		elseif eventName == "countdown_cancel" then
@@ -2835,6 +2950,7 @@ function startTrader(orderData)
 					writeLog("trade completed and requested item is no longer available")
 					setState("COOLDOWN", "trade verified; preparing farming handoff")
 					session.completed = true
+					RWProof.finish(session, "completed")   -- v2.4: the proof video stops ~1.5 s after this
 					if session.externalOrder then
 						setState("VERIFYING_INVENTORY", "reporting completion to Hub")
 						reportCompletionWithRetry(session)
@@ -2850,9 +2966,11 @@ function startTrader(orderData)
 					end
 				else
 					writeLog("processing ended, but inventory verification failed")
+					RWProof.finish(session, "unverified")   -- v2.4: keep the video, the trade may have happened
 					stopTrader("verification failed", "verification_failed")
 				end
 			else
+				RWProof.finish(session, "aborted")   -- v2.4: trade cancelled, recording is discarded
 				setState("WAITING_FOR_CUSTOMER", "customer left")
 				session.customerWaitSince = os.clock()
 				latestTradeState = nil
