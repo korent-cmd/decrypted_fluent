@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v3.8 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.0 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,25 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.0
+#   - ADD: trade proof recorder (proof.py). LocalTrader signals "confirm stage"
+#     and "trade done" (see rwproof.lua); the watchdog raises that clone to the
+#     front, records the screen, and saves <request_id>_<clone>_<time>.mp4 in
+#     /storage/emulated/0/RWProof. Runs in its own threads. Menu option 12.
+#   - FIX (crashes): the main loop is now wrapped, so one exception can no longer
+#     end the watchdog; its traceback goes to watchdog.log. Terminal output errors
+#     (closed session) switch to headless mode instead of crashing. SIGHUP is
+#     ignored, SIGTERM is logged. sys.excepthook + faulthandler write to the log.
+#   - FIX (load): the screen redraw used to run `su pidof` for every clone EVERY
+#     SECOND (hundreds of su spawns per minute + log spam). It now shows the PID
+#     found by tick().
+#   - ADD: post-mortem. watchdog.alive is refreshed every 10 s and removed on a
+#     clean exit; if it is still there at start-up the previous run was killed,
+#     and the kill/lmkd lines from logcat are written to flight_recorder.log.
+#   - ADD: `python3 rw.py watch` shows the live screen of a headless/root
+#     instance (watchdog_screen.txt). Works with rw_supervisor.sh.
+#   - ADD: deviceidle whitelist + kernel wake lock for Termux (root).
 #
 # v3.9
 #   - ADD: LocalTrader autoexec. For every clone the watchdog now writes a small file into the clone's Autoexec
@@ -170,6 +189,7 @@
 
 import base64
 import dataclasses
+import faulthandler
 import fcntl
 import hashlib
 import json
@@ -189,12 +209,24 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "3.9"
+try:                                   # proof.py is optional: rw.py still works without it
+    from proof import ProofRecorder, DEFAULT_PROOF
+except Exception as _proof_err:        # noqa
+    ProofRecorder = None               # type: ignore
+    DEFAULT_PROOF = {}                 # type: ignore
+    _PROOF_IMPORT_ERROR = str(_proof_err)
+else:
+    _PROOF_IMPORT_ERROR = ""
+
+VERSION = "4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
 LOCK_PATH = os.path.join(BASE_DIR, "watchdog.lock")
 RECORDER_PATH = os.path.join(BASE_DIR, "flight_recorder.log")
+ALIVE_PATH = os.path.join(BASE_DIR, "watchdog.alive")
+SCREEN_PATH = os.path.join(BASE_DIR, "watchdog_screen.txt")
+FAULT_PATH = os.path.join(BASE_DIR, "watchdog_fault.log")
 RECORDER_MAX_BYTES = 2_000_000
 SNAPSHOT_DELAYS = (5, 20, 60)   # seconds after a transition
 
@@ -232,7 +264,11 @@ def now_str() -> str:
 
 
 def clear_screen() -> None:
-    os.system("clear")
+    try:
+        if sys.stdout.isatty():
+            os.system("clear")
+    except Exception:
+        pass
 
 
 def acquire_instance_lock(path: str = LOCK_PATH):
@@ -1019,6 +1055,7 @@ class Watchdog:
         focus_handoff: bool = False,
         soft_return: bool = False,
         autoexec: Optional[dict] = None,
+        proof: Optional[dict] = None,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -1044,6 +1081,25 @@ class Watchdog:
         self.pending_snapshots: List[Tuple[float, str, int]] = []
         self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
         self.autoexec = AutoexecInstaller(self.shell, logger, autoexec)
+        try:
+            self.headless = not sys.stdout.isatty()
+        except Exception:
+            self.headless = True
+        self.proof = None
+        pc = {**DEFAULT_PROOF, **(proof or {})}
+        if ProofRecorder is not None and pc.get("enabled", True):
+            self.proof = ProofRecorder(
+                self.shell, logger, lambda: self.targets, pc,
+                on_saved=self._proof_saved,
+                is_trading=lambda t: t.hub_state == "TRADING",
+                resane=_resane_tty,
+            )
+        elif ProofRecorder is None:
+            logger.log(f"proof recorder unavailable: {_PROOF_IMPORT_ERROR or 'proof.py missing'}")
+
+    def _proof_saved(self, t: Target, rid: str, path: str) -> None:
+        self.log.log(f"{t.label}: proof video saved: {path}")
+        self.notify(t, t.status, "proof_saved", {"request_id": rid, "file": path})
 
     def ensure_autoexec(self, t: Target, force: bool = False) -> None:
         """Best-effort and cheap (re-checks a clone at most every few minutes): never blocks a launch."""
@@ -1131,6 +1187,78 @@ class Watchdog:
             self.log.log(f"{t.label}: focus handoff -> Termux before force-stop")
             self.shell.root("am start -n com.termux/.app.TermuxActivity", timeout=10)
             time.sleep(1.0)
+
+    # ------------------------------------------------------------------
+    # v4.0: crash forensics + safe drawing
+    # ------------------------------------------------------------------
+    def touch_alive(self) -> None:
+        try:
+            tmp = ALIVE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "ts": time.time()}, f)
+            os.replace(tmp, ALIVE_PATH)
+        except Exception:
+            pass
+
+    def clear_alive(self) -> None:
+        try:
+            with open(ALIVE_PATH, encoding="utf-8") as f:
+                if json.load(f).get("pid") == os.getpid():
+                    os.remove(ALIVE_PATH)
+        except Exception:
+            pass
+
+    def post_mortem(self) -> None:
+        """If the previous run left watchdog.alive behind, it was killed from outside."""
+        try:
+            with open(ALIVE_PATH, encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            return
+        if prev.get("pid") == os.getpid():
+            return
+        try:
+            ago = int(time.time() - float(prev.get("ts", 0)))
+        except Exception:
+            ago = -1
+        self.log.log(f"PREVIOUS RUN DIED UNCLEANLY: pid {prev.get('pid')} was last alive {ago}s ago "
+                     f"(no 'Watchdog stopped' line = killed by Android/SIGKILL). Details: flight_recorder.log")
+        out = self._rec_shell(
+            'echo "-- kills/deaths mentioning termux or python (logcat events)"; '
+            'logcat -b events -d -t 5000 2>/dev/null | grep -E "am_kill|am_proc_died|am_low_memory" | '
+            'grep -iE "termux|python" | tail -15; '
+            'echo "-- lmkd / system"; logcat -b system -d -t 4000 2>/dev/null | grep -iE "lmkd|killing" | tail -10; '
+            'echo "-- kernel"; dmesg 2>/dev/null | grep -iE "lowmemory|oom|killed process" | tail -5',
+            timeout=60)
+        self.rec_write(f"===== {now_str()}  POST-MORTEM of pid {prev.get('pid')} (last alive {ago}s earlier) =====\n{out}\n")
+
+    def guard(self, name: str, fn, *args) -> None:
+        """Run one start-up step; log and survive any exception."""
+        try:
+            fn(*args)
+        except Exception as e:
+            self.log.log(f"startup step '{name}' failed (continuing): {type(e).__name__}: {e}")
+            self.log.log(traceback.format_exc()[-1500:])
+
+    def draw(self) -> None:
+        text = self.render()
+        try:                                   # always keep a copy for `rw.py watch`
+            tmp = SCREEN_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            os.replace(tmp, SCREEN_PATH)
+        except Exception:
+            pass
+        if self.headless:
+            return
+        try:
+            clear_screen()
+            print(text)
+            sys.stdout.flush()
+        except Exception as e:
+            self.headless = True
+            self.log.log(f"terminal output lost ({type(e).__name__}); continuing headless "
+                         f"(view with: python3 rw.py watch)")
 
     def activity_packages(self) -> Optional[set]:
         """Packages that currently own at least one Activity record, or None if unknown."""
@@ -1270,6 +1398,8 @@ class Watchdog:
             "item": str(request.get("item", "")) if isinstance(request, dict) else "",
             "quantity": max(1, int(request.get("quantity", 1) or 1)) if isinstance(request, dict) else 1,
             "request_status": str(request.get("status", "")) if isinstance(request, dict) else "",
+            "proof_enabled": bool(self.proof),
+            "proof_url": f"http://127.0.0.1:{self.proof.cfg['port']}" if self.proof else "",
         }, ensure_ascii=False, separators=(",", ":"))
         encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
@@ -1396,6 +1526,11 @@ class Watchdog:
             self.log.log("Termux oom protection: " + out.replace("\n", "; "))
         if not self._wakelock_done:
             self._wakelock_done = True
+            extra = self._rec_shell(
+                'cmd deviceidle whitelist +com.termux 2>&1 | head -1; '
+                'echo rw_watchdog > /sys/power/wake_lock 2>/dev/null && echo "kernel wake lock held"',
+                timeout=20, with_err=False)
+            self.log.log("power settings: " + extra.replace("\n", "; "))
             try:
                 subprocess.run(["termux-wake-lock"], timeout=10, capture_output=True)
                 self.log.log("termux-wake-lock requested")
@@ -1586,7 +1721,8 @@ class Watchdog:
             t.status = "cooldown"
             return
 
-        running = self.controller.is_running(t.package)
+        t._pid = self.controller.pid(t.package)
+        running = bool(t._pid)
 
         # A clone that is running but whose timer was never started (it appeared
         # after startup, e.g. you opened it by hand) is adopted, not restarted.
@@ -1701,49 +1837,58 @@ class Watchdog:
         # Pull the real desired state BEFORE writing LocalTrader_Hub.json or
         # touching any Roblox process. This preserves TRADING across a watchdog
         # restart instead of temporarily telling LocalTrader to FARM.
-        self.poll_hub()
+        self.guard("post_mortem", self.post_mortem)
+        self.touch_alive()
+        self.guard("poll_hub", self.poll_hub)
 
         # v3.8: shield Termux and this script from the low-memory killer.
-        self.protect_termux(force=True)
+        self.guard("protect_termux", self.protect_termux, True)
+        if self.proof:
+            self.guard("proof.start", self.proof.start)
 
         # Do not restart clones that are already running; just start their timers.
-        self.adopt_running_targets()
+        self.guard("adopt_running_targets", self.adopt_running_targets)
 
         for t in self.targets:
             if t.enabled:
-                self.ensure_autoexec(t, force=True)
-                self.sync_localtrader_config(t)
-                self.heartbeat(t)
+                self.guard("autoexec", self.ensure_autoexec, t, True)
+                self.guard("sync_config", self.sync_localtrader_config, t)
+                self.guard("heartbeat", self.heartbeat, t)
 
         try:
             last_tick = 0.0
+            last_alive = 0.0
             while self.running:
-                self.poll_hub()
-                self.run_pending_transition()
-                self.protect_termux()
-                self.run_due_snapshots()
-                now = time.time()
-                if now - last_tick >= self.interval_sec:
-                    last_tick = now
-                    for t in self.targets:
-                        try:
-                            self.tick(t)
-                        except Exception as e:
-                            t.status = "error"
-                            self.log.log(f"{t.label}: tick exception: {e}")
-                            self.log.log(traceback.format_exc()[-2000:])
-                # Redraw every pass so the screen reflects current status - it
-                # used to be printed exactly once, before this loop started,
-                # so it stayed frozen on whatever state existed at that
-                # instant (typically "stopped", before the first tick had
-                # even run) no matter what actually happened afterward.
-                clear_screen()
-                print(self.render())
-                # One-second granularity means Hub commands are seen promptly even
-                # when the normal watchdog interval is much larger.
+                try:
+                    self.poll_hub()
+                    self.run_pending_transition()
+                    self.protect_termux()
+                    self.run_due_snapshots()
+                    now = time.time()
+                    if now - last_tick >= self.interval_sec:
+                        last_tick = now
+                        for t in self.targets:
+                            try:
+                                self.tick(t)
+                            except Exception as e:
+                                t.status = "error"
+                                self.log.log(f"{t.label}: tick exception: {e}")
+                                self.log.log(traceback.format_exc()[-2000:])
+                    self.draw()
+                    if time.time() - last_alive >= 10:
+                        last_alive = time.time()
+                        self.touch_alive()
+                except Exception as e:
+                    # v4.0: one bad iteration must never end the watchdog.
+                    self.log.log(f"MAIN LOOP error (continuing): {type(e).__name__}: {e}")
+                    self.log.log(traceback.format_exc()[-2500:])
+                    time.sleep(2)
                 time.sleep(1)
         finally:
             self.running = False
+            if self.proof:
+                self.proof.stop()
+            self.clear_alive()
             self.log.log("Watchdog stopped")
 
     def stop(self) -> None:
@@ -1758,9 +1903,11 @@ class Watchdog:
         lines.append(f"Hub: {hubtxt} | poll {self.hub_poll_sec}s | crash-restart: {cr} | autoexec: {'ON' if self.autoexec.enabled else 'OFF'}")
         if self.pending_transitions:
             lines.append(f"Queued transitions: {len(self.pending_transitions)}")
+        if self.proof is not None:
+            lines.append(f"Proof recorder: {self.proof.status_text()}")
         lines.append("-")
         for i, t in enumerate(self.targets, 1):
-            pid = self.controller.pid(t.package) or "-"
+            pid = getattr(t, "_pid", "") or "-"
             age = "-"
             if t.last_rejoin:
                 age = f"{int((time.time()-t.last_rejoin)/60)}m"
@@ -1791,6 +1938,7 @@ class App:
         self.hub_token = ""
         self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
         self.autoexec = dict(DEFAULT_AUTOEXEC)
+        self.proof = dict(DEFAULT_PROOF)
         self.load()
 
     def load(self) -> None:
@@ -1806,6 +1954,7 @@ class App:
             self.soft_return = bool(c.get("soft_return", False))
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
             self.autoexec = {**DEFAULT_AUTOEXEC, **(c.get("autoexec") or {})}
+            self.proof = {**DEFAULT_PROOF, **(c.get("proof") or {})}
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
             self.hub_token = str(hub.get("token", ""))
@@ -1824,6 +1973,7 @@ class App:
             "soft_return": self.soft_return,
             "trading_share_link": self.trading_share_link,
             "autoexec": self.autoexec,
+            "proof": self.proof,
             "hub": {
                 "url": self.hub_url,
                 "token": self.hub_token,
@@ -2105,15 +2255,22 @@ class App:
             self.focus_handoff,
             self.soft_return,
             self.autoexec,
+            self.proof,
         )
 
         def sigint(_sig, _frame):
             wd.stop()
 
         old = signal.signal(signal.SIGINT, sigint)
+        try:
+            # v4.0: closing the Termux window sends SIGHUP; survive it (output
+            # errors are handled by Watchdog.draw()). SIGTERM is logged.
+            signal.signal(signal.SIGHUP, lambda *_: self.logger.log("SIGHUP received (terminal closed) - ignoring"))
+            signal.signal(signal.SIGTERM, lambda *_: (self.logger.log("SIGTERM received - stopping"), wd.stop()))
+        except Exception:
+            pass
         clear_screen()
         try:
-            print(wd.render())
             wd.run()
         finally:
             signal.signal(signal.SIGINT, old)
@@ -2164,6 +2321,60 @@ class App:
                     print(f"  {'OK ' if ok else 'FAIL'} {t.label}: {msg}")
                 input("\nPress Enter...")
 
+    def proof_menu(self) -> None:
+        if ProofRecorder is None:
+            print(f"proof.py could not be loaded: {_PROOF_IMPORT_ERROR or 'file missing'}")
+            print("Put proof.py in the same folder as rw.py.")
+            input("Press Enter...")
+            return
+        while True:
+            cfg = {**DEFAULT_PROOF, **self.proof}
+            clear_screen()
+            print("TRADE PROOF RECORDER")
+            print("=" * 70)
+            print(f"Status          : {'ON' if cfg['enabled'] else 'OFF'}")
+            print(f"Videos          : {cfg['dir']}  (deleted after {cfg['keep_days']} days)")
+            print(f"HTTP signal     : http://127.0.0.1:{cfg['port']}/proof/start|done")
+            print(f"File signal     : <clone>/Arceus X/Workspace/LocalTrader_Signal.json")
+            print(f"Raise to front  : {'yes' if cfg['bring_to_front'] else 'no'}")
+            print(f"Stop after done : {cfg['tail_sec']}s   max length {cfg['max_sec']}s   keep last {cfg['keep_last_sec']}s (needs ffmpeg)")
+            print()
+            print("t = on/off   f = raise-to-front on/off   r = test recording (6 s)")
+            print("l = list recent videos   b = back")
+            choice = input("\n> ").strip().lower()
+            if choice == "b":
+                return
+            if choice == "t":
+                self.proof["enabled"] = not cfg["enabled"]
+                self.save()
+            elif choice == "f":
+                self.proof["bring_to_front"] = not cfg["bring_to_front"]
+                self.save()
+            elif choice == "l":
+                print(self.shell.root_out(f"ls -lt {shlex.quote(cfg['dir'])} 2>&1 | head -15") or "(nothing)")
+                input("\nPress Enter...")
+            elif choice == "r":
+                if not self.targets:
+                    print("No instances configured.")
+                    input("Press Enter...")
+                    continue
+                for i, t in enumerate(self.targets, 1):
+                    print(f"{i}. {t.label}")
+                try:
+                    t = self.targets[int(self.ask("Which instance", "1")) - 1]
+                except (ValueError, IndexError):
+                    continue
+                print("Recording 6 s: the clone should jump to the front...")
+                rec = ProofRecorder(self.shell, self.logger, lambda: self.targets, cfg, resane=_resane_tty)
+                rec.start(http=False)
+                try:
+                    result = rec.test(t, 6)
+                finally:
+                    rec.stop()
+                print(f"\nResult: {result}")
+                print("Open that file on the phone and check the clone is fully visible.")
+                input("\nPress Enter...")
+
     def menu(self) -> None:
         while True:
             clear_screen()
@@ -2187,6 +2398,7 @@ class App:
             print("9. Toggle focus handoff (KNOWN BAD: hides every clone - leave OFF)")
             print("10. Toggle soft return (no force-stop when returning to farming)")
             print("11. LocalTrader autoexec (install / check / remove / on-off / URL)")
+            print("12. Trade proof recorder (video of each trade)")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -2232,6 +2444,8 @@ class App:
                 input("Press Enter...")
             elif choice == "11":
                 self.autoexec_menu()
+            elif choice == "12":
+                self.proof_menu()
             elif choice == "0":
                 return
 
@@ -2250,7 +2464,46 @@ def headless_start() -> int:
         _resane_tty()
 
 
+_fault_fh = None
+
+
+def install_crash_logging() -> None:
+    """Make sure that *how* the process died ends up in watchdog.log."""
+    global _fault_fh
+    def hook(et, ev, tb):
+        try:
+            Logger(LOG_PATH).log("UNCAUGHT EXCEPTION:\n" + "".join(traceback.format_exception(et, ev, tb))[-2500:])
+        except Exception:
+            pass
+        sys.__excepthook__(et, ev, tb)
+    sys.excepthook = hook
+    try:
+        _fault_fh = open(FAULT_PATH, "a")
+        faulthandler.enable(file=_fault_fh)      # native crashes (SIGSEGV/SIGABRT...) get a traceback
+    except Exception:
+        pass
+
+
+def watch_screen() -> int:
+    """Live view of a headless watchdog: python3 rw.py watch"""
+    try:
+        while True:
+            try:
+                with open(SCREEN_PATH, encoding="utf-8") as f:
+                    txt = f.read()
+            except OSError:
+                txt = "(watchdog_screen.txt not found - is the watchdog running?)"
+            os.system("clear")
+            print(txt)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
 def main() -> int:
+    install_crash_logging()
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "watch":
+        return watch_screen()
     if len(sys.argv) > 1 and sys.argv[1].lower() == "start":
         return headless_start()
     with Terminal():
