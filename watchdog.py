@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.2 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.3 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,10 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.3
+#   - ADD: `python3 rw.py probe` collects LocalTrader_ItemProbe.txt (written by LocalTrader v2.6) from every clone and saves it as
+#     item_probe_all.txt. It shows how skinned fruits (Divine Portal, Glacier Eagle, ...) appear in the game's trade inventory.
 #
 # v4.2
 #   - Proof recorder understands the trade RESULT. LocalTrader now calls
@@ -230,7 +234,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.2"
+VERSION = "4.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -3201,6 +3205,21 @@ def main() -> int:
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     if cmd == "watch":
         return watch_screen()
+    if cmd == "probe":
+        app = App()
+        script = ('for f in "/storage/emulated/0"/RobloxClone*/"Arceus X"/Workspace/LocalTrader_ItemProbe.txt; do '
+                  '[ -f "$f" ] && { echo "=== $f"; cat "$f"; echo; }; done')
+        text = app.shell.root_out(script, timeout=30)
+        if not text.strip():
+            print("No LocalTrader_ItemProbe.txt found. It is written by LocalTrader v2.6 after the first inventory report")
+            print("(the account must be in game with a team chosen). Run LocalTrader v2.6 and try again in a minute.")
+            return 1
+        out = os.path.join(BASE_DIR, "item_probe_all.txt")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(text)
+        print(f"\nSaved to {out}")
+        return 0
     if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "lua"):
         app = App()
         if cmd == "install-supervisor":
