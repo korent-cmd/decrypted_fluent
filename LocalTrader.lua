@@ -2,6 +2,16 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.6: more skin fruits. Divine Portal, Glacier Eagle, Requiem Eagle, Pink Portal, Celestial Pain ... are ItemIds records of type
+--        "FruitWithSkin" (32 of them), a different type from the "PhysicalMoveset" skins of v2.5. They are accepted when the
+--        inventory entry's Type contains "Physical" (a stored, non-physical copy is not tradable). New CONFIG.SkinProbe writes
+--        LocalTrader_ItemProbe.txt (every fruit-like inventory item with ALL its fields), so the real ItemId / Type of your skinned
+--        fruits can be checked; CONFIG.SkinAcceptAnyInventoryType = true is the fallback if their Type does not say "Physical".
+-- v2.5: skin fruits. They are ItemIds records of type "PhysicalMoveset" (1522 Sealed Fiend, 1523 Heavenly Gravity, 1524 Red
+--        Ghost, 1525 Arcsteel Magnet, 1526 Lime Blade; 1516 Magnet-Magnet is the physical Magnet fruit), and the old filter only
+--        accepted "PhysicalFruit", so the Hub never saw them and orders for them could not be fulfilled. Now they are reported
+--        to the Hub, listed in the dropdown, resolvable by name and tradable. They are NEVER flushed as trash. Fuzzy name search
+--        still prefers normal fruits ("Ghost" = Ghost-Ghost, not Red Ghost). Switch: CONFIG.SkinFruitsEnabled.
 -- v2.4: trade proof video. LocalTrader tells the Termux watchdog (rw.py v4.2+) when the trade is about to complete
 --        (worker pressed Accept / countdown / processing) and how it ended: RWProof.begin(session) ... RWProof.finish(session,
 --        "completed" | "unverified" | "aborted"). rw.py raises this clone to the front and records the screen; aborted trades
@@ -212,6 +222,10 @@ local CONFIG = {
 	TravelTimeout = 90,           -- total seconds allowed to reach the trade table
 	AddItemMaxAttempts = 4,       -- v1.5: tries to put the requested fruit in the offer
 	AddItemRetryDelay = 1.5,      -- v1.5: seconds between those tries
+	SkinFruitsEnabled = true,     -- v2.5: report / sell / trade skin fruits (ItemIds type PhysicalMoveset)
+	SkinAcceptAnyInventoryType = false, -- v2.6: accept FruitWithSkin items whatever their inventory Type (use only if the probe shows a Type without "Physical")
+	SkinProbe = true,             -- v2.6: write LocalTrader_ItemProbe.txt (fruit-like inventory items with all their fields)
+	SendSkinFlag = false,         -- v2.5: also send skin = true/false per item to the Hub (only if the Hub accepts the field)
 	MaxItemsPerTrade = 4,         -- v1.8: game rule: at most 4 units per side in one trade
 	WorkerErrorRetries = 2,       -- v2.1: extra attempts after a worker_error while reaching the table, before the Hub hears of it
 	WorkerErrorRetryDelay = 5,    -- v2.1: seconds between those attempts
@@ -1076,20 +1090,61 @@ local function readInventory()
 	return result.Items
 end
 
+-- v2.6: skin fruits come in two shapes in ItemIds:
+--   "PhysicalMoveset": Sealed Fiend, Heavenly Gravity, Red Ghost, Arcsteel Magnet, Lime Blade (and the physical Magnet-Magnet)
+--   "FruitWithSkin":   Divine Portal, Glacier Eagle, Requiem Eagle, Pink Portal, Celestial Pain, ...
+local SKIN_RECORD_TYPES = { PhysicalMoveset = true, FruitWithSkin = true }
+
+-- A PhysicalMoveset skin has no "X-X" name ("Heavenly Gravity"); the physical Magnet fruit is "Magnet-Magnet" and is a normal fruit.
+local function isSkinFruitName(name)
+	return not tostring(name):find("-", 1, true)
+end
+
+local function isSkinFruitRecord(record)
+	return CONFIG.SkinFruitsEnabled == true and type(record) == "table" and SKIN_RECORD_TYPES[record[1]] == true
+end
+
+-- Normal fruits: ItemIds type PhysicalFruit AND inventory Type PhysicalMoveset / SpecialPhysicalFruit (unchanged).
+-- PhysicalMoveset skins: ItemIds already whitelists those exact ids, so the inventory Type is not checked.
+-- FruitWithSkin: the same ItemId can also exist as a stored (non-physical) fruit, so the inventory Type must say "Physical".
+local skinSeenLogged = {}
+local function isTradableInventoryItem(item, record)
+	if type(record) ~= "table" or type(item) ~= "table" then
+		return false
+	end
+	local tradeType = tostring(item.Type or "")
+	if record[1] == "PhysicalFruit" then
+		return tradeType == "PhysicalMoveset" or tradeType == "SpecialPhysicalFruit"
+	end
+	if not isSkinFruitRecord(record) then
+		return false
+	end
+	if record[1] == "PhysicalMoveset" then
+		return true
+	end
+	return CONFIG.SkinAcceptAnyInventoryType == true or tradeType:find("Physical", 1, true) ~= nil
+end
+
 local function getAvailablePhysicalFruits(items)
 	local available = {}
 	for _, item in pairs(items or {}) do
 		local id = tonumber(item.ItemId)
 		local record = id and ItemIds and ItemIds[id]
-		local tradeType = tostring(item.Type or "")
-		local isTradeableType = tradeType == "PhysicalMoveset"
-			or tradeType == "SpecialPhysicalFruit"
-		if id and record and record[1] == "PhysicalFruit" and isTradeableType
+		if id and record and isTradableInventoryItem(item, record)
 			and (tonumber(item.Amount) or 0) > 0 then
+			local name = tostring(record[2])
+			local isSkin = record[1] == "FruitWithSkin"
+				or (record[1] == "PhysicalMoveset" and isSkinFruitName(name))
+			if SKIN_RECORD_TYPES[record[1]] and not skinSeenLogged[id] then
+				skinSeenLogged[id] = true
+				debugLog(string.format("LocalTrader: skin/moveset fruit in inventory: %s (id %d, record %s, inventory Type=%s, x%s)",
+					name, id, tostring(record[1]), tostring(item.Type), tostring(item.Amount)))
+			end
 			available[#available + 1] = {
 				id = id,
-				name = tostring(record[2]),
+				name = name,
 				amount = tonumber(item.Amount) or 0,
+				skin = isSkin,
 			}
 		end
 	end
@@ -1097,6 +1152,52 @@ local function getAvailablePhysicalFruits(items)
 		return a.name:lower() < b.name:lower()
 	end)
 	return available
+end
+
+-- v2.6: item probe. Writes LocalTrader_ItemProbe.txt (executor workspace) whenever the set of fruit-like inventory items changes:
+-- one line per item with its ItemId, inventory Type, ItemIds record, whether LocalTrader counts it as tradable, and EVERY field the
+-- game sent. This shows exactly how a skinned fruit (Divine Portal, Glacier Eagle, ...) appears in getTradeInventory.
+local PROBE_RECORD_TYPES = {
+	FruitWithSkin = true, FruitSkin = true, SkinBundle = true, PhysicalMoveset = true, PhysicalFruit = true,
+	MutatedFruit = true, FruitWithMutation = true, FruitFusion = true, FruitMutation = true,
+}
+local probeLastBody = ""
+local function writeItemProbe(items)
+	if CONFIG.SkinProbe ~= true or type(writefile) ~= "function" then
+		return
+	end
+	local lines = {}
+	for _, item in pairs(items or {}) do
+		if type(item) == "table" then
+			local id = tonumber(item.ItemId)
+			local record = id and ItemIds and ItemIds[id]
+			local invType = tostring(item.Type or "")
+			local recType = type(record) == "table" and tostring(record[1]) or "?"
+			if PROBE_RECORD_TYPES[recType] or invType:find("Physical", 1, true)
+				or invType:find("Skin", 1, true) or invType:find("Mutat", 1, true) then
+				local fields = {}
+				for key, value in pairs(item) do
+					fields[#fields + 1] = tostring(key) .. "=" .. (type(value) == "table" and "{table}" or tostring(value))
+				end
+				table.sort(fields)
+				lines[#lines + 1] = string.format("id=%s | name=%s | record=%s | inventoryType=%s | counted_as_tradable=%s | %s",
+					tostring(id), type(record) == "table" and tostring(record[2]) or "?", recType, invType,
+					tostring(isTradableInventoryItem(item, record)), table.concat(fields, "; "))
+			end
+		end
+	end
+	table.sort(lines)
+	local body = table.concat(lines, "\n")
+	if body == probeLastBody then
+		return
+	end
+	probeLastBody = body
+	local ok = pcall(writefile, "LocalTrader_ItemProbe.txt",
+		"LocalTrader item probe (v2.6) " .. os.date("!%Y-%m-%d %H:%M:%S") .. " UTC\n"
+		.. "Every fruit-like inventory item and ALL its fields. Send this file back to see how skinned fruits appear.\n\n"
+		.. body .. "\n")
+	debugLog(string.format("LocalTrader: item probe %s (%d fruit-like item(s)) -> LocalTrader_ItemProbe.txt",
+		ok and "written" or "could not be written", #lines))
 end
 
 -- Reports current tradable-fruit inventory to the Hub so make-order can scan
@@ -1189,9 +1290,18 @@ local function reportInventoryToHub()
 		return
 	end
 	local available = getAvailablePhysicalFruits(inventory)
+	pcall(writeItemProbe, inventory)   -- v2.6
+	local reportItems = {}
+	for _, entry in ipairs(available) do
+		local row = { id = entry.id, name = entry.name, amount = entry.amount }
+		if CONFIG.SendSkinFlag then
+			row.skin = entry.skin == true
+		end
+		reportItems[#reportItems + 1] = row
+	end
 	local data, reqErr = hubRequest("POST", "/api/v1/inventory", {
 		account_id = HubConfig.accountId,
-		items = available,
+		items = reportItems,
 		sea = sea,
 	})
 	if not data then
@@ -1263,7 +1373,7 @@ local function scanTrashCandidates()
 	local available = getAvailablePhysicalFruits(inventory)
 	local candidates = {}
 	for _, entry in ipairs(available) do
-		if trashFruitLookup[entry.name] then
+		if trashFruitLookup[entry.name] and not entry.skin then   -- v2.5: skin fruits are never flushed
 			candidates[#candidates + 1] = {
 				name = entry.name,
 				amount = entry.amount,
@@ -1341,7 +1451,7 @@ end
 local fruitNameSet = {}
 if ItemIds then
 	for _, rec in pairs(ItemIds) do
-		if type(rec) == "table" and rec[1] == "PhysicalFruit" and rec[2] then
+		if type(rec) == "table" and (rec[1] == "PhysicalFruit" or isSkinFruitRecord(rec)) and rec[2] then
 			fruitNameSet[tostring(rec[2])] = true
 		end
 	end
@@ -1881,35 +1991,51 @@ local function resolveItemId(name)
 		return nil, "itemIds.lua could not be loaded"
 	end
 
-	local function physicalMatches(records)
+	local function physicalMatches(records, includeSkins)
 		local matches = {}
 		for _, record in ipairs(records or {}) do
-			if record.type == "PhysicalFruit" then
+			if record.type == "PhysicalFruit" or (includeSkins and SKIN_RECORD_TYPES[record.type]) then
 				matches[#matches + 1] = record
 			end
 		end
 		return matches
 	end
 
-	local exactMatches = physicalMatches(itemByName[wanted])
-	if #exactMatches == 1 then
-		return exactMatches[1].id
-	elseif #exactMatches > 1 then
-		return nil, "multiple tradable physical fruits share this name; use an ItemId"
-	end
+	-- Returns id, nil (found) / nil, message (ambiguous) / nil, nil (nothing).
+	local function search(includeSkins)
+		local exactMatches = physicalMatches(itemByName[wanted], includeSkins)
+		if #exactMatches == 1 then
+			return exactMatches[1].id
+		elseif #exactMatches > 1 then
+			return nil, "multiple tradable physical fruits share this name; use an ItemId"
+		end
 
-	local matches = {}
-	for normalizedName, records in pairs(itemByName) do
-		if normalizedName:find(wanted, 1, true) then
-			for _, record in ipairs(physicalMatches(records)) do
-				matches[#matches + 1] = record
+		local matches = {}
+		for normalizedName, records in pairs(itemByName) do
+			if normalizedName:find(wanted, 1, true) then
+				for _, record in ipairs(physicalMatches(records, includeSkins)) do
+					matches[#matches + 1] = record
+				end
 			end
 		end
+		if #matches == 1 then
+			return matches[1].id
+		elseif #matches > 1 then
+			return nil, "ambiguous tradable fruit name; use the full name or ItemId"
+		end
+		return nil, nil
 	end
-	if #matches == 1 then
-		return matches[1].id
-	elseif #matches > 1 then
-		return nil, "ambiguous tradable fruit name; use the full name or ItemId"
+
+	-- v2.5: normal fruits first, so "Ghost" still means Ghost-Ghost and not Red Ghost.
+	local id, err = search(false)
+	if id or err then
+		return id, err
+	end
+	if CONFIG.SkinFruitsEnabled then
+		id, err = search(true)
+		if id or err then
+			return id, err
+		end
 	end
 	return nil, "no tradable PhysicalFruit with that name was found"
 end
@@ -1924,7 +2050,7 @@ end
 
 local function isTradablePhysicalFruit(itemId)
 	local record = itemRecord(itemId)
-	return type(record) == "table" and record[1] == "PhysicalFruit"
+	return type(record) == "table" and (record[1] == "PhysicalFruit" or isSkinFruitRecord(record))
 end
 
 local function inventoryEntry(items, wantedId)
@@ -2749,8 +2875,15 @@ function startTrader(orderData)
 	end
 	local requestedEntry = inventoryEntry(inventory, requestedId)
 	local requestedType = requestedEntry and tostring(requestedEntry.Type) or ""
-	local inventoryTradeable = requestedType == "PhysicalMoveset"
-		or requestedType == "SpecialPhysicalFruit"
+	-- v2.6: same rule as the inventory report (isTradableInventoryItem); ANY entry with this ItemId may qualify
+	local requestedRecord = itemRecord(requestedId)
+	local inventoryTradeable = false
+	for _, entry in pairs(inventory) do
+		if tonumber(entry.ItemId) == tonumber(requestedId) and isTradableInventoryItem(entry, requestedRecord) then
+			inventoryTradeable = true
+			break
+		end
+	end
 	if not isTradablePhysicalFruit(requestedId) or not inventoryTradeable then
 		writeLog("selected item is not a tradable PhysicalFruit")
 		return
