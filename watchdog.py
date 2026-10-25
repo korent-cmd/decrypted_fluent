@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.3 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.6 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,30 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.6
+#   - ADD: the hub config now comes from a link (hubcfg.url_sea2 = your repo's qntmcfgsea2.json), cached next to this script
+#     (hubcfg_cache_sea2.json, refreshed every hubcfg.refresh_min minutes). If the download fails the cached copy is used, and
+#     with no cache the local quantum_config_template.json.
+#   - ADD: SEA-SPECIFIC CONFIG. A clone in Sea 1 gets the Sea 2 file with hubcfg.sea1_overrides applied (default: AutoFarm on, quest
+#     farming, AutoSecondSea on, AutoChest off; Random_Auto and AutoStoreFruit stay on = it keeps rolling and storing fruits). Set
+#     hubcfg.url_sea1 to use a separate file instead. The sea comes from the Hub (needs hub.py v2.9.5, which adds it to /poll), else
+#     from the Place ID, else Sea 2 is assumed. Sea 3 uses the Sea 2 file.
+#
+# v4.5
+#   - ADD: Quantum Onyx Hub config. Before every (re)launch - right after the clone is force-stopped, so the hub cannot overwrite it
+#     while running - the watchdog overwrites each clone's `Arceus X/Workspace/Quantum Onyx Hub/*-BloxFruits-994732206.json` with
+#     quantum_config_template.json (next to this script). The file name starts with the Roblox username, so it cannot be created
+#     before the hub made it once: the first launch creates it, the next relaunch (rejoin) applies the template. Only files that
+#     differ are rewritten. Menu 14 or `python3 rw.py hubcfg` applies it now. Settings: watchdog_config.json -> "hubcfg".
+#
+# v4.4
+#   - FIX: the supervisor never stayed alive on this phone. The old launch (`setsid sh ... &` inside one `su -c`) was killed the
+#     moment that `su` call returned (confirmed on-device: not even `sh -x` printed a line). The supervisor is now started by a
+#     long-lived `su -c` child of this process (its own session, output in supervisor_launch.log), which is the only way
+#     that was seen to work. It still lives inside Termux, so Termux must stay alive (oom protection + wake lock do that).
+#   - ADD: `python3 rw.py install-boot` writes ~/.termux/boot/rw.sh (needs the Termux:Boot app, opened once). After a phone
+#     restart it installs and starts the supervisor, which then starts the watchdog. Also menu 13 -> t.
 #
 # v4.3
 #   - ADD: `python3 rw.py probe` collects LocalTrader_ItemProbe.txt (written by LocalTrader v2.6) from every clone and saves it as
@@ -234,7 +258,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.3"
+VERSION = "4.6"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -273,6 +297,44 @@ DEFAULT_AUTOEXEC = {
     "base_dir": "/storage/emulated/0",    # where the RobloxCloneNNN folders live
 }
 
+
+# v4.5: the Quantum Onyx Hub settings file that every clone gets (see HubConfigInstaller).
+DEFAULT_HUBCFG = {
+    "enabled": True,
+    "url_sea2": "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/qntmcfgsea2.json",
+    "url_sea1": "",                                       # empty = Sea 2 file + sea1_overrides below
+    "refresh_min": 10,                                    # how often the link is downloaded again
+    "sea1_overrides": {
+        "AutoFarm": True,            # farm levels
+        "FarmMode": "Quest",         # ...by quest
+        "AcceptQuests": True,
+        "AutoSecondSea": True,       # do the Second Sea quest at level 700
+        "AutoChest": False,          # one mover at a time: level farming, not chest hunting
+        "Random_Auto": True,         # keep rolling fruits
+        "AutoStoreFruit": True,      # keep storing them
+    },
+    "template": "quantum_config_template.json",          # fallback when the link and the cache both fail
+    "dir_name": "Arceus X/Workspace/Quantum Onyx Hub",     # inside each RobloxCloneNNN folder
+    "file_glob": "*-BloxFruits-994732206.json",           # <roblox username>-BloxFruits-<game id>.json
+    "base_dir": "/storage/emulated/0",
+}
+
+
+PLACE_SEA = {"2753915549": 1, "4442272183": 2, "7449423635": 3}   # Blox Fruits place ids
+
+
+def resolve_sea(target: "Target", hub_sea: Optional[int] = None) -> Tuple[int, str]:
+    """(sea, where it came from): the sea the Hub saw the account in, else the Place ID, else Sea 2."""
+    try:
+        hs = int(hub_sea or 0)
+    except (TypeError, ValueError):
+        hs = 0
+    if hs in (1, 2, 3):
+        return hs, "hub"
+    ps = PLACE_SEA.get(str(getattr(target, "place_id", "") or "").strip())
+    if ps:
+        return ps, "place id"
+    return 2, "default"
 
 
 def now_str() -> str:
@@ -1039,6 +1101,200 @@ exit 0
             return False, f"{type(e).__name__}: {e}"
 
 
+class HubConfigInstaller:
+    """Overwrites the Quantum Onyx Hub settings file in each clone with the right config for its sea. Root shell commands only.
+
+    The config is downloaded from a link (cached; falls back to the cache, then to a local template). A Sea 1 clone gets the
+    Sea 2 file with sea1_overrides applied, unless url_sea1 is set. The hub names its file <roblox username>-BloxFruits-<game id>.json,
+    so it can only be EDITED once the hub has created it (first launch); a clone without that file yet is picked up at its next relaunch.
+    """
+    SCRIPT = r'''
+src=@@SRC@@; d=@@DIR@@; g=@@GLOB@@
+[ -r "$src" ] || { echo "HUBCFG_ERR template not readable: $src" >&2; exit 2; }
+[ -d "$d" ] || { echo "HUBCFG_OK found=0 written=0 nodir"; exit 0; }
+n=0; w=0
+for f in "$d"/$g; do
+  [ -f "$f" ] || continue
+  n=$((n+1))
+  if cmp -s "$src" "$f"; then continue; fi
+  tmp="$f.rwtmp"
+  { cp "$src" "$tmp" && mv -f "$tmp" "$f"; } || { rm -f "$tmp"; echo "HUBCFG_ERR write failed: $f" >&2; exit 4; }
+  chmod 666 "$f" 2>/dev/null
+  w=$((w+1))
+done
+echo "HUBCFG_OK found=$n written=$w"
+exit 0
+'''
+
+    def __init__(self, shell: Shell, logger: Logger, cfg: Optional[dict], namer: Callable[..., str],
+                 sea_fn: Optional[Callable[["Target"], Tuple[int, str]]] = None):
+        self.shell = shell
+        self.log = logger
+        self.cfg = {**DEFAULT_HUBCFG, **(cfg or {})}
+        self.namer = namer
+        self.sea_fn = sea_fn or (lambda t: resolve_sea(t, 0))
+        self._warned: Dict[str, str] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled", True))
+
+    def _local(self, name: str) -> str:
+        return name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
+
+    def template_path(self) -> str:
+        return self._local(str(self.cfg.get("template") or DEFAULT_HUBCFG["template"]))
+
+    @staticmethod
+    def _valid(raw: bytes) -> Optional[dict]:
+        try:
+            if not raw or len(raw) > 2_000_000:
+                return None
+            data = json.loads(raw.decode("utf-8-sig"))
+            return data if isinstance(data, dict) and data else None
+        except Exception:
+            return None
+
+    def _note(self, key: str, msg: str) -> None:
+        """Log a message only when it differs from the last one for this key (keeps watchdog.log quiet)."""
+        if self._warned.get(key) != msg:
+            self._warned[key] = msg
+            self.log.log("hub config: " + msg)
+
+    def fetch(self, url: str, cache_name: str) -> Tuple[Optional[str], str]:
+        """(path of a usable local copy, where it came from). Downloads at most every refresh_min minutes."""
+        cache = self._local(cache_name)
+        refresh = max(1, int(self.cfg.get("refresh_min") or 10)) * 60
+        try:
+            if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < refresh and self._valid(open(cache, "rb").read()):
+                return cache, "cache"
+        except OSError:
+            pass
+        err = ""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "rw-watchdog", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read(2_000_001)
+            if self._valid(raw) is None:
+                err = "the download is not a valid JSON object"
+            else:
+                tmp = cache + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(raw)
+                os.replace(tmp, cache)
+                self._note("dl:" + cache_name, f"downloaded {url.rsplit('/', 1)[-1]} ({len(raw)} bytes)")
+                return cache, "download"
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        try:
+            if self._valid(open(cache, "rb").read()):
+                self._note("dl:" + cache_name, f"download failed ({err}); using the cached copy")
+                return cache, "stale cache"
+        except OSError:
+            pass
+        self._note("dl:" + cache_name, f"download failed ({err}) and there is no cached copy")
+        return None, err
+
+    def base_config(self, url: str, cache_name: str) -> Tuple[Optional[str], str]:
+        """The Sea 2 style file: the link, else the cache, else the local template."""
+        if url:
+            path, how = self.fetch(url, cache_name)
+            if path:
+                return path, how
+        t = self.template_path()
+        try:
+            if self._valid(open(t, "rb").read()):
+                return t, "local template"
+        except OSError:
+            pass
+        return None, f"no usable config (link failed, {t} missing or invalid)"
+
+    @staticmethod
+    def _set_where_present(obj: dict, overrides: dict) -> int:
+        n = 0
+        for k, v in overrides.items():
+            if k in obj:
+                obj[k] = v
+                n += 1
+        return n
+
+    def source_for(self, sea: int) -> Tuple[Optional[str], str]:
+        """Local file to copy into the clones for this sea, and a short description of where it came from."""
+        url2 = str(self.cfg.get("url_sea2") or "").strip()
+        url1 = str(self.cfg.get("url_sea1") or "").strip()
+        if sea == 1 and url1:
+            path, how = self.base_config(url1, "hubcfg_cache_sea1.json")
+            return path, f"Sea 1 file, {how}"
+        path, how = self.base_config(url2, "hubcfg_cache_sea2.json")
+        if path is None or sea != 1:
+            return path, f"Sea {2 if sea != 1 else 1} file, {how}"
+        over = self.cfg.get("sea1_overrides") or {}
+        if not over:
+            return path, f"Sea 2 file (no Sea 1 overrides set), {how}"
+        try:
+            data = json.loads(open(path, "rb").read().decode("utf-8-sig"))
+            hits = self._set_where_present(data, over)
+            for slot in data.get("_saveSlots") or []:
+                if isinstance(slot, dict) and isinstance(slot.get("data"), dict):
+                    hits += self._set_where_present(slot["data"], over)
+            out = self._local("hubcfg_sea1_generated.json")
+            tmp = out + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+            os.replace(tmp, out)
+            return out, f"Sea 2 file + Sea 1 overrides ({hits} values set), {how}"
+        except Exception as e:
+            return None, f"could not build the Sea 1 config: {type(e).__name__}: {e}"
+
+    def template_problem(self) -> str:
+        """Empty string if some usable config can be produced right now."""
+        path, how = self.base_config(str(self.cfg.get("url_sea2") or "").strip(), "hubcfg_cache_sea2.json")
+        return "" if path else how
+
+    def apply(self, target: "Target", targets: List["Target"]) -> Tuple[bool, str]:
+        """Never raises. Returns (ok, message)."""
+        if not self.enabled:
+            return False, "hub config is switched off"
+        try:
+            sea, sea_src = self.sea_fn(target)
+            src, how = self.source_for(sea)
+            if not src:
+                if getattr(target, "_hubcfg_last", "") != how:
+                    target._hubcfg_last = how
+                    self.log.log(f"{target.label}: hub config NOT applied: {how}")
+                return False, how
+            base = str(self.cfg.get("base_dir") or DEFAULT_HUBCFG["base_dir"]).rstrip("/")
+            clone = self.namer(target, targets)
+            folder = f"{base}/{clone}/{str(self.cfg.get('dir_name') or DEFAULT_HUBCFG['dir_name']).strip('/')}"
+            script = (self.SCRIPT.replace("@@SRC@@", shlex.quote(src))
+                                 .replace("@@DIR@@", shlex.quote(folder))
+                                 .replace("@@GLOB@@", shlex.quote(str(self.cfg.get("file_glob") or DEFAULT_HUBCFG["file_glob"]))))
+            res = self.shell.root(script, timeout=25)
+            out = (res.stdout or "") + "\n" + (res.stderr or "")
+            m = re.search(r"HUBCFG_OK found=(\d+) written=(\d+)", out)
+            if res.returncode != 0 or not m:
+                err = re.search(r"HUBCFG_ERR (.+)", out)
+                msg = err.group(1).strip() if err else (out.strip()[-200:] or f"exit code {res.returncode}")
+                self.log.log(f"{target.label}: hub config FAILED: {msg}")
+                return False, msg
+            found, written = int(m.group(1)), int(m.group(2))
+            tag = f"[sea {sea} from {sea_src}: {how}]"
+            if found == 0:
+                msg = (f"no config file yet in {folder} (matching {self.cfg.get('file_glob')}); the hub creates it after its first "
+                       f"load, it will be applied at the next relaunch {tag}")
+            elif written:
+                msg = f"written into {written} of {found} file(s) in {folder} {tag}"
+            else:
+                msg = f"already identical ({found} file(s)) {tag}"
+            if written or getattr(target, "_hubcfg_last", "") != msg:
+                target._hubcfg_last = msg
+                self.log.log(f"{target.label}: hub config: {msg}")
+            return True, msg
+        except Exception as e:
+            self.log.log(f"{target.label}: hub config error: {type(e).__name__}: {e}")
+            return False, f"{type(e).__name__}: {e}"
+
+
 # ============================================================================
 # Trade proof recorder (v4.x, built in).
 # LocalTrader signals "start" (confirm stage) and "done" (trade complete) over
@@ -1442,6 +1698,7 @@ class Watchdog:
         soft_return: bool = False,
         autoexec: Optional[dict] = None,
         proof: Optional[dict] = None,
+        hubcfg: Optional[dict] = None,
     ):
         self.targets = targets
         self.interval_sec = max(5, int(interval_sec))
@@ -1467,6 +1724,8 @@ class Watchdog:
         self.pending_snapshots: List[Tuple[float, str, int]] = []
         self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
         self.autoexec = AutoexecInstaller(self.shell, logger, autoexec)
+        self.hubcfg = HubConfigInstaller(self.shell, logger, hubcfg, self.autoexec.clone_name_for,
+                                         lambda t: resolve_sea(t, getattr(t, "_hub_sea", 0)))
         try:
             self.headless = not sys.stdout.isatty()
         except Exception:
@@ -1491,6 +1750,13 @@ class Watchdog:
             self.autoexec.ensure(t, self.targets, force=force)
         except Exception as e:
             self.log.log(f"{t.label}: autoexec check failed: {e}")
+
+    def ensure_hubcfg(self, t: Target) -> None:
+        """Call right after a clone was force-stopped and before it is launched. Best-effort, never raises."""
+        try:
+            self.hubcfg.apply(t, self.targets)
+        except Exception as e:
+            self.log.log(f"{t.label}: hub config check failed: {e}")
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
@@ -1832,6 +2098,10 @@ class Watchdog:
                 version = int(data.get("version", 0) or 0)
                 req = data.get("request") or {}
                 t.hub_request = req if isinstance(req, dict) else {}
+                try:
+                    t._hub_sea = int(data.get("sea", 0) or 0)      # hub.py v2.9.5+; older hubs send nothing
+                except (TypeError, ValueError):
+                    t._hub_sea = 0
                 t.hub_request_id = str(req.get("request_id", "")) if isinstance(req, dict) else ""
 
                 # Keep LocalTrader_Hub.json current even when only the request
@@ -1933,6 +2203,7 @@ class Watchdog:
         self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
         self.prepare_stop(t, "ENTER_TRADING")
         self.controller.force_stop(t)
+        self.ensure_hubcfg(t)
         time.sleep(1)
         ok = self.controller.launch_trading(t, self.trading_share_link)
         self.last_launch_any = time.time()
@@ -1961,6 +2232,7 @@ class Watchdog:
         else:
             self.prepare_stop(t, "RETURN_TO_FARMING")
             self.controller.force_stop(t)
+            self.ensure_hubcfg(t)
             time.sleep(1)
         ok = self.controller.launch(t)
         self.last_launch_any = time.time()
@@ -2070,6 +2342,7 @@ class Watchdog:
         self.wake()
         self.prepare_stop(t, f"RESTART ({reason})")
         self.controller.force_stop(t)
+        self.ensure_hubcfg(t)
         time.sleep(2.5)
         if t.hub_state == "TRADING":
             ok = self.controller.launch_trading(t, self.trading_share_link)
@@ -2552,6 +2825,7 @@ class App:
         self.hub_poll_sec = DEFAULT_HUB_POLL_SEC
         self.autoexec = dict(DEFAULT_AUTOEXEC)
         self.proof = dict(DEFAULT_PROOF)
+        self.hubcfg = dict(DEFAULT_HUBCFG)
         self.load()
 
     def load(self) -> None:
@@ -2568,6 +2842,7 @@ class App:
             self.trading_share_link = c.get("trading_share_link", DEFAULT_TRADING_SHARE_LINK)
             self.autoexec = {**DEFAULT_AUTOEXEC, **(c.get("autoexec") or {})}
             self.proof = {**DEFAULT_PROOF, **(c.get("proof") or {})}
+            self.hubcfg = {**DEFAULT_HUBCFG, **(c.get("hubcfg") or {})}
             hub = c.get("hub", {}) or {}
             self.hub_url = str(hub.get("url", ""))
             self.hub_token = str(hub.get("token", ""))
@@ -2587,6 +2862,7 @@ class App:
             "trading_share_link": self.trading_share_link,
             "autoexec": self.autoexec,
             "proof": self.proof,
+            "hubcfg": self.hubcfg,
             "hub": {
                 "url": self.hub_url,
                 "token": self.hub_token,
@@ -2869,6 +3145,7 @@ class App:
             self.soft_return,
             self.autoexec,
             self.proof,
+            self.hubcfg,
         )
 
         def sigint(_sig, _frame):
@@ -2932,6 +3209,52 @@ class App:
                         continue
                     ok, msg = inst.ensure(t, self.targets, force=True) if choice == "i" else inst.remove(t, self.targets)
                     print(f"  {'OK ' if ok else 'FAIL'} {t.label}: {msg}")
+                input("\nPress Enter...")
+
+    def make_hubcfg(self) -> "HubConfigInstaller":
+        hub = HubClient(self.hub_url, self.hub_token, self.logger)
+
+        def sea_fn(t: Target) -> Tuple[int, str]:
+            hs = 0
+            if hub.enabled:
+                try:
+                    hs = int(hub.poll(t).get("sea", 0) or 0)
+                except Exception:
+                    hs = 0
+            return resolve_sea(t, hs)
+        return HubConfigInstaller(self.shell, self.logger, self.hubcfg,
+                                  AutoexecInstaller(self.shell, self.logger, self.autoexec).clone_name_for, sea_fn)
+
+    def hubcfg_menu(self) -> None:
+        inst = self.make_hubcfg()
+        while True:
+            inst.cfg = {**DEFAULT_HUBCFG, **self.hubcfg}
+            clear_screen()
+            print("QUANTUM ONYX HUB CONFIG")
+            print("=" * 70)
+            print(f"Status   : {'ON' if inst.enabled else 'OFF'}  (applied before every (re)launch of a clone)")
+            print(f"Sea 2 link : {inst.cfg['url_sea2'] or '(none)'}")
+            print(f"Sea 1      : {inst.cfg['url_sea1'] or 'Sea 2 file + sea1_overrides (watchdog_config.json -> hubcfg)'}")
+            print(f"Fallback   : {inst.template_path()}")
+            print(f"Right now  : {inst.template_problem() or 'a usable config is available'}")
+            print(f"Target   : <clone>/{inst.cfg['dir_name']}/{inst.cfg['file_glob']}")
+            print()
+            print("a = apply to every clone NOW (best when the clones are stopped: a running hub can overwrite it again)")
+            print("t = switch on/off     b = back")
+            choice = input("\n> ").strip().lower()
+            if choice == "b":
+                return
+            if choice == "t":
+                self.hubcfg["enabled"] = not inst.enabled
+                self.save()
+            elif choice == "a":
+                if not inst.enabled:
+                    print("Switched off (press t first).")
+                for t in self.targets:
+                    if not t.enabled:
+                        continue
+                    ok, msg = inst.apply(t, self.targets)
+                    print(f"  {'OK  ' if ok else 'FAIL'} {t.label}: {msg}")
                 input("\nPress Enter...")
 
     def proof_menu(self) -> None:
@@ -3029,12 +3352,54 @@ class App:
         else:
             notes.append("No /data/adb/service.d here: it will not start by itself after a reboot "
                          "(run this install again after rebooting).")
-        self.shell.root(
-            f"export {env}; if command -v setsid >/dev/null 2>&1; then "
-            f"setsid sh {SUP_TARGET} >/dev/null 2>&1 & else nohup sh {SUP_TARGET} >/dev/null 2>&1 & fi",
-            timeout=15)
+        notes.append(self.start_supervisor_process())
         time.sleep(2.5)
         return "\n".join(notes) + "\n" + self.supervisor_status()
+
+    def start_supervisor_process(self) -> str:
+        """Start rw_supervisor.sh as a long-lived `su` child of this process.
+
+        A `su -c "... &"` that returns is killed on this phone, so `su` itself must stay alive.
+        The child gets its own session (survives closing the Termux window) and writes to supervisor_launch.log.
+        """
+        name = os.path.basename(os.path.abspath(__file__))
+        inner = f"RW_DIR={shlex.quote(BASE_DIR)} RW_SCRIPT={shlex.quote(name)} sh {SUP_TARGET}"
+        cmd = inner if self.shell.is_root() else "su -c " + shlex.quote(inner)
+        logp = os.path.join(BASE_DIR, "supervisor_launch.log")
+        try:
+            with open(logp, "ab") as out:
+                subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                 start_new_session=True)
+            return f"Supervisor launch sent (errors, if any, go to {logp})."
+        except Exception as e:
+            return f"Could not start the supervisor: {type(e).__name__}: {e}"
+        finally:
+            _resane_tty()
+
+    def install_boot_script(self) -> str:
+        """Write ~/.termux/boot/rw.sh for the Termux:Boot app."""
+        home = os.path.expanduser("~")
+        d = os.path.join(home, ".termux", "boot")
+        path = os.path.join(d, "rw.sh")
+        name = os.path.basename(os.path.abspath(__file__))
+        text = (
+            "#!/data/data/com.termux/files/usr/bin/sh\n"
+            "# written by rw.py install-boot: starts the supervisor (which starts the watchdog) after a phone restart\n"
+            "termux-wake-lock\n"
+            "sleep 45\n"
+            f"cd {shlex.quote(BASE_DIR)} || exit 1\n"
+            f"{shlex.quote(sys.executable)} {shlex.quote(name)} install-supervisor >> boot.log 2>&1\n"
+        )
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.chmod(path, 0o755)
+        except Exception as e:
+            return f"Could not write {path}: {type(e).__name__}: {e}"
+        return (f"Written: {path}\n"
+                "Install the Termux:Boot app (same source as Termux) and OPEN IT ONCE, otherwise Android never runs this file.\n"
+                "Also: Termux battery = Unrestricted, and root for Termux set to always allow.")
 
     def supervisor_stop(self) -> str:
         self.shell.root(f"touch {shlex.quote(os.path.join(BASE_DIR, 'supervisor.stop'))}", timeout=10)
@@ -3057,7 +3422,7 @@ class App:
             print()
             print(self.supervisor_status())
             print()
-            print("i = install / start now   x = stop supervisor   l = write rwproof.lua   b = back")
+            print("i = install / start now   x = stop supervisor   t = write Termux:Boot script   l = write rwproof.lua   b = back")
             choice = input("\n> ").strip().lower()
             if choice == "b":
                 return
@@ -3066,6 +3431,9 @@ class App:
                 input("\nPress Enter...")
             elif choice == "x":
                 print("\n" + self.supervisor_stop())
+                input("\nPress Enter...")
+            elif choice == "t":
+                print("\n" + self.install_boot_script())
                 input("\nPress Enter...")
             elif choice == "l":
                 print("\nWritten: " + self.write_lua_helper())
@@ -3097,6 +3465,7 @@ class App:
             print("11. LocalTrader autoexec (install / check / remove / on-off / URL)")
             print("12. Trade proof recorder (video of each trade)")
             print("13. Auto-restart supervisor / Lua helper")
+            print("14. Quantum Onyx Hub config (one template for every clone)")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -3146,6 +3515,8 @@ class App:
                 self.proof_menu()
             elif choice == "13":
                 self.supervisor_menu()
+            elif choice == "14":
+                self.hubcfg_menu()
             elif choice == "0":
                 return
 
@@ -3205,6 +3576,18 @@ def main() -> int:
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     if cmd == "watch":
         return watch_screen()
+    if cmd == "hubcfg":
+        app = App()
+        inst = app.make_hubcfg()
+        bad = inst.template_problem()
+        if bad:
+            print(bad)
+            return 1
+        for t in app.targets:
+            if t.enabled:
+                ok, msg = inst.apply(t, app.targets)
+                print(f"{'OK  ' if ok else 'FAIL'} {t.label}: {msg}")
+        return 0
     if cmd == "probe":
         app = App()
         script = ('for f in "/storage/emulated/0"/RobloxClone*/"Arceus X"/Workspace/LocalTrader_ItemProbe.txt; do '
@@ -3220,7 +3603,7 @@ def main() -> int:
         print(text)
         print(f"\nSaved to {out}")
         return 0
-    if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "lua"):
+    if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "install-boot", "lua"):
         app = App()
         if cmd == "install-supervisor":
             print(app.supervisor_install())
@@ -3228,6 +3611,8 @@ def main() -> int:
             print(app.supervisor_status())
         elif cmd == "supervisor-stop":
             print(app.supervisor_stop())
+        elif cmd == "install-boot":
+            print(app.install_boot_script())
         else:
             path = app.write_lua_helper()
             print(f"Written: {path}\n")
