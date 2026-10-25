@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.6 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.8 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,20 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.8
+#   - FIX: accounts on DIFFERENT phones were fused into one on the Hub. The Hub account id was a hash of "<package>:<Android uid>",
+#     and two phones with the same clone package names installed in the same order have the same uid, so they got the same id.
+#     New: a per-phone device name (watchdog_config.json -> "device_id", set with `python3 rw.py device-id <name>`) is mixed into the
+#     hash and shown in front of the label on the dashboard. Without a device name nothing changes, so existing phones keep their
+#     ids and history. Set it on the phone(s) that collide - ideally every phone except the oldest one.
+#
+# v4.7
+#   - ADD: first launch of a NEW clone. The Quantum Onyx Hub folder and its file only exist after the script has run once, so the
+#     template cannot be put there beforehand. The watchdog now remembers such a clone ("pending"); once the clone has been up
+#     for 90 s it looks (quietly, once a minute) for the file, and as soon as it exists and differs from the template it restarts
+#     that clone ONCE (stop -> write the config -> launch), instead of waiting for the next scheduled rejoin (up to 45 min).
+#     Never during TRADING, and never more than one restart per clone per run for this reason.
 #
 # v4.6
 #   - ADD: the hub config now comes from a link (hubcfg.url_sea2 = your repo's qntmcfgsea2.json), cached next to this script
@@ -258,7 +272,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.6"
+VERSION = "4.8"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -394,10 +408,17 @@ def parse_private_link(value: str) -> str:
     return ""
 
 
+DEVICE_ID = ""        # v4.8: this phone's name, set from watchdog_config.json before any Target is built
+
+
+def clean_device_id(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(text or ""))[:20]
+
+
 def account_id_for_target(t: "Target") -> str:
     if t.hub_id:
         return t.hub_id
-    raw = f"{t.package}:{t.user_id}".encode("utf-8")
+    raw = (f"{DEVICE_ID}:{t.package}:{t.user_id}" if DEVICE_ID else f"{t.package}:{t.user_id}").encode("utf-8")
     return "rbx-" + hashlib.sha1(raw).hexdigest()[:12]
 
 
@@ -719,7 +740,7 @@ class HubClient:
             "account_id": t.hub_id,
             "package": t.package,
             "user_id": t.user_id,
-            "label": t.label,
+            "label": (f"{DEVICE_ID}:{t.label}" if DEVICE_ID else t.label),
             "status": status,
             "mode": mode,
         })
@@ -1109,7 +1130,7 @@ class HubConfigInstaller:
     so it can only be EDITED once the hub has created it (first launch); a clone without that file yet is picked up at its next relaunch.
     """
     SCRIPT = r'''
-src=@@SRC@@; d=@@DIR@@; g=@@GLOB@@
+src=@@SRC@@; d=@@DIR@@; g=@@GLOB@@; dry=@@DRY@@
 [ -r "$src" ] || { echo "HUBCFG_ERR template not readable: $src" >&2; exit 2; }
 [ -d "$d" ] || { echo "HUBCFG_OK found=0 written=0 nodir"; exit 0; }
 n=0; w=0
@@ -1117,6 +1138,7 @@ for f in "$d"/$g; do
   [ -f "$f" ] || continue
   n=$((n+1))
   if cmp -s "$src" "$f"; then continue; fi
+  if [ "$dry" = 1 ]; then w=$((w+1)); continue; fi
   tmp="$f.rwtmp"
   { cp "$src" "$tmp" && mv -f "$tmp" "$f"; } || { rm -f "$tmp"; echo "HUBCFG_ERR write failed: $f" >&2; exit 4; }
   chmod 666 "$f" 2>/dev/null
@@ -1127,8 +1149,10 @@ exit 0
 '''
 
     def __init__(self, shell: Shell, logger: Logger, cfg: Optional[dict], namer: Callable[..., str],
-                 sea_fn: Optional[Callable[["Target"], Tuple[int, str]]] = None):
+                 sea_fn: Optional[Callable[["Target"], Tuple[int, str]]] = None,
+                 quiet_run: Optional[Callable[[str, int], str]] = None):
         self.shell = shell
+        self.quiet_run = quiet_run     # runs a root script WITHOUT writing it to watchdog.log; returns stdout (+ "ERR ..." lines)
         self.log = logger
         self.cfg = {**DEFAULT_HUBCFG, **(cfg or {})}
         self.namer = namer
@@ -1251,6 +1275,22 @@ exit 0
         path, how = self.base_config(str(self.cfg.get("url_sea2") or "").strip(), "hubcfg_cache_sea2.json")
         return "" if path else how
 
+    def _run(self, script: str, timeout: int) -> Tuple[int, str]:
+        if self.quiet_run:
+            out = self.quiet_run(script, timeout)
+            return (0 if "HUBCFG_OK" in out else 1), out
+        res = self.shell.root(script, timeout=timeout)
+        return res.returncode, (res.stdout or "") + "\n" + (res.stderr or "")
+
+    def pending_check(self, target: "Target", targets: List["Target"]) -> Tuple[int, int]:
+        """Quiet, read-only: (config files found in the clone, how many of them differ from what apply() would write)."""
+        sea, _src = self.sea_fn(target)
+        src, _how = self.source_for(sea)
+        if not src:
+            return 0, 0
+        ok, msg, found, written = self._apply_inner(target, targets, src, sea, "", dry=True)
+        return found, written
+
     def apply(self, target: "Target", targets: List["Target"]) -> Tuple[bool, str]:
         """Never raises. Returns (ok, message)."""
         if not self.enabled:
@@ -1263,36 +1303,44 @@ exit 0
                     target._hubcfg_last = how
                     self.log.log(f"{target.label}: hub config NOT applied: {how}")
                 return False, how
-            base = str(self.cfg.get("base_dir") or DEFAULT_HUBCFG["base_dir"]).rstrip("/")
-            clone = self.namer(target, targets)
-            folder = f"{base}/{clone}/{str(self.cfg.get('dir_name') or DEFAULT_HUBCFG['dir_name']).strip('/')}"
-            script = (self.SCRIPT.replace("@@SRC@@", shlex.quote(src))
-                                 .replace("@@DIR@@", shlex.quote(folder))
-                                 .replace("@@GLOB@@", shlex.quote(str(self.cfg.get("file_glob") or DEFAULT_HUBCFG["file_glob"]))))
-            res = self.shell.root(script, timeout=25)
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            m = re.search(r"HUBCFG_OK found=(\d+) written=(\d+)", out)
-            if res.returncode != 0 or not m:
-                err = re.search(r"HUBCFG_ERR (.+)", out)
-                msg = err.group(1).strip() if err else (out.strip()[-200:] or f"exit code {res.returncode}")
-                self.log.log(f"{target.label}: hub config FAILED: {msg}")
-                return False, msg
-            found, written = int(m.group(1)), int(m.group(2))
             tag = f"[sea {sea} from {sea_src}: {how}]"
-            if found == 0:
-                msg = (f"no config file yet in {folder} (matching {self.cfg.get('file_glob')}); the hub creates it after its first "
-                       f"load, it will be applied at the next relaunch {tag}")
-            elif written:
-                msg = f"written into {written} of {found} file(s) in {folder} {tag}"
-            else:
-                msg = f"already identical ({found} file(s)) {tag}"
-            if written or getattr(target, "_hubcfg_last", "") != msg:
+            ok, msg, found, written = self._apply_inner(target, targets, src, sea, tag, dry=False)
+            target._hubcfg_pending = bool(ok and found == 0)       # the hub has not made its file yet: watch for it
+            if ok and (written or getattr(target, "_hubcfg_last", "") != msg):
                 target._hubcfg_last = msg
                 self.log.log(f"{target.label}: hub config: {msg}")
-            return True, msg
+            return ok, msg
         except Exception as e:
             self.log.log(f"{target.label}: hub config error: {type(e).__name__}: {e}")
             return False, f"{type(e).__name__}: {e}"
+
+
+    def _apply_inner(self, target, targets, src: str, sea: int, tag: str, dry: bool):
+        """Run the copy script for one clone. Returns (ok, message, files found, files written / that would be written)."""
+        base = str(self.cfg.get("base_dir") or DEFAULT_HUBCFG["base_dir"]).rstrip("/")
+        clone = self.namer(target, targets)
+        folder = f"{base}/{clone}/{str(self.cfg.get('dir_name') or DEFAULT_HUBCFG['dir_name']).strip('/')}"
+        script = (self.SCRIPT.replace("@@SRC@@", shlex.quote(src))
+                             .replace("@@DIR@@", shlex.quote(folder))
+                             .replace("@@GLOB@@", shlex.quote(str(self.cfg.get("file_glob") or DEFAULT_HUBCFG["file_glob"])))
+                             .replace("@@DRY@@", "1" if dry else "0"))
+        rc, out = self._run(script, 25)
+        m = re.search(r"HUBCFG_OK found=(\d+) written=(\d+)", out)
+        if rc != 0 or not m:
+            err = re.search(r"HUBCFG_ERR (.+)", out)
+            msg = err.group(1).strip() if err else (out.strip()[-200:] or f"exit code {rc}")
+            if not dry:
+                self.log.log(f"{target.label}: hub config FAILED: {msg}")
+            return False, msg, 0, 0
+        found, written = int(m.group(1)), int(m.group(2))
+        if found == 0:
+            msg = (f"no config file yet in {folder} (matching {self.cfg.get('file_glob')}); the hub creates it after its first "
+                   f"load, the clone will be restarted once when it shows up {tag}")
+        elif written:
+            msg = f"written into {written} of {found} file(s) in {folder} {tag}"
+        else:
+            msg = f"already identical ({found} file(s)) {tag}"
+        return True, msg, found, written
 
 
 # ============================================================================
@@ -1725,7 +1773,8 @@ class Watchdog:
         self._act_cache: Tuple[float, Optional[set]] = (0.0, None)
         self.autoexec = AutoexecInstaller(self.shell, logger, autoexec)
         self.hubcfg = HubConfigInstaller(self.shell, logger, hubcfg, self.autoexec.clone_name_for,
-                                         lambda t: resolve_sea(t, getattr(t, "_hub_sea", 0)))
+                                         lambda t: resolve_sea(t, getattr(t, "_hub_sea", 0)),
+                                         lambda script, timeout: self._rec_shell(script, timeout=timeout))
         try:
             self.headless = not sys.stdout.isatty()
         except Exception:
@@ -1757,6 +1806,38 @@ class Watchdog:
             self.hubcfg.apply(t, self.targets)
         except Exception as e:
             self.log.log(f"{t.label}: hub config check failed: {e}")
+
+    HUBCFG_FIRST_GRACE_SEC = 90       # the hub needs this long after a launch to create its folder and file
+    HUBCFG_CHECK_EVERY_SEC = 60
+
+    def check_hubcfg_pending(self, t: Target) -> bool:
+        """A clone whose hub file did not exist at its last launch: once the file shows up, restart the clone ONCE so it loads
+        the template. Returns True if it restarted the clone."""
+        if not (self.hubcfg.enabled and getattr(t, "_hubcfg_pending", False)) or t.hub_state == "TRADING":
+            return False
+        now = time.time()
+        if not t.last_launch or now - t.last_launch < self.HUBCFG_FIRST_GRACE_SEC:
+            return False
+        if now - getattr(t, "_hubcfg_checked", 0.0) < self.HUBCFG_CHECK_EVERY_SEC:
+            return False
+        t._hubcfg_checked = now
+        try:
+            found, differs = self.hubcfg.pending_check(t, self.targets)
+        except Exception as e:
+            self.log.log(f"{t.label}: hub config check failed: {e}")
+            return False
+        if found == 0:
+            return False
+        t._hubcfg_pending = False              # the file exists now: this check is done either way
+        if differs == 0:
+            self.log.log(f"{t.label}: hub config file appeared and already matches; nothing to do")
+            return False
+        if now - self.last_launch_any < self.LAUNCH_STAGGER_SEC:
+            t._hubcfg_pending = True           # another clone is starting right now: try again next time
+            return False
+        self.log.log(f"{t.label}: the hub created its config file on the first launch; restarting this clone once to load the template")
+        self.restart(t, "first launch: loading the Quantum config")
+        return True
 
     def mode(self, t: Target) -> str:
         return "TRADING" if t.hub_state == "TRADING" else "FARMING"
@@ -2455,6 +2536,10 @@ class Watchdog:
             self.heartbeat(t)
             return
 
+        if self.check_hubcfg_pending(t):
+            self.heartbeat(t)
+            return
+
         if self.crash_restart_enabled:
             state = self.health(t)
             if (state in ("hung", "dialog")
@@ -2826,6 +2911,7 @@ class App:
         self.autoexec = dict(DEFAULT_AUTOEXEC)
         self.proof = dict(DEFAULT_PROOF)
         self.hubcfg = dict(DEFAULT_HUBCFG)
+        self.device_id = ""
         self.load()
 
     def load(self) -> None:
@@ -2834,6 +2920,9 @@ class App:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 c = json.load(f)
+            global DEVICE_ID
+            self.device_id = clean_device_id(c.get("device_id", ""))
+            DEVICE_ID = self.device_id                 # before the Targets below are built
             self.interval_sec = int(c.get("check_interval_sec", 20))
             self.hang_sec = int(c.get("hang_detection_sec", 90))
             self.crash_restart_enabled = bool(c.get("crash_restart_enabled", False))
@@ -2854,6 +2943,7 @@ class App:
     def save(self) -> None:
         data = {
             "version": VERSION,
+            "device_id": self.device_id,
             "check_interval_sec": self.interval_sec,
             "hang_detection_sec": self.hang_sec,
             "crash_restart_enabled": self.crash_restart_enabled,
@@ -3211,6 +3301,34 @@ class App:
                     print(f"  {'OK ' if ok else 'FAIL'} {t.label}: {msg}")
                 input("\nPress Enter...")
 
+    def set_device_id(self, name: str) -> str:
+        """Give this phone a name and re-derive the auto-made Hub ids (rbx-<12 hex>) of every instance from it."""
+        global DEVICE_ID
+        new = clean_device_id(name)
+        if not new:
+            return "Use letters, digits, - or _ (max 20), for example:  python3 rw.py device-id phone2"
+        old_dev = self.device_id
+        lines = []
+        for t in self.targets:
+            if not re.fullmatch(r"rbx-[0-9a-f]{12}", t.hub_id or ""):
+                lines.append(f"  {t.label}: keeps its own custom id {t.hub_id!r}")
+                continue
+            DEVICE_ID = old_dev
+            was = account_id_for_target(Target(package=t.package, user_id=t.user_id))
+            DEVICE_ID = new
+            now = account_id_for_target(Target(package=t.package, user_id=t.user_id))
+            if t.hub_id in (was, now):
+                lines.append(f"  {t.label}: {t.hub_id} -> {now}")
+                t.hub_id = now
+            else:
+                lines.append(f"  {t.label}: id {t.hub_id!r} was not made from package+uid, left alone")
+        self.device_id = DEVICE_ID = new
+        self.save()
+        return (f"This phone is now called {new!r}. New Hub ids:\n" + "\n".join(lines) +
+                "\n\nThe Hub will list these as NEW accounts (its old, fused entry stays until you delete it on the dashboard).\n"
+                "Restart the watchdog (supervisor-stop, wait 20 s, install-supervisor) and relaunch the clones once so the\n"
+                "in-game script picks up its new account id.")
+
     def make_hubcfg(self) -> "HubConfigInstaller":
         hub = HubClient(self.hub_url, self.hub_token, self.logger)
 
@@ -3466,6 +3584,7 @@ class App:
             print("12. Trade proof recorder (video of each trade)")
             print("13. Auto-restart supervisor / Lua helper")
             print("14. Quantum Onyx Hub config (one template for every clone)")
+            print(f"15. Phone name for the Hub ({self.device_id or 'not set'}) - needed when two phones fuse into one")
             print("0. Exit")
             choice = input("\n> ").strip()
             if choice == "1":
@@ -3517,6 +3636,10 @@ class App:
                 self.supervisor_menu()
             elif choice == "14":
                 self.hubcfg_menu()
+            elif choice == "15":
+                name = self.ask("Phone name (letters/digits, e.g. phone2)", self.device_id)
+                print("\n" + self.set_device_id(name))
+                input("\nPress Enter...")
             elif choice == "0":
                 return
 
@@ -3576,6 +3699,16 @@ def main() -> int:
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     if cmd == "watch":
         return watch_screen()
+    if cmd == "device-id":
+        app = App()
+        if len(sys.argv) > 2:
+            print(app.set_device_id(sys.argv[2]))
+        else:
+            print(f"device id: {app.device_id or '(not set)'}")
+            for t in app.targets:
+                print(f"  {t.label}: {t.hub_id}")
+            print("Set one with:  python3 rw.py device-id <name>   (use it on every phone except your oldest one)")
+        return 0
     if cmd == "hubcfg":
         app = App()
         inst = app.make_hubcfg()
