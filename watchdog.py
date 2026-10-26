@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.8 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.9 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,11 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.9
+#   - ADD: `python3 rw.py stop` stops EVERYTHING: the supervisor first (so it cannot restart anything), then the watchdog (kill, and
+#     kill -9 after 15 s if needed), as root, and prints what it did. `supervisor-stop` only ever stopped the supervisor - rw.py kept
+#     running - and its message now says so. Menu 13 -> x does the full stop too.
 #
 # v4.8
 #   - FIX: accounts on DIFFERENT phones were fused into one on the Hub. The Hub account id was a hash of "<package>:<Android uid>",
@@ -272,7 +277,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.8"
+VERSION = "4.9"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -3521,7 +3526,42 @@ class App:
 
     def supervisor_stop(self) -> str:
         self.shell.root(f"touch {shlex.quote(os.path.join(BASE_DIR, 'supervisor.stop'))}", timeout=10)
-        return "Stop requested - the supervisor exits within ~15 s (the watchdog itself keeps running)."
+        return ("Stop requested - the SUPERVISOR exits within ~15 s. rw.py itself keeps running (that is normal).\n"
+                "To stop everything use:  python3 rw.py stop")
+
+    STOP_ALL_SCRIPT = r'''
+APPDIR=@@APPDIR@@; SCRIPT=@@SCRIPT@@; PIDFILE=@@PIDFILE@@
+alive() { [ -d "/proc/$1" ] && ! grep -q '^State:.*Z' "/proc/$1/status" 2>/dev/null; }
+touch "$APPDIR/supervisor.stop"
+i=0
+while [ $i -lt 20 ]; do
+  sp=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$sp" ] && alive "$sp"; then sleep 1; i=$((i+1)); else break; fi
+done
+sp=$(cat "$PIDFILE" 2>/dev/null)
+if [ -n "$sp" ] && alive "$sp"; then kill "$sp" 2>/dev/null; echo "supervisor: did not react to the stop file, killed (pid $sp)"; else echo "supervisor: stopped"; fi
+rm -f "$APPDIR/supervisor.stop"
+wd=$(head -n1 "$APPDIR/watchdog.lock" 2>/dev/null | tr -dc 0-9)
+if [ -n "$wd" ] && [ -r "/proc/$wd/cmdline" ] && tr '\0' ' ' < "/proc/$wd/cmdline" | grep -q "$SCRIPT"; then
+  kill "$wd" 2>/dev/null
+  j=0
+  while [ $j -lt 15 ] && alive "$wd"; do sleep 1; j=$((j+1)); done
+  if alive "$wd"; then kill -9 "$wd" 2>/dev/null; sleep 1; echo "watchdog: still alive after 15 s, killed with -9 (pid $wd)"; else echo "watchdog: stopped (pid $wd)"; fi
+else
+  echo "watchdog: not running"
+fi
+'''
+
+    def stop_all(self) -> str:
+        """Stop the supervisor FIRST (otherwise it restarts the watchdog), then the watchdog. Needs root."""
+        if not self.shell.has_root_access():
+            return "Root (su) is not available - nothing was stopped."
+        name = os.path.basename(os.path.abspath(__file__))
+        script = (self.STOP_ALL_SCRIPT.replace("@@APPDIR@@", shlex.quote(BASE_DIR))
+                                      .replace("@@SCRIPT@@", shlex.quote(name))
+                                      .replace("@@PIDFILE@@", shlex.quote(SUP_PIDFILE)))
+        out = self.shell.root_out(script, timeout=60)
+        return (out or "(no answer from su)") + "\n\nStart it again with:  python3 rw.py install-supervisor"
 
     def write_lua_helper(self) -> str:
         path = os.path.join(BASE_DIR, "rwproof.lua")
@@ -3540,7 +3580,7 @@ class App:
             print()
             print(self.supervisor_status())
             print()
-            print("i = install / start now   x = stop supervisor   t = write Termux:Boot script   l = write rwproof.lua   b = back")
+            print("i = install / start now   x = STOP EVERYTHING (supervisor + watchdog)   t = write Termux:Boot script   l = write rwproof.lua   b = back")
             choice = input("\n> ").strip().lower()
             if choice == "b":
                 return
@@ -3548,7 +3588,7 @@ class App:
                 print("\n" + self.supervisor_install())
                 input("\nPress Enter...")
             elif choice == "x":
-                print("\n" + self.supervisor_stop())
+                print("\n" + self.stop_all())
                 input("\nPress Enter...")
             elif choice == "t":
                 print("\n" + self.install_boot_script())
@@ -3736,7 +3776,7 @@ def main() -> int:
         print(text)
         print(f"\nSaved to {out}")
         return 0
-    if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "install-boot", "lua"):
+    if cmd in ("install-supervisor", "supervisor-status", "supervisor-stop", "stop", "install-boot", "lua"):
         app = App()
         if cmd == "install-supervisor":
             print(app.supervisor_install())
@@ -3744,6 +3784,8 @@ def main() -> int:
             print(app.supervisor_status())
         elif cmd == "supervisor-stop":
             print(app.supervisor_stop())
+        elif cmd == "stop":
+            print(app.stop_all())
         elif cmd == "install-boot":
             print(app.install_boot_script())
         else:
