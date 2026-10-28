@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.9 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.10 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,14 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.10
+#   - ADD: automatic Sea 1 -> Sea 2 config switch. The Quantum config used to be written only when a clone was launched, so an account
+#     that reached Sea 2 kept the Sea 1 farm settings until its next scheduled rejoin. Now, when the HUB reports a clone in a different
+#     config group than the one last applied (Sea 1 vs Sea 2/3) for 2 minutes in a row, the watchdog restarts that clone once
+#     (stop -> write the right config -> launch). Needs hub.py v2.9.5 (the sea is only trusted from the Hub, never from the Place ID).
+#     Not during TRADING, not within 5 minutes of a launch, at most one such restart per clone per 30 minutes.
+#     Switch off with hubcfg.restart_on_sea_change = false.
 #
 # v4.9
 #   - ADD: `python3 rw.py stop` stops EVERYTHING: the supervisor first (so it cannot restart anything), then the watchdog (kill, and
@@ -277,7 +285,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.9"
+VERSION = "4.10"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -323,6 +331,7 @@ DEFAULT_HUBCFG = {
     "url_sea2": "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/qntmcfgsea2.json",
     "url_sea1": "",                                       # empty = Sea 2 file + sea1_overrides below
     "refresh_min": 10,                                    # how often the link is downloaded again
+    "restart_on_sea_change": True,                        # restart a clone once when the Hub says it moved to another sea
     "sea1_overrides": {
         "AutoFarm": True,            # farm levels
         "FarmMode": "Quest",         # ...by quest
@@ -1311,6 +1320,9 @@ exit 0
             tag = f"[sea {sea} from {sea_src}: {how}]"
             ok, msg, found, written = self._apply_inner(target, targets, src, sea, tag, dry=False)
             target._hubcfg_pending = bool(ok and found == 0)       # the hub has not made its file yet: watch for it
+            if ok and found > 0:
+                target._hubcfg_sea = sea                           # which config this clone is running now
+                target._hubcfg_sea_src = sea_src
             if ok and (written or getattr(target, "_hubcfg_last", "") != msg):
                 target._hubcfg_last = msg
                 self.log.log(f"{target.label}: hub config: {msg}")
@@ -1842,6 +1854,45 @@ class Watchdog:
             return False
         self.log.log(f"{t.label}: the hub created its config file on the first launch; restarting this clone once to load the template")
         self.restart(t, "first launch: loading the Quantum config")
+        return True
+
+    SEA_SWITCH_DEBOUNCE_SEC = 120     # the Hub must report the new sea this long without interruption
+    SEA_SWITCH_MIN_UPTIME_SEC = 300   # never restart a clone that was launched less than this long ago
+    SEA_SWITCH_COOLDOWN_SEC = 1800    # at most one such restart per clone per this long
+
+    @staticmethod
+    def _cfg_group(sea: int) -> int:
+        return 1 if int(sea or 0) == 1 else 2        # Sea 3 uses the Sea 2 config
+
+    def check_sea_switch(self, t: Target) -> bool:
+        """The clone's config was written for one sea but the Hub now says it is in the other: restart it once so the hub script loads
+        the right file. Only the Hub's word counts (not the Place ID). Returns True if it restarted the clone."""
+        if not self.hubcfg.enabled or not self.hubcfg.cfg.get("restart_on_sea_change", True):
+            return False
+        applied = int(getattr(t, "_hubcfg_sea", 0) or 0)
+        hub_sea = int(getattr(t, "_hub_sea", 0) or 0)
+        if applied not in (1, 2, 3) or hub_sea not in (1, 2, 3) or getattr(t, "_hubcfg_pending", False):
+            t._sea_seen_since = 0.0
+            return False
+        if self._cfg_group(hub_sea) == self._cfg_group(applied):
+            t._sea_seen_since = 0.0
+            return False
+        now = time.time()
+        if not getattr(t, "_sea_seen_since", 0.0):
+            t._sea_seen_since = now                      # first moment the Hub disagrees with the applied config
+            return False
+        if t.hub_state == "TRADING" or now - t._sea_seen_since < self.SEA_SWITCH_DEBOUNCE_SEC:
+            return False
+        if not t.last_launch or now - t.last_launch < self.SEA_SWITCH_MIN_UPTIME_SEC:
+            return False
+        if now - getattr(t, "_sea_switch_at", 0.0) < self.SEA_SWITCH_COOLDOWN_SEC:
+            return False
+        if now - self.last_launch_any < self.LAUNCH_STAGGER_SEC:
+            return False
+        t._sea_switch_at = now
+        t._sea_seen_since = 0.0
+        self.log.log(f"{t.label}: the Hub says Sea {hub_sea}, the Quantum config on it is for Sea {applied}; restarting once to load the right one")
+        self.restart(t, f"Sea {applied} -> {hub_sea}: loading the matching Quantum config")
         return True
 
     def mode(self, t: Target) -> str:
@@ -2541,7 +2592,7 @@ class Watchdog:
             self.heartbeat(t)
             return
 
-        if self.check_hubcfg_pending(t):
+        if self.check_hubcfg_pending(t) or self.check_sea_switch(t):
             self.heartbeat(t)
             return
 
