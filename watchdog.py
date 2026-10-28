@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.10 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.11 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,11 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.11
+#   - REVERT: the Quantum config is no longer written before a TRADING launch (enter_trading is byte-for-byte the v4.2 sequence again:
+#     force-stop, 1 s, launch). The trading server does not use the farm config, and writing it there only risked the trading join.
+#     The config is still written before FARMING launches (restart, return to farming).
 #
 # v4.10
 #   - ADD: automatic Sea 1 -> Sea 2 config switch. The Quantum config used to be written only when a clone was launched, so an account
@@ -285,7 +290,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.10"
+VERSION = "4.11"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -2340,7 +2345,6 @@ class Watchdog:
         self.notify(t, t.status, "enter_trading", {"request_id": t.hub_request_id})
         self.prepare_stop(t, "ENTER_TRADING")
         self.controller.force_stop(t)
-        self.ensure_hubcfg(t)
         time.sleep(1)
         ok = self.controller.launch_trading(t, self.trading_share_link)
         self.last_launch_any = time.time()
