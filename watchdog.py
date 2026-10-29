@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# ROBLOX WATCHDOG v4.11 - interactive edition for Termux (rooted Android)
+# ROBLOX WATCHDOG v4.12 - interactive edition for Termux (rooted Android)
 # + optional Hub control for FARMING <-> TRADING transitions
 #
 # Hub connection model:
@@ -13,6 +13,11 @@
 # ----------------------------------------------------------------------------
 # CHANGELOG (newest first) - check this against what you expect to confirm
 # you actually pulled the latest version.
+#
+# v4.12
+#   - ADD: the Sea 1/Sea 2 config switch no longer fails silently. If a clone has been up for 10 minutes and the Hub still reports no
+#     sea for its account, watchdog.log says so (once per 30 min) with the likely reasons. `python3 rw.py hubcfg` now also prints each
+#     clone's Hub account id and what the Hub said, so a mismatch between the watchdog's id and the in-game script's id is visible.
 #
 # v4.11
 #   - REVERT: the Quantum config is no longer written before a TRADING launch (enter_trading is byte-for-byte the v4.2 sequence again:
@@ -290,7 +295,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-VERSION = "4.11"
+VERSION = "4.12"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "watchdog_config.json")
 LOG_PATH = os.path.join(BASE_DIR, "watchdog.log")
@@ -2244,6 +2249,12 @@ class Watchdog:
                     t._hub_sea = int(data.get("sea", 0) or 0)      # hub.py v2.9.5+; older hubs send nothing
                 except (TypeError, ValueError):
                     t._hub_sea = 0
+                if (not t._hub_sea and self.hubcfg.enabled and t.last_launch and time.time() - t.last_launch > 600
+                        and time.time() - getattr(t, "_nosea_logged", 0.0) > 1800):
+                    t._nosea_logged = time.time()
+                    self.log.log(f"{t.label}: the Hub reports NO sea for account {t.hub_id} - the Sea 1/Sea 2 config switch cannot work. "
+                                 f"Either hub.py is older than v2.9.5 (or was not restarted), or the in-game script reports under a "
+                                 f"different account id (relaunch the clone after a device-id change), or LocalTrader does not send the sea.")
                 t.hub_request_id = str(req.get("request_id", "")) if isinstance(req, dict) else ""
 
                 # Keep LocalTrader_Hub.json current even when only the request
@@ -3814,7 +3825,7 @@ def main() -> int:
         for t in app.targets:
             if t.enabled:
                 ok, msg = inst.apply(t, app.targets)
-                print(f"{'OK  ' if ok else 'FAIL'} {t.label}: {msg}")
+                print(f"{'OK  ' if ok else 'FAIL'} {t.label} (Hub id {t.hub_id}): {msg}")
         return 0
     if cmd == "probe":
         app = App()
