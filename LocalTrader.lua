@@ -2,6 +2,11 @@
 -- Requires an executor with readfile/loadstring or a runtime ItemIds table.
 -- No namecall hooks are used. Trade calls are made directly through the game's remotes.
 --
+-- v2.7: the ItemIds catalog is now read LIVE from the running game (ReplicatedStorage.Economy.ItemId.RawSource), so a game update that
+--        adds fruits / skins needs no new table. It is checked for the expected shape ([ItemId] = { IdType, StorageKey } with enough
+--        PhysicalFruit records) before it is used. If the game table cannot be read or looks wrong, the old order applies: your repo copy
+--        (CONFIG.ItemIdsUrl), then itemIds.lua in the executor workspace. The source that was used is written to the diagnostics log
+--        ("ItemIds source: ..."). Switch off with CONFIG.ItemIdsLive = false.
 -- v2.6: more skin fruits. Divine Portal, Glacier Eagle, Requiem Eagle, Pink Portal, Celestial Pain ... are ItemIds records of type
 --        "FruitWithSkin" (32 of them), a different type from the "PhysicalMoveset" skins of v2.5. They are accepted when the
 --        inventory entry's Type contains "Physical" (a stored, non-physical copy is not tradable). New CONFIG.SkinProbe writes
@@ -196,7 +201,9 @@ end
 
 local CONFIG = {
 	TablePath = {"Map", "Dressrosa", "TradeTable"},
-	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",
+	ItemIdsUrl = "https://raw.githubusercontent.com/korent-cmd/decrypted_fluent/refs/heads/main/itemIds.lua",  -- fallback when the live read fails
+	ItemIdsLive = true,           -- v2.7: read the item table from the running game first (ReplicatedStorage.Economy.ItemId.RawSource)
+	ItemIdsLiveWait = 20,         -- v2.7: seconds to wait for that module to appear before falling back to the repo copy
 	QuantumOnyxUrl = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua",
 	TradingJobId = "",
 	HandoffFile = "LocalTrader_V3_Handoff.json",
@@ -1038,25 +1045,135 @@ local function normalize(value)
 	return tostring(value or ""):lower():gsub("[%s%p]+", "")
 end
 
+-- v2.7: LIVE item table ---------------------------------------------------------------------------------------------------
+local ITEMIDS_MIN_ENTRIES = 300   -- fewer usable entries than this = not the item table
+local ITEMIDS_MIN_FRUITS = 10     -- the trade logic needs "PhysicalFruit" records; a table without them would silently break everything
+
+local function countKeys(t)
+	local n = 0
+	for _ in pairs(t) do n = n + 1 end
+	return n
+end
+
+-- Brings what RawSource returns into [ItemId] = { IdType, StorageKey } (a wrapper table or a list of rows is unpacked) and checks
+-- that it really is the item table. Returns the table and a short description, or nil and the reason.
+local function shapeItemIds(root)
+	if type(root) ~= "table" then
+		return nil, "not a table"
+	end
+	local data = root
+	if countKeys(data) < ITEMIDS_MIN_ENTRIES then
+		local best, bestN
+		for _, child in pairs(root) do
+			if type(child) == "table" then
+				local n = countKeys(child)
+				if n > (bestN or 0) then best, bestN = child, n end
+			end
+		end
+		if best and bestN >= ITEMIDS_MIN_ENTRIES then data = best end
+	end
+	local count = #data
+	if count > 0 and countKeys(data) == count and type(data[1]) == "table" and type(data[1][1]) == "number" and #data[1] >= 3 then
+		local shaped = {}
+		for _, row in ipairs(data) do
+			shaped[row[1]] = { row[2], row[3] }
+		end
+		data = shaped
+	end
+	local copy, total, fruits = {}, 0, 0
+	for id, rec in pairs(data) do
+		if type(id) == "number" and type(rec) == "table" and type(rec[1]) == "string" and type(rec[2]) == "string" then
+			copy[id] = rec
+			total = total + 1
+			if rec[1] == "PhysicalFruit" then fruits = fruits + 1 end
+		end
+	end
+	if total < ITEMIDS_MIN_ENTRIES or fruits < ITEMIDS_MIN_FRUITS then
+		return nil, string.format("unexpected shape (%d usable entries, %d PhysicalFruit records)", total, fruits)
+	end
+	return copy, string.format("%d entries, %d physical fruits", total, fruits)
+end
+
+local function findRawSourceModule()
+	local ok, mod = pcall(function() return ReplicatedStorage.Economy.ItemId.RawSource end)
+	if ok and typeof(mod) == "Instance" and mod:IsA("ModuleScript") then
+		return mod
+	end
+	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+		if d.Name == "RawSource" and d:IsA("ModuleScript") then
+			local p = d.Parent
+			while p and p ~= game do
+				if p.Name == "ItemId" then return d end
+				p = p.Parent
+			end
+		end
+	end
+	return nil
+end
+
+local function readLiveItemIds()
+	local deadline = os.clock() + (tonumber(CONFIG.ItemIdsLiveWait) or 20)
+	local mod
+	repeat
+		mod = findRawSourceModule()
+		if mod then break end
+		task.wait(1)
+	until os.clock() >= deadline
+	if not mod then
+		return nil, "ReplicatedStorage.Economy.ItemId.RawSource was not found"
+	end
+	local ok, result = pcall(require, mod)
+	local why = tostring(result)
+	if not (ok and type(result) == "table") and type(getrenv) == "function" then
+		local ok2, result2 = pcall(function() return getrenv().require(mod) end)
+		if ok2 and type(result2) == "table" then
+			ok, result = true, result2
+		else
+			why = why .. " / getrenv: " .. tostring(result2)
+		end
+	end
+	if not (ok and type(result) == "table") then
+		return nil, "require failed: " .. why
+	end
+	return shapeItemIds(result)
+end
+
+local ItemIdsSource = "none"
+
 local function loadItemIds()
 	if type(_G.ItemIds) == "table" then
+		ItemIdsSource = "_G.ItemIds"
 		return _G.ItemIds
 	end
 
+	-- 1. live from the running game
+	if CONFIG.ItemIdsLive ~= false then
+		local ok, data, info = pcall(readLiveItemIds)
+		if ok and data then
+			ItemIdsSource = "live game table (" .. tostring(info) .. ")"
+			return data
+		end
+		debugLog("LocalTrader: live ItemIds not usable: " .. tostring(ok and info or data) .. " - falling back to the repo copy")
+	end
+
+	-- 2. your repo copy
 	if type(loadstring) == "function" and type(game.HttpGet) == "function" then
 		local ok, result = pcall(function()
 			return loadstring(game:HttpGet(CONFIG.ItemIdsUrl))()
 		end)
 		if ok and type(result) == "table" then
+			ItemIdsSource = "repo copy (" .. CONFIG.ItemIdsUrl .. ")"
 			return result
 		end
 	end
 
+	-- 3. a copy in the executor workspace
 	if type(readfile) == "function" and type(loadstring) == "function" then
 		local ok, result = pcall(function()
 			return loadstring(readfile("itemIds.lua"))()
 		end)
 		if ok and type(result) == "table" then
+			ItemIdsSource = "workspace file itemIds.lua"
 			return result
 		end
 	end
@@ -1065,6 +1182,10 @@ local function loadItemIds()
 end
 
 local ItemIds = loadItemIds()
+debugLog("LocalTrader: ItemIds source: " .. ItemIdsSource)
+if not ItemIds then
+	debugLog("LocalTrader: WARNING - no ItemIds table could be loaded from any source; fruits cannot be recognised")
+end
 
 -- v1.7: every top-level field of the last getTradeInventory answer except Items (diagnostics)
 local lastInventoryMeta = ""
